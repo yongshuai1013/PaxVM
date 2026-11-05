@@ -54,40 +54,89 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/guest \
              ../app/src/main/jniLibs/arm64-v8a/libguest.so
 
-      # M1 guest: static busybox from Alpine's official busybox-static
-      # package (musl, aarch64; package sha256 pinned). The previous
-      # guest was a CI-built glibc static busybox: glibc startup calls
-      # rseq(2) right after set_robust_list, and the seccomp filter
-      # Android imposes on app processes kills that with SIGSYS
-      # before main() ever runs (seen on a real device: the guest died
-      # after brk/set_tid_address/set_robust_list, before printing
-      # anything). musl startup makes no rseq call -- the M0 musl
-      # guest runs fine under the same filter -- so the guest now
-      # comes prebuilt from Alpine instead of a glibc cross-build.
-      - name: Fetch busybox (Alpine busybox-static, aarch64, static)
+      # M1 guest: static busybox 1.36.1 built from source against
+      # musl with CONFIG_FEATURE_SUID=n. Why not a prebuilt package:
+      # a FEATURE_SUID=y busybox runs a privilege-drop sequence at
+      # every startup (ruid = getuid(), then setgid(rgid), then
+      # setuid(ruid) -- libbb/appletlib.c, all inside the
+      # FEATURE_SUID guard) even when the binary is not setuid, and
+      # Android's app seccomp filter TRAPs the set*id family
+      # (bionic SECCOMP_BLOCKLIST_APP lists setgid/setuid/setresgid/
+      # setgroups/setfsuid/setfsgid), killing the guest before
+      # main() -- proven on a real device across 0.2.1-0.2.5. The
+      # supervisor cannot cancel those calls on this kernel
+      # (5.4.233 vendor): rewrites at the ptrace entry stop do not
+      # stop the filter evaluating the original syscall number.
+      # So the calls must not exist: with FEATURE_SUID=n the whole
+      # sequence is compiled out and startup touches no set*id.
+      # Toolchain: musl.cc's aarch64-linux-musl cross gcc (tarball
+      # sha256 pinned below), so busybox is compiled against musl
+      # end to end, never glibc (the earlier glibc-built guest died
+      # even earlier, on rseq at startup). The Alpine busybox-static
+      # package used in 0.2.1-0.2.5 has FEATURE_SUID=y compiled in,
+      # which is exactly what has to go.
+      - name: Build busybox (musl, from source, FEATURE_SUID=n)
         run: |
           set -euo pipefail
-          APK=busybox-static-1.36.1-r31.apk
-          curl -fsSL -o "$APK" \
-            "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/$APK"
-          echo "1d8e7a7fc2ed69bdb8eb7be9d962489c21a0f75b72d8a325437c8a09d4cfac70  $APK" | sha256sum -c -
-          mkdir -p bb-extract
-          tar -xzf "$APK" -C bb-extract
-          file bb-extract/bin/busybox.static | grep -q "statically linked"
+          curl -fsSL -o musl-cross.tgz \
+            "https://musl.cc/aarch64-linux-musl-cross.tgz"
+          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  musl-cross.tgz" | sha256sum -c -
+          mkdir -p musl-cross
+          tar -xzf musl-cross.tgz -C musl-cross --strip-components=1
+          export PATH="$PWD/musl-cross/bin:$PATH"
+          curl -fsSL -o busybox-1.36.1.tar.bz2 \
+            "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
+          echo "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314  busybox-1.36.1.tar.bz2" | sha256sum -c -
+          tar xjf busybox-1.36.1.tar.bz2
+          # The tarball's top-level directory is busybox-1.36.1/
+          # (verified against the tar listing); everything below
+          # runs inside it.
+          cd busybox-1.36.1
+          test -f Makefile
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- defconfig
+          # BusyBox ships no scripts/config (that helper is a
+          # Linux-kernel tool and is absent from the 1.36.1 tree),
+          # so flip options in .config directly, then let oldconfig
+          # settle dependencies. The grep assertions fail the step
+          # if an option does not end up as intended, checked both
+          # before and after oldconfig (oldconfig must not be able
+          # to resurrect FEATURE_SUID via its sub-options).
+          # CONFIG_TC is turned OFF: 1.36.1's tc applet uses CBQ
+          # definitions that current kernel headers have removed,
+          # and the guest has no use for tc anyway.
+          sed -i 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' .config
+          sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set$/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+          sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' .config
+          sed -i 's/^CONFIG_FEATURE_SUID=y$/# CONFIG_FEATURE_SUID is not set/' .config
+          grep -q "^CONFIG_STATIC=y" .config
+          grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
+          grep -q "^# CONFIG_FEATURE_SUID is not set" .config
+          # pipefail would let yes(1)'s SIGPIPE fail this pipeline;
+          # the status that matters is make's, i.e. the last
+          # command's, which is what remains with pipefail off.
+          set +o pipefail
+          yes '' | make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- oldconfig
+          set -o pipefail
+          grep -q "^CONFIG_STATIC=y" .config
+          grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
+          grep -q "^# CONFIG_FEATURE_SUID is not set" .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- -j"$(nproc)"
+          file busybox | grep -q "statically linked"
           # The guest acceptance script drives these applets; fail
-          # here if Alpine's build ever drops one. BusyBox packs
-          # applet names as short NUL-separated strings, so match
-          # whole lines from strings -n 2. The strings dump goes to
-          # a file first: grep -q exiting on match would SIGPIPE the
+          # here if the build ever drops one. BusyBox packs applet
+          # names as short NUL-separated strings, so match whole
+          # lines from strings -n 2. The strings dump goes to a
+          # file first: grep -q exiting on match would SIGPIPE the
           # producer and pipefail would report a false failure.
-          strings -n 2 bb-extract/bin/busybox.static > bb-strings.txt
+          strings -n 2 busybox > ../bb-strings.txt
           for applet in sh echo pwd cd cat ls wc mkdir touch rm uname; do
-            grep -qx "$applet" bb-strings.txt \
+            grep -qx "$applet" ../bb-strings.txt \
               || { echo "busybox missing applet: $applet" >&2; exit 1; }
           done
           mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
-          cp bb-extract/bin/busybox.static \
-             "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox.so"
+          cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox.so"
           ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
 
       # Guard the payloads' static-ness and the APK contents: if a
