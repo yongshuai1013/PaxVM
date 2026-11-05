@@ -221,6 +221,22 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    /** Delete-then-write for shell-owned guest files. A guest
+     * can chmod a file the shell rewrites on every launch —
+     * 2.3's init chmods /proc/cmdline to 0440 (through the
+     * supervisor's proxy, onto the host path), and the next
+     * launch's plain writeText then dies with EACCES inside the
+     * click handler: the 0.3.2 field failure, where the GB
+     * button killed the app before any log line (the busybox
+     * buttons were unaffected — their guest never chmods).
+     * Recreating the file resets its permissions. */
+    private fun writeFresh(file: File, text: String) {
+        if (file.exists()) {
+            file.delete()
+        }
+        file.writeText(text)
+    }
+
     /** Idempotent: build the rootfs tree the busybox guest expects. */
     private fun prepareRootfs(rootfs: File) {
         val bin = File(rootfs, "bin")
@@ -251,7 +267,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        File(rootfs, "verify.sh").writeText(verifyScript)
+        writeFresh(File(rootfs, "verify.sh"), verifyScript)
     }
 
     /** Idempotent: build the rootfs tree the Gingerbread init
@@ -279,13 +295,17 @@ class MainActivity : Activity() {
                 appendLog("[shell] symlink sh failed: $e")
             }
         }
-        File(rootfs, "init.rc").writeText(gbInitRc)
-        File(rootfs, "probe.sh").writeText(gbProbeScript)
+        writeFresh(File(rootfs, "init.rc"), gbInitRc)
+        writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
         // init reads the kernel cmdline for androidboot.hardware
         // (and looks for /init.<hardware>.rc, absent on purpose).
-        File(rootfs, "proc/cmdline")
-            .writeText("androidboot.hardware=paxvm androidboot.console=tty0\n")
-        File(rootfs, ".kmsg").writeText("")
+        // This is the file init chmods to 0440 — writeFresh is
+        // what keeps the next launch alive (see its doc).
+        writeFresh(
+            File(rootfs, "proc/cmdline"),
+            "androidboot.hardware=paxvm androidboot.console=tty0\n",
+        )
+        writeFresh(File(rootfs, ".kmsg"), "")
     }
 
     private fun startSupervisor(
