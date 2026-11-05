@@ -71,8 +71,15 @@ class MainActivity : Activity() {
      * that init's service machinery works under supervision.
      * Rewritten on every GB start, like verify.sh. */
     private val gbInitRc: String = listOf(
+        // No setprop in early-init: 2.3's property_set writes
+        // through pa_info_array, which is null until the
+        // property_init builtin runs (queued after the
+        // early-init actions) — a setprop there segfaults init
+        // (proven in the 0.3.1 device run; the stock rc's
+        // early-init likewise contains no setprop). The write
+        // builtin is safe at any stage and leaves evidence.
         "on early-init",
-        "    setprop pax.stage early-init",
+        "    write /probe-early-init.txt ok",
         "",
         "on init",
         "    loglevel 7",

@@ -1871,6 +1871,40 @@ fn main() {
             // exit stop, that exit stop still follows, and the exit
             // path already tolerates a missing record.
             let mut deliver = sig;
+            if matches!(sig, 4 | 6 | 7 | 8 | 11) {
+                // Fatal-signal forensics (purely additive): a
+                // genuine guest crash (SIGSEGV and friends) is
+                // far easier to place with its pc and fault
+                // address than from the bare GUEST_SIGNALED line
+                // that follows at reaping time. Motivated by
+                // 2.3.7 init's SIGSEGV at its first action
+                // (0.3.1 device run), which the log could only
+                // bracket, not locate.
+                let fcompat = procs
+                    .get(&pid)
+                    .map(|p| p.compat)
+                    .unwrap_or(guest_compat);
+                let pc = get_regs(pid, fcompat).map(|r| r.pc()).unwrap_or(0);
+                let mut buf = [0u8; 128];
+                let ok = ptrace4(
+                    PTRACE_GETSIGINFO,
+                    pid,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                ) == 0;
+                if ok {
+                    let addr = if fcompat {
+                        u32::from_ne_bytes(buf[12..16].try_into().unwrap()) as u64
+                    } else {
+                        u64::from_ne_bytes(buf[16..24].try_into().unwrap())
+                    };
+                    sup!(
+                        "FATAL sig={sig} pid={pid} pc=0x{pc:x} fault_addr=0x{addr:x}"
+                    );
+                } else {
+                    sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo)");
+                }
+            }
             if sig == SIGSYS {
                 let sig_compat = procs
                     .get(&pid)
