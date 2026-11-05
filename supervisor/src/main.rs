@@ -1327,7 +1327,7 @@ fn entry_chown(
     let cstr = match std::ffi::CString::new(host.as_bytes()) {
         Ok(c) => c,
         Err(_) => {
-            skip_syscall(pid, regs, pend, -EINVAL);
+            skip_syscall(pid, regs, pend, -(libc::EINVAL as i64));
             return format!("{name}({nr}) '{p}' bad path -> -EINVAL");
         }
     };
