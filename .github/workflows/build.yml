@@ -76,14 +76,22 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
           # BusyBox ships no scripts/config (that helper is a
           # Linux-kernel tool and is absent from the 1.36.1 tree),
-          # so flip the two options in .config directly, then let
-          # oldconfig settle dependencies. The grep assertions fail
-          # the step if either option does not end up =y, checked
-          # both before and after oldconfig.
+          # so flip options in .config directly, then let oldconfig
+          # settle dependencies. The grep assertions fail the step
+          # if an option does not end up as intended, checked both
+          # before and after oldconfig. CONFIG_TC is turned OFF:
+          # 1.36.1's tc applet uses CBQ definitions that current
+          # kernel headers have removed, so tc.c no longer compiles
+          # against them (header drift, not a config problem), and
+          # the guest has no use for tc anyway. oldconfig then
+          # drops the dependent CONFIG_FEATURE_TC_INGRESS on its
+          # own (verified against a local defconfig run).
           sed -i 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' .config
           sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set$/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+          sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' .config
           grep -q "^CONFIG_STATIC=y" .config
           grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
           # pipefail would let yes(1)'s SIGPIPE fail this pipeline;
           # the status that matters is make's, i.e. the last
           # command's, which is what remains with pipefail off.
@@ -92,6 +100,7 @@ jobs:
           set -o pipefail
           grep -q "^CONFIG_STATIC=y" .config
           grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
           file busybox | grep -q "statically linked"
           mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
