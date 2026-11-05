@@ -69,21 +69,30 @@ jobs:
       # stop the filter evaluating the original syscall number.
       # So the calls must not exist: with FEATURE_SUID=n the whole
       # sequence is compiled out and startup touches no set*id.
-      # Toolchain: musl.cc's aarch64-linux-musl cross gcc (tarball
-      # sha256 pinned below), so busybox is compiled against musl
+      # Toolchain: Bootlin's aarch64 musl cross gcc 12.3 (tarball
+      # sha256 pinned below, cross-checked against Bootlin's
+      # published .sha256), so busybox is compiled against musl
       # end to end, never glibc (the earlier glibc-built guest died
-      # even earlier, on rseq at startup). The Alpine busybox-static
+      # even earlier, on rseq at startup). musl.cc was the first
+      # choice but is unreachable from GitHub runners (run
+      # 42036094797 step 8: curl connect timeout to musl.cc:443),
+      # so the toolchain comes from toolchains.bootlin.com. The Alpine busybox-static
       # package used in 0.2.1-0.2.5 has FEATURE_SUID=y compiled in,
       # which is exactly what has to go.
       - name: Build busybox (musl, from source, FEATURE_SUID=n)
         run: |
           set -euo pipefail
-          curl -fsSL -o musl-cross.tgz \
-            "https://musl.cc/aarch64-linux-musl-cross.tgz"
-          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  musl-cross.tgz" | sha256sum -c -
-          mkdir -p musl-cross
-          tar -xzf musl-cross.tgz -C musl-cross --strip-components=1
-          export PATH="$PWD/musl-cross/bin:$PATH"
+          # Bootlin tarball layout: a single top-level directory
+          # (aarch64--musl--stable-2023.11-1/) holding bin/, lib/,
+          # and the target sysroot; its cross prefix is
+          # aarch64-linux- (bin/aarch64-linux-gcc, verified against
+          # the tarball contents), NOT musl.cc's aarch64-linux-musl-.
+          curl -fsSL --retry 3 --connect-timeout 30 -o bootlin-musl.tar.bz2 \
+            "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2023.11-1.tar.bz2"
+          echo "3554391a9ae82cc1fe35a6ab0c9efa34a5bac5474b6d527474997256e148c297  bootlin-musl.tar.bz2" | sha256sum -c -
+          mkdir -p bootlin-musl
+          tar -xjf bootlin-musl.tar.bz2 -C bootlin-musl --strip-components=1
+          export PATH="$PWD/bootlin-musl/bin:$PATH"
           curl -fsSL -o busybox-1.36.1.tar.bz2 \
             "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
           echo "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314  busybox-1.36.1.tar.bz2" | sha256sum -c -
@@ -93,7 +102,7 @@ jobs:
           # runs inside it.
           cd busybox-1.36.1
           test -f Makefile
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux- defconfig
           # BusyBox ships no scripts/config (that helper is a
           # Linux-kernel tool and is absent from the 1.36.1 tree),
           # so flip options in .config directly, then let oldconfig
@@ -116,13 +125,13 @@ jobs:
           # the status that matters is make's, i.e. the last
           # command's, which is what remains with pipefail off.
           set +o pipefail
-          yes '' | make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- oldconfig
+          yes '' | make ARCH=arm64 CROSS_COMPILE=aarch64-linux- oldconfig
           set -o pipefail
           grep -q "^CONFIG_STATIC=y" .config
           grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
           grep -q "^# CONFIG_TC is not set" .config
           grep -q "^# CONFIG_FEATURE_SUID is not set" .config
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- -j"$(nproc)"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux- -j"$(nproc)"
           file busybox | grep -q "statically linked"
           # The guest acceptance script drives these applets; fail
           # here if the build ever drops one. BusyBox packs applet
