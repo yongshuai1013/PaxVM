@@ -1,0 +1,10 @@
+[package]
+name = "supervisor"
+version = "0.1.0"
+edition = "2021"
+
+# Built for aarch64-linux-android with the NDK clang linker (dynamic
+# PIE), then packaged into the APK as libsupervisor.so and exec'd from
+# nativeLibraryDir by the shell (M0 spec sections 1.2 and 2.1).
+[dependencies]
+libc = "0.2"

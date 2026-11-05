@@ -1,0 +1,10 @@
+[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+
+# Built for aarch64-unknown-linux-musl, whose default crt-static gives a
+# fully static ELF with no PT_INTERP (M0 spec section 3). Packaged into
+# the APK as libguest.so and exec'd by the supervisor.
+[profile.release]
+panic = "abort"
