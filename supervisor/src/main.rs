@@ -429,6 +429,14 @@ impl Regs {
             Regs::A32(r) => r.uregs[7] = u32::MAX,
         }
     }
+    /// Set the tracee-visible syscall-number register (x8 on
+    /// AArch64, r7 on compat) to a different number.
+    fn set_nr(&mut self, v: u64) {
+        match self {
+            Regs::A64(r) => r.regs[8] = v,
+            Regs::A32(r) => r.uregs[7] = v as u32,
+        }
+    }
 }
 
 /// The guest binary's personality, from its ELF header: EI_CLASS
@@ -832,6 +840,12 @@ struct Pending {
     /// entry_unix_sockaddr): (address, original bytes), restored
     /// verbatim at the exit stop.
     mem_restore: Option<(u64, Vec<u8>)>,
+    /// When true, `inject` is a rescue-only fallback: the exit
+    /// stop must NOT apply it (the real syscall result stands);
+    /// it exists solely so a SIGSYS belonging to this call can
+    /// be rescued with the fabricated value. Used by the
+    /// accept -> accept4 rewrite (see entry_accept).
+    rescue_only: bool,
 }
 
 struct ProcState {
@@ -1378,6 +1392,34 @@ fn entry_rmdir(
             format!("rmdir(40) '{p}' -> '{host}' proxied (errno {en})")
         }
     }
+}
+
+/// Compat accept(285): absent from the host app seccomp
+/// allowlist entirely -- Android 12's bionic SYSCALLS.TXT defines
+/// only accept4 for arm, so GB init is killed by SIGSYS the
+/// first time a property write arrives (S4b fourth shot: init
+/// died at its accept on the property socket). accept4(366)
+/// with flags=0 is the identical operation. Rewrite the number
+/// in both the tracee-visible register and the dispatch field,
+/// zero the flags argument, and arm a rescue-only fallback: if
+/// this device's filter nevertheless evaluates the original
+/// number and traps, the pending record lets the SIGSYS rescue
+/// keep init alive with a fabricated -EAGAIN (its property
+/// handler treats that as "no connection" and returns to the
+/// poll loop; that client's write is lost, and both the rescue
+/// line and this description say so plainly).
+fn entry_accept(pid: i32, regs: &mut Regs, pend: &mut Pending) -> String {
+    regs.set_nr(366);
+    regs.set_arg(3, 0);
+    if !set_syscallno(pid, 366) {
+        sup!(
+            "WARN: NT_ARM_SYSTEM_CALL set(366) failed pid={pid} errno={}",
+            errno()
+        );
+    }
+    pend.inject = Some(-(libc::EAGAIN as i64));
+    pend.rescue_only = true;
+    "accept(285) -> accept4(366) rewritten (rescue armed: -EAGAIN if trapped)".to_string()
 }
 
 /// Resolve a canonical guest path through one symlink level inside
@@ -1959,6 +2001,7 @@ fn main() {
                     inject: None,
                     applied: false,
                     mem_restore: None,
+                    rescue_only: false,
                 };
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -2075,6 +2118,11 @@ fn main() {
                         &mut pend,
                     ));
                     dirty = true;
+                } else if proc.compat && nr == 285 {
+                    // Compat accept: rewritten to accept4 (see
+                    // entry_accept).
+                    pend.desc = Some(entry_accept(pid, &mut regs, &mut pend));
+                    dirty = true;
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
                     || is_t_symlinkat(proc.compat, nr)
@@ -2141,11 +2189,13 @@ fn main() {
                     if let Some(mut regs) = get_regs(pid, proc.compat) {
                         let mut ret = regs.retval();
                         if let Some(v) = pend.inject {
-                            regs.set_retval(v);
-                            if set_regs(pid, &regs) {
-                                pend.applied = true;
+                            if !pend.rescue_only {
+                                regs.set_retval(v);
+                                if set_regs(pid, &regs) {
+                                    pend.applied = true;
+                                }
+                                ret = v;
                             }
-                            ret = v;
                         }
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
