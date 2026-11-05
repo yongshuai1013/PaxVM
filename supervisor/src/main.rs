@@ -173,6 +173,17 @@ fn nr_name(nr: u64) -> &'static str {
         134 => "rt_sigaction",
         135 => "rt_sigprocmask",
         139 => "rt_sigreturn",
+        143 => "setregid",
+        144 => "setgid",
+        145 => "setreuid",
+        146 => "setuid",
+        147 => "setresuid",
+        148 => "getresuid",
+        149 => "setresgid",
+        150 => "getresgid",
+        151 => "setfsuid",
+        152 => "setfsgid",
+        159 => "setgroups",
         160 => "uname",
         163 => "getrlimit",
         164 => "setrlimit",
@@ -354,8 +365,8 @@ fn dump_sigsys_info(pid: i32) {
     }
     if let Some(r) = get_regs(pid) {
         sup!(
-            "SIGSYS regs pid={pid}: pc=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}",
-            r.pc, r.regs[0], r.regs[1], r.regs[2]
+            "SIGSYS regs pid={pid}: pc=0x{:x} x8=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}",
+            r.pc, r.regs[8], r.regs[0], r.regs[1], r.regs[2]
         );
     }
 }
@@ -642,6 +653,21 @@ fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserP
         desc.push_str(" [note: readlink result may carry the rootfs prefix]");
     }
     desc
+}
+
+/// set*id family: emulated at the entry stop, always returning 0.
+/// Android's app seccomp filter traps the whole family (it is not on
+/// the app allowlist, and the filter's default action is TRAP), but
+/// the ptrace syscall-entry stop fires *before* seccomp evaluation
+/// on arm64, so cancelling the syscall here means the filter never
+/// sees it. The guest is a single-uid sandbox and busybox's startup
+/// privilege-drop sequence (getuid/getgid, then setgid, then setuid,
+/// dispatched per-thread by musl's synccall) only ever sets the ids
+/// to their own current values, so 0 is the semantically correct
+/// answer -- the same treatment proot gives the uid/gid family.
+/// getresuid(148)/getresgid(150) are harmless queries and pass.
+fn is_setid_emulated(nr: u64) -> bool {
+    matches!(nr, 143 | 144 | 145 | 146 | 147 | 149 | 151 | 152 | 159)
 }
 
 /// F class (getcwd, fchdir): cancel the syscall and fabricate the
@@ -1110,6 +1136,13 @@ fn main() {
                     || is_t_path0(nr)
                 {
                     pend.desc = Some(entry_translate(pid, &rootfs, &proc.vcwd, nr, &mut regs));
+                    dirty = true;
+                } else if is_setid_emulated(nr) {
+                    // Cancel before the kernel (and its seccomp
+                    // filter) ever evaluates it; answer 0 at the
+                    // exit stop via the standard inject path.
+                    skip_syscall(&mut regs, &mut pend, 0);
+                    pend.desc = Some(format!("{}({}) emulated (return 0)", nr_name(nr), nr));
                     dirty = true;
                 } else if is_faked(nr) {
                     pend.desc = Some(entry_fake(pid, &proc.vcwd, nr, &mut regs, &mut pend));
