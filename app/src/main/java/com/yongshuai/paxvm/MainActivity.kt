@@ -1,8 +1,15 @@
 package com.yongshuai.paxvm
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ContentValues
+import android.content.Context
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.system.Os
 import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
@@ -10,6 +17,10 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -48,6 +59,8 @@ class MainActivity : Activity() {
     private lateinit var probeButton: Button
     private lateinit var gbButton: Button
     private lateinit var stopButton: Button
+    private lateinit var copyButton: Button
+    private lateinit var saveButton: Button
 
     private var supervisor: Process? = null
 
@@ -200,7 +213,21 @@ class MainActivity : Activity() {
         buttons.addView(probeButton)
         buttons.addView(gbButton)
         buttons.addView(stopButton)
+        copyButton = Button(this).apply {
+            text = "複製日誌"
+            setOnClickListener { copyLog() }
+        }
+        saveButton = Button(this).apply {
+            text = "下載日誌"
+            setOnClickListener { saveLog() }
+        }
+        val logButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        logButtons.addView(copyButton)
+        logButtons.addView(saveButton)
         root.addView(buttons)
+        root.addView(logButtons)
 
         logView = TextView(this).apply {
             textSize = 12f
@@ -276,7 +303,7 @@ class MainActivity : Activity() {
      * so last session's log would otherwise be overwritten in
      * place and garbled. */
     private fun prepareGBRootfs(rootfs: File) {
-        for (d in listOf("bin", "dev", "proc", "sys", "system", "data", "sbin", "tmp")) {
+        for (d in listOf("bin", "dev", "proc", "sys", "system", "data", "data/property", "sbin", "tmp")) {
             File(rootfs, d).mkdirs()
         }
         // Same busybox placeholder + sh symlink arrangement as
@@ -306,6 +333,54 @@ class MainActivity : Activity() {
             "androidboot.hardware=paxvm androidboot.console=tty0\n",
         )
         writeFresh(File(rootfs, ".kmsg"), "")
+    }
+
+    /** Copy the whole log view to the clipboard, so a session's
+     * log can be pasted as text instead of screenshotted page by
+     * page (added 0.3.5 at the user's request). */
+    private fun copyLog() {
+        val text = logView.text.toString()
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("PaxVM log", text))
+        appendLog("[shell] 日誌已複製到剪貼簿（${text.count { it == '\n' } + 1} 行）")
+    }
+
+    /** Save the whole log view as a .txt in the device's
+     * Download folder (MediaStore on API 29+, no permission
+     * needed; legacy public dir below that). Added 0.3.5 at the
+     * user's request, alongside 複製日誌. */
+    private fun saveLog() {
+        val text = logView.text.toString()
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val name = "paxvm-log-$stamp.txt"
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS,
+                    )
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    values,
+                ) ?: throw IOException("MediaStore insert returned null")
+                val out = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("openOutputStream returned null")
+                out.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS,
+                )
+                dir.mkdirs()
+                File(dir, name).writeText(text)
+            }
+            appendLog("[shell] 日誌已存到 Download/$name")
+        } catch (e: Exception) {
+            appendLog("[shell] 存日誌失敗：$e")
+        }
     }
 
     private fun startSupervisor(

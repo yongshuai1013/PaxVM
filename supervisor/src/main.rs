@@ -827,6 +827,11 @@ struct Pending {
     /// written into the tracee's regs (at the exit stop, or at a
     /// SIGSYS rescue stop). Only meaningful when inject is Some.
     applied: bool,
+    /// Guest memory temporarily rewritten for the duration of
+    /// one passed syscall (the unix-socket sockaddr path, see
+    /// entry_unix_sockaddr): (address, original bytes), restored
+    /// verbatim at the exit stop.
+    mem_restore: Option<(u64, Vec<u8>)>,
 }
 
 struct ProcState {
@@ -1220,6 +1225,120 @@ fn entry_ftruncate(pid: i32, regs: &mut Regs, pend: &mut Pending) -> String {
             skip_syscall(pid, regs, pend, -(en as i64));
             format!("ftruncate(93) fd={fd} open '{target}' failed (errno {en})")
         }
+    }
+}
+
+/// Unix-socket bind/connect: virtualize the sockaddr path.
+/// The path argument of bind(2)/connect(2) does not travel in a
+/// register — it sits inside the sockaddr_un in guest memory,
+/// where the path-translation machinery never sees it. Left
+/// alone, a guest binding "/dev/socket/property_service" binds
+/// the HOST's path: Gingerbread init collided with the host's
+/// own live property-service socket (EADDRINUSE), the socket
+/// never came up, and check_startup exit(1)'d the whole boot
+/// (0.3.4 device run). The supervisor therefore rewrites the
+/// path inside the guest's sockaddr to the translated host path
+/// for the duration of the call and restores the original bytes
+/// at the exit stop — the guest keeps seeing its own path (its
+/// later chown/chmod of the socket node depend on that). The
+/// path field is capped at 108 bytes; our rootfs paths fit.
+/// Abstract sockets (leading NUL) and non-Unix families pass
+/// untouched.
+fn entry_unix_sockaddr(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    nr: u64,
+    compat: bool,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    let name = nr_name(compat, nr);
+    let addr_ptr = regs.arg(1);
+    let addrlen = (regs.arg(2) as usize).min(512);
+    if addrlen < 3 {
+        return format!("{name}({nr}) pass (short sockaddr)");
+    }
+    let mut buf = vec![0u8; addrlen];
+    let got = match read_mem(pid, addr_ptr, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return format!("{name}({nr}) pass (sockaddr unreadable)"),
+    };
+    buf.truncate(got);
+    if buf.len() < 3 || u16::from_ne_bytes([buf[0], buf[1]]) != libc::AF_UNIX as u16 {
+        return format!("{name}({nr}) pass (non-unix sockaddr)");
+    }
+    if buf[2] == 0 {
+        return format!("{name}({nr}) pass (abstract unix socket)");
+    }
+    let path_end = buf[2..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|i| 2 + i)
+        .unwrap_or(buf.len());
+    let guest_path = String::from_utf8_lossy(&buf[2..path_end]).into_owned();
+    let host = format!("{rootfs}{}", guest_abs(vcwd, &guest_path));
+    if host.len() + 3 > 110 {
+        return format!(
+            "{name}({nr}) unix '{guest_path}' NOT rewritten (host path too long), passed"
+        );
+    }
+    let mut newbuf = Vec::with_capacity(host.len() + 3);
+    newbuf.extend_from_slice(&buf[0..2]);
+    newbuf.extend_from_slice(host.as_bytes());
+    newbuf.push(0);
+    pend.mem_restore = Some((addr_ptr, buf));
+    if write_mem(pid, addr_ptr, &newbuf).is_err() {
+        pend.mem_restore = None;
+        return format!("{name}({nr}) unix '{guest_path}' rewrite failed, passed");
+    }
+    regs.set_arg(2, newbuf.len() as u64);
+    format!("{name}({nr}) unix '{guest_path}' -> '{host}' (sockaddr rewritten)")
+}
+
+/// Compat chown(182) / chown32(212), proxied by the supervisor
+/// itself. The android12 policy inputs carry no chown stub at
+/// all — SYSCALLS.TXT lists only fchown/fchownat (modern bionic
+/// implements chown() as an fchownat wrapper) — so the call is
+/// in the same trap family as rmdir/chmod, and it sits on a
+/// proven path: create_socket chowns the socket node right
+/// after bind (util.c:148), where a trap would kill init
+/// mid-startup. The supervisor performs the chown on the
+/// translated host path and returns its honest result
+/// (chowning to uid 0 from the app's uid yields EPERM, which
+/// create_socket ignores — faithful semantics, no fakery).
+fn entry_chown(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    nr: u64,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    let name = if nr == 212 { "chown32" } else { "chown" };
+    let addr = regs.arg(0);
+    let owner = regs.arg(1) as u32;
+    let group = regs.arg(2) as u32;
+    let Some(p) = read_path(pid, addr) else {
+        skip_syscall(pid, regs, pend, -EFAULT);
+        return format!("{name}({nr}) path unreadable -> -EFAULT");
+    };
+    let host = format!("{rootfs}{}", guest_abs(vcwd, &p));
+    let cstr = match std::ffi::CString::new(host.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            skip_syscall(pid, regs, pend, -EINVAL);
+            return format!("{name}({nr}) '{p}' bad path -> -EINVAL");
+        }
+    };
+    let r = unsafe { libc::chown(cstr.as_ptr(), owner, group) };
+    if r == 0 {
+        skip_syscall(pid, regs, pend, 0);
+        format!("{name}({nr}) '{p}' -> '{host}' proxied uid={owner} gid={group}")
+    } else {
+        let en = errno();
+        skip_syscall(pid, regs, pend, -(en as i64));
+        format!("{name}({nr}) '{p}' -> '{host}' proxied (errno {en})")
     }
 }
 
@@ -1659,7 +1778,13 @@ fn main() {
                     continue;
                 };
                 let nr = regs.nr();
-                let mut pend = Pending { nr, desc: None, inject: None, applied: false };
+                let mut pend = Pending {
+                    nr,
+                    desc: None,
+                    inject: None,
+                    applied: false,
+                    mem_restore: None,
+                };
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
                     && pid == root_pid
@@ -1734,6 +1859,35 @@ fn main() {
                     // Compat ftruncate: proxied (see
                     // entry_ftruncate).
                     pend.desc = Some(entry_ftruncate(pid, &mut regs, &mut pend));
+                    dirty = true;
+                } else if (proc.compat && (nr == 282 || nr == 283))
+                    || (!proc.compat && (nr == 200 || nr == 203))
+                {
+                    // bind/connect: the sockaddr path lives in
+                    // guest memory; rewrite it for the call's
+                    // duration (see entry_unix_sockaddr). The
+                    // call itself passes through.
+                    pend.desc = Some(entry_unix_sockaddr(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        nr,
+                        proc.compat,
+                        &mut regs,
+                        &mut pend,
+                    ));
+                    dirty = true;
+                } else if proc.compat && (nr == 182 || nr == 212) {
+                    // Compat chown/chown32: proxied (see
+                    // entry_chown).
+                    pend.desc = Some(entry_chown(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        nr,
+                        &mut regs,
+                        &mut pend,
+                    ));
                     dirty = true;
                 } else if proc.compat && nr == 40 {
                     // Compat rmdir: proxied (see entry_rmdir).
@@ -1820,6 +1974,12 @@ fn main() {
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
                         }
+                    }
+                    if let Some((addr, orig)) = &pend.mem_restore {
+                        // Undo a for-the-duration rewrite (the
+                        // unix sockaddr path): the guest must
+                        // keep seeing its own bytes.
+                        let _ = write_mem(pid, *addr, orig);
                     }
                     if pend.inject.is_some() {
                         // A faked syscall's record outlives its exit
