@@ -348,6 +348,7 @@ class MainActivity : Activity() {
             "androidboot.hardware=paxvm androidboot.console=tty0\n",
         )
         writeFresh(File(rootfs, ".kmsg"), "")
+        writeFresh(File(rootfs, ".gbloader-err"), "")
         installGBSystem(rootfs)
     }
 
@@ -506,6 +507,12 @@ class MainActivity : Activity() {
                     kmsg.readLines().forEach { appendLog("[init] $it") }
                 } else {
                     appendLog("[init] (kmsg capture empty)")
+                }
+                // Loader errors from dynamic guests (their
+                // stderr is /dev/null under init services).
+                val lerr = File(rootfs, ".gbloader-err")
+                if (lerr.exists() && lerr.length() > 0) {
+                    lerr.readLines().forEach { appendLog("[loader] $it") }
                 }
             }
             runOnUiThread {

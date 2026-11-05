@@ -45,6 +45,24 @@ extern char **environ;
 
 static void say(const char *s) { (void)!write(2, s, strlen(s)); }
 
+/* A guest service's stderr is /dev/null, so a loader error
+ * would vanish. Mirror it into a capture file at the guest
+ * root (the supervisor translates the path; the shell dumps
+ * the file at session end, like the init kmsg capture). */
+static void log_to_file(const char *what, const char *path) {
+    int fd = open("/.gbloader-err", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return;
+    (void)!write(fd, "gbloader: ", 10);
+    (void)!write(fd, what, strlen(what));
+    if (path) {
+        (void)!write(fd, ": ", 2);
+        (void)!write(fd, path, strlen(path));
+    }
+    (void)!write(fd, "\n", 1);
+    close(fd);
+}
+
 static void die(const char *what, const char *path) {
     say("gbloader: ");
     say(what);
@@ -53,6 +71,7 @@ static void die(const char *what, const char *path) {
         say(path);
     }
     say("\n");
+    log_to_file(what, path);
     _exit(127);
 }
 
@@ -99,7 +118,12 @@ static void load_image(const char *path, struct image *img) {
             else
                 die("short interp", path);
         }
-        if (p->p_type == PT_LOAD) {
+        if (p->p_type == PT_LOAD && p->p_memsz > 0) {
+            /* Zero-memsz segments occupy nothing and must not
+             * poison the span: the Gingerbread linker carries a
+             * dummy LOAD at vaddr 0 with memsz 0, which otherwise
+             * stretches the reservation to ~3 GB from address 0
+             * and makes it fail outright. */
             if (p->p_vaddr < lo)
                 lo = p->p_vaddr;
             if (p->p_vaddr + p->p_memsz > hi)
