@@ -68,6 +68,7 @@ const ENOSYS: i64 = 38;
 const ERANGE: i64 = 34;
 const EACCES: i64 = 13;
 const ENOENT: i64 = 2;
+const EFAULT: i64 = 14;
 const ENOTDIR: i64 = 20;
 
 // ---- syscall numbers that differ per personality ----
@@ -179,6 +180,17 @@ fn is_blocked(compat: bool, nr: u64) -> bool {
 /// for AArch64 guests, ARM EABI names (names32.rs) for compat.
 fn nr_name(compat: bool, nr: u64) -> &'static str {
     if compat {
+        // ARM private syscalls (0x0f0000 range) have no entry in
+        // the tbl-generated table.
+        match nr {
+            983_041 => return "__arm_breakpoint",
+            983_042 => return "__arm_cacheflush",
+            983_043 => return "__arm_usr26",
+            983_044 => return "__arm_usr32",
+            983_045 => return "__arm_set_tls",
+            983_046 => return "__arm_get_tls",
+            _ => {}
+        }
         names32::nr_name32(nr)
     } else {
         nr_name64(nr)
@@ -1061,6 +1073,44 @@ fn entry_chdir(
     }
 }
 
+/// Compat rmdir(40), proxied by the supervisor itself. The
+/// 32-bit app seccomp allowlist does not contain rmdir at all
+/// (checked against bionic android12-release policy inputs:
+/// rmdir appears in neither SYSCALLS.TXT nor any
+/// SECCOMP_ALLOWLIST, while unlink was explicitly added for
+/// lp32), so a passed-through rmdir is trapped and its caller
+/// dies of SIGSYS — 0.2.8 device runs, twice, at the same pc.
+/// Cancelling at entry and performing the removal on the
+/// translated host path gives the guest exact same-filesystem
+/// errno semantics; the standard inject path (and its SIGSYS
+/// rescue) applies as for chdir.
+fn entry_rmdir(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    let addr = regs.arg(0);
+    let Some(p) = read_path(pid, addr) else {
+        skip_syscall(pid, regs, pend, -EFAULT);
+        return "rmdir(40) path unreadable -> -EFAULT".to_string();
+    };
+    let target = guest_abs(vcwd, &p);
+    let host = format!("{rootfs}{target}");
+    match std::fs::remove_dir(&host) {
+        Ok(()) => {
+            skip_syscall(pid, regs, pend, 0);
+            format!("rmdir(40) '{p}' -> '{host}' proxied")
+        }
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(libc::EIO);
+            skip_syscall(pid, regs, pend, -(en as i64));
+            format!("rmdir(40) '{p}' -> '{host}' proxied (errno {en})")
+        }
+    }
+}
+
 /// Resolve a canonical guest path through one symlink level inside
 /// the rootfs. Returns (final guest path, entity exists there).
 fn resolve_guest_target(rootfs: &str, abs: &str) -> (String, bool) {
@@ -1493,6 +1543,16 @@ fn main() {
                     if let Some(v) = new_vcwd {
                         proc.vcwd = v;
                     }
+                } else if proc.compat && nr == 40 {
+                    // Compat rmdir: proxied (see entry_rmdir).
+                    pend.desc = Some(entry_rmdir(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        &mut regs,
+                        &mut pend,
+                    ));
+                    dirty = true;
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
                     || is_t_symlinkat(proc.compat, nr)
