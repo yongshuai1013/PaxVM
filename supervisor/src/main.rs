@@ -1177,6 +1177,52 @@ fn entry_chmod(
     }
 }
 
+/// Compat ftruncate(93), proxied by the supervisor itself.
+/// Same allowlist family as rmdir/chmod: the guest's 2011-era
+/// call has no place in the host's 2024 app policy (modern
+/// bionic routes ftruncate through ftruncate64), so a passed-
+/// through call is trapped — 2.3.7's init died exactly there,
+/// sizing its property workspace (0.3.3 device run: ftruncate
+/// passed, then SIGSYS with nr_reg=93, fd=4, len=0x8000). An fd
+/// cannot be proxied by path rewriting, so the supervisor
+/// resolves the guest's fd through /proc/<pid>/fd/<fd> and
+/// truncates the same inode under its own fd; the guest's
+/// descriptor observes the new length.
+fn entry_ftruncate(pid: i32, regs: &mut Regs, pend: &mut Pending) -> String {
+    let fd = regs.arg(0) as i32;
+    let len = regs.arg(1) as u64;
+    let link = format!("/proc/{pid}/fd/{fd}");
+    let target = match std::fs::read_link(&link) {
+        Ok(t) => {
+            let s = t.to_string_lossy().into_owned();
+            s.strip_suffix(" (deleted)").unwrap_or(&s).to_string()
+        }
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(libc::EBADF);
+            skip_syscall(pid, regs, pend, -(en as i64));
+            return format!("ftruncate(93) fd={fd} unresolvable (errno {en})");
+        }
+    };
+    match std::fs::OpenOptions::new().write(true).open(&target) {
+        Ok(f) => match f.set_len(len) {
+            Ok(()) => {
+                skip_syscall(pid, regs, pend, 0);
+                format!("ftruncate(93) fd={fd} len={len} proxied via '{target}'")
+            }
+            Err(e) => {
+                let en = e.raw_os_error().unwrap_or(libc::EIO);
+                skip_syscall(pid, regs, pend, -(en as i64));
+                format!("ftruncate(93) fd={fd} proxied (errno {en})")
+            }
+        },
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(libc::EIO);
+            skip_syscall(pid, regs, pend, -(en as i64));
+            format!("ftruncate(93) fd={fd} open '{target}' failed (errno {en})")
+        }
+    }
+}
+
 /// Compat rmdir(40), proxied by the supervisor itself. The
 /// 32-bit app seccomp allowlist does not contain rmdir at all
 /// (checked against bionic android12-release policy inputs:
@@ -1683,6 +1729,11 @@ fn main() {
                         &mut regs,
                         &mut pend,
                     ));
+                    dirty = true;
+                } else if proc.compat && nr == 93 {
+                    // Compat ftruncate: proxied (see
+                    // entry_ftruncate).
+                    pend.desc = Some(entry_ftruncate(pid, &mut regs, &mut pend));
                     dirty = true;
                 } else if proc.compat && nr == 40 {
                     // Compat rmdir: proxied (see entry_rmdir).
