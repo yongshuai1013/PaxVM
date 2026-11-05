@@ -30,6 +30,7 @@ mod names32;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 
@@ -851,6 +852,15 @@ struct Pending {
     /// stop the returned ucred is rewritten to the peer's
     /// virtual credentials (see patch_peercred).
     peercred: Option<(u64, u64)>,
+    /// A binder WRITE_READ parked at its entry stop: the ioctl
+    /// was cancelled and pre-answered 0, but the tracee is NOT
+    /// continued until the virtual driver has data for it (see
+    /// complete_parked).
+    binder_parked: bool,
+    /// An mmap on a binder arena fd: the arena's host path. At
+    /// the exit stop the returned address becomes the arena
+    /// base for this thread.
+    mmap_binder: Option<String>,
 }
 
 struct ProcState {
@@ -1141,6 +1151,722 @@ fn patch_peercred(
     b[8..12].copy_from_slice(&vg.to_ne_bytes());
     if write_mem(pid, optval, &b).is_ok() {
         sup!("peercred pid={pid}: peer {peer} uid {ruid} -> {vu}, gid {rgid} -> {vg}");
+    }
+}
+
+// ---- S5: the supervisor is the binder driver ----
+//
+// The guest's /dev/binder is a per-opener sparse file under
+// {rootfs}/.binder/; its mmap is flipped PRIVATE -> SHARED so
+// supervisor pwrite()s are the guest's arena contents. All
+// binder ioctls on such fds are emulated here: nodes, handles
+// and parcel object translation follow the real driver's
+// model, and looper/reply waits park the tracee at its entry
+// stop until the driver has bytes for it. Design:
+// ~/workspace/vm-engine-research/s5-binder-spec.md.
+const BC_TRANSACTION: u32 = 0x4028_6300;
+const BC_REPLY: u32 = 0x4028_6301;
+const BC_FREE_BUFFER: u32 = 0x4004_6303;
+const BC_INCREFS: u32 = 0x4004_6304;
+const BC_ACQUIRE: u32 = 0x4004_6305;
+const BC_RELEASE: u32 = 0x4004_6306;
+const BC_DECREFS: u32 = 0x4004_6307;
+const BC_INCREFS_DONE: u32 = 0x4008_6308;
+const BC_ACQUIRE_DONE: u32 = 0x4008_6309;
+const BC_ATTEMPT_ACQUIRE: u32 = 0x4008_630a;
+const BC_REGISTER_LOOPER: u32 = 0x630b;
+const BC_ENTER_LOOPER: u32 = 0x630c;
+const BC_EXIT_LOOPER: u32 = 0x630d;
+const BC_REQUEST_DEATH_NOTIFICATION: u32 = 0x4008_630e;
+const BC_CLEAR_DEATH_NOTIFICATION: u32 = 0x4008_630f;
+const BC_DEAD_BINDER_DONE: u32 = 0x4004_6310;
+const BR_TRANSACTION: u32 = 0x8028_7202;
+const BR_REPLY: u32 = 0x8028_7203;
+const BR_DEAD_REPLY: u32 = 0x7205;
+const BR_TRANSACTION_COMPLETE: u32 = 0x7206;
+const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = 0x8004_7210;
+const BR_FAILED_REPLY: u32 = 0x7211;
+const BINDER_WRITE_READ: u32 = 0xC018_6201;
+const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
+const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
+const BINDER_SET_IDLE_PRIORITY: u32 = 0x4004_6206;
+const BINDER_SET_CONTEXT_MGR: u32 = 0x4004_6207;
+const BINDER_THREAD_EXIT: u32 = 0x4004_6208;
+const BINDER_VERSION: u32 = 0xC004_6209;
+const OBJ_BINDER: u32 = 0x7362_2A85;
+const OBJ_WEAK_BINDER: u32 = 0x7762_2A85;
+const OBJ_HANDLE: u32 = 0x7368_2A85;
+const OBJ_WEAK_HANDLE: u32 = 0x7768_2A85;
+const TF_ONE_WAY: u32 = 0x01;
+const BINDER_ARENA_CAP: u32 = 8 * 1024 * 1024;
+
+fn u32_at(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+fn put_u32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn read_mem_vec(pid: i32, addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    match read_mem(pid, addr, &mut buf) {
+        Ok(n) if n == len => Some(buf),
+        _ => None,
+    }
+}
+
+/// If `fd` in `pid` is one of our binder arena files, return
+/// its host path (the arena's identity everywhere below).
+fn fd_arena(pid: i32, fd: i32) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    let s = target.to_string_lossy().into_owned();
+    if s.contains("/.binder/") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+struct BinderProc {
+    file: std::fs::File,
+    /// thread pid -> guest address of this arena's mmap
+    base: HashMap<i32, u32>,
+    bump: u32,
+    free: Vec<(u32, u32)>,
+    used: HashMap<u32, u32>,
+    /// handle -> node index (handle 0 is the context manager
+    /// in every process and is never stored here)
+    handles: HashMap<u32, usize>,
+    next_handle: u32,
+    /// pending BR byte stream for this arena's readers
+    queue: Vec<u8>,
+    loopers: HashSet<i32>,
+}
+
+struct BinderNode {
+    owner: String,
+    ptr: u32,
+    cookie: u32,
+}
+
+struct ParkedIoctl {
+    bwr: u32,
+    read_buf: u32,
+    read_size: u32,
+    write_consumed: u32,
+}
+
+struct ReplyWait {
+    sender_pid: i32,
+    sender_arena: String,
+    cookie: u32,
+    target_handle: u32,
+}
+
+#[derive(Default)]
+struct BinderState {
+    procs: HashMap<String, BinderProc>,
+    nodes: Vec<BinderNode>,
+    mgr_arena: Option<String>,
+    mgr_node: Option<usize>,
+    parked: HashMap<i32, ParkedIoctl>,
+    /// target arena -> processes waiting for a reply from it
+    waiters: HashMap<String, Vec<ReplyWait>>,
+    /// node index -> (watcher arena, cookie) death watches
+    watchers: HashMap<usize, Vec<(String, u32)>>,
+    thread_arena: HashMap<i32, String>,
+    noted: HashSet<String>,
+}
+
+impl BinderState {
+    fn note(&mut self, what: &str) {
+        if self.noted.insert(what.to_string()) {
+            sup!("binder: {what} (first occurrence)");
+        }
+    }
+    fn node_for_local(&mut self, owner: &str, ptr: u32, cookie: u32) -> usize {
+        if let Some(i) = self
+            .nodes
+            .iter()
+            .position(|n| n.owner == owner && n.ptr == ptr && n.cookie == cookie)
+        {
+            return i;
+        }
+        self.nodes.push(BinderNode {
+            owner: owner.to_string(),
+            ptr,
+            cookie,
+        });
+        self.nodes.len() - 1
+    }
+    fn handle_for(&mut self, arena: &str, node: usize) -> u32 {
+        let bp = self.procs.get_mut(arena).expect("arena exists");
+        if let Some((h, _)) = bp.handles.iter().find(|(_, n)| **n == node) {
+            return *h;
+        }
+        let h = bp.next_handle;
+        bp.next_handle += 1;
+        bp.handles.insert(h, node);
+        h
+    }
+    fn alloc(&mut self, arena: &str, size: u32) -> Option<u32> {
+        let bp = self.procs.get_mut(arena)?;
+        let size = (size + 7) & !7;
+        for i in 0..bp.free.len() {
+            let (o, s) = bp.free[i];
+            if s >= size {
+                bp.free.remove(i);
+                if s > size {
+                    bp.free.push((o + size, s - size));
+                }
+                bp.used.insert(o, size);
+                return Some(o);
+            }
+        }
+        if bp.bump + size > BINDER_ARENA_CAP {
+            return None;
+        }
+        let o = bp.bump;
+        bp.bump += size;
+        bp.used.insert(o, size);
+        Some(o)
+    }
+}
+
+/// Rewrite one flat_binder_object slot in a parcel being
+/// transferred `to` a process: the node is presented as a
+/// local object when the receiver owns it, else as a handle
+/// in the receiver's table.
+fn binder_write_obj(st: &mut BinderState, to: &str, node: usize, weak: bool, out: &mut [u8], off: usize) {
+    let (owner, nptr, ncookie) = {
+        let n = &st.nodes[node];
+        (n.owner.clone(), n.ptr, n.cookie)
+    };
+    if owner == to {
+        put_u32(out, off, if weak { OBJ_WEAK_BINDER } else { OBJ_BINDER });
+        put_u32(out, off + 8, nptr);
+        put_u32(out, off + 12, ncookie);
+    } else {
+        let h = st.handle_for(to, node);
+        put_u32(out, off, if weak { OBJ_WEAK_HANDLE } else { OBJ_HANDLE });
+        put_u32(out, off + 8, h);
+        put_u32(out, off + 12, 0);
+    }
+}
+
+/// The driver's parcel translation: local objects become
+/// nodes, handles resolve through the sender's table, and
+/// everything is re-expressed in the receiver's view. FD
+/// objects pass through untranslated (v1 boundary, noted).
+fn binder_translate(st: &mut BinderState, from: &str, to: &str, data: &[u8], offs: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let mut i = 0;
+    while i + 4 <= offs.len() {
+        let off = u32_at(offs, i) as usize;
+        i += 4;
+        if off + 16 > out.len() {
+            continue;
+        }
+        let ty = u32_at(&out, off);
+        let ptr = u32_at(&out, off + 8);
+        let cookie = u32_at(&out, off + 12);
+        match ty {
+            OBJ_BINDER | OBJ_WEAK_BINDER => {
+                let node = st.node_for_local(from, ptr, cookie);
+                binder_write_obj(st, to, node, ty == OBJ_WEAK_BINDER, &mut out, off);
+            }
+            OBJ_HANDLE | OBJ_WEAK_HANDLE => {
+                let node = if ptr == 0 {
+                    st.mgr_node
+                } else {
+                    st.procs
+                        .get(from)
+                        .and_then(|p| p.handles.get(&ptr).copied())
+                };
+                match node {
+                    Some(n) => binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off),
+                    None => st.note("parcel carried an unknown handle; left untranslated"),
+                }
+            }
+            _ => st.note("parcel object of untranslated type passed through"),
+        }
+    }
+    out
+}
+
+/// Copy a translated parcel into the target arena and queue
+/// the BR_TRANSACTION / BR_REPLY carrying it. Returns false
+/// when the target cannot receive (no mmap, arena full).
+fn binder_deliver(
+    st: &mut BinderState,
+    target: &str,
+    br_cmd: u32,
+    target_ptr: u32,
+    cookie: u32,
+    code: u32,
+    flags: u32,
+    sender_pid: i32,
+    sender_euid: u32,
+    data: &[u8],
+    offs: &[u8],
+) -> bool {
+    let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
+    let Some(off) = st.alloc(target, total.max(8)) else {
+        return false;
+    };
+    let Some(bp) = st.procs.get_mut(target) else {
+        return false;
+    };
+    let Some(&base) = bp.base.values().next() else {
+        return false;
+    };
+    if bp.file.write_all_at(data, off as u64).is_err()
+        || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
+    {
+        return false;
+    }
+    let mut txn = [0u8; 40];
+    put_u32(&mut txn, 0, target_ptr);
+    put_u32(&mut txn, 4, cookie);
+    put_u32(&mut txn, 8, code);
+    put_u32(&mut txn, 12, flags);
+    put_u32(&mut txn, 16, sender_pid as u32);
+    put_u32(&mut txn, 20, sender_euid);
+    put_u32(&mut txn, 24, data.len() as u32);
+    put_u32(&mut txn, 28, offs.len() as u32);
+    put_u32(&mut txn, 32, base + off);
+    put_u32(&mut txn, 36, base + off + ((data.len() as u32 + 3) & !3));
+    bp.queue.extend_from_slice(&br_cmd.to_le_bytes());
+    bp.queue.extend_from_slice(&txn);
+    true
+}
+
+/// If the target arena has a parked reader, schedule its
+/// wake (the main loop performs it after the entry stop).
+fn binder_maybe_wake(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
+    if let Some(bp) = st.procs.get(arena) {
+        if bp.queue.is_empty() {
+            return;
+        }
+        for pid in &bp.loopers {
+            if st.parked.contains_key(pid) && !wakes.contains(pid) {
+                wakes.push(*pid);
+                return;
+            }
+        }
+        // A parked non-looper (a reply waiter) also receives.
+        for (pid, park) in &st.parked {
+            if st.thread_arena.get(pid).map(|a| a == arena).unwrap_or(false)
+                && park.read_size > 0
+                && !wakes.contains(pid)
+            {
+                wakes.push(*pid);
+                return;
+            }
+        }
+    }
+}
+
+/// Process one binder WRITE_READ stream's write side.
+#[allow(clippy::too_many_arguments)]
+fn binder_process_stream(
+    pid: i32,
+    arena: &str,
+    stream: &[u8],
+    st: &mut BinderState,
+    veuid: u32,
+    wakes: &mut Vec<i32>,
+    notes: &mut Vec<String>,
+) {
+    let mut cur = 0usize;
+    while cur + 4 <= stream.len() {
+        let cmd = u32_at(stream, cur);
+        cur += 4;
+        match cmd {
+            BC_ENTER_LOOPER | BC_REGISTER_LOOPER => {
+                if let Some(bp) = st.procs.get_mut(arena) {
+                    bp.loopers.insert(pid);
+                }
+                notes.push("looper in".to_string());
+            }
+            BC_EXIT_LOOPER => {
+                if let Some(bp) = st.procs.get_mut(arena) {
+                    bp.loopers.remove(&pid);
+                }
+                notes.push("looper out".to_string());
+            }
+            BC_FREE_BUFFER => {
+                if cur + 4 > stream.len() {
+                    break;
+                }
+                let ptr = u32_at(stream, cur);
+                cur += 4;
+                if let Some(bp) = st.procs.get_mut(arena) {
+                    if let Some(&base) = bp.base.get(&pid) {
+                        let off = ptr.wrapping_sub(base);
+                        if let Some(sz) = bp.used.remove(&off) {
+                            bp.free.push((off, sz));
+                        }
+                    }
+                }
+            }
+            BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
+                if cur + 4 > stream.len() {
+                    break;
+                }
+                cur += 4;
+                st.note("refcount BC consumed (v1 no-op)");
+            }
+            BC_INCREFS_DONE | BC_ACQUIRE_DONE => {
+                if cur + 8 > stream.len() {
+                    break;
+                }
+                cur += 8;
+            }
+            BC_ATTEMPT_ACQUIRE => {
+                if cur + 8 > stream.len() {
+                    break;
+                }
+                cur += 8;
+                if let Some(bp) = st.procs.get_mut(arena) {
+                    bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+                }
+                st.note("ATTEMPT_ACQUIRE answered DEAD_REPLY (v1)");
+            }
+            BC_REQUEST_DEATH_NOTIFICATION => {
+                if cur + 8 > stream.len() {
+                    break;
+                }
+                let h = u32_at(stream, cur);
+                let cookie = u32_at(stream, cur + 4);
+                cur += 8;
+                let node = if h == 0 {
+                    st.mgr_node
+                } else {
+                    st.procs.get(arena).and_then(|p| p.handles.get(&h).copied())
+                };
+                if let Some(n) = node {
+                    st.watchers
+                        .entry(n)
+                        .or_default()
+                        .push((arena.to_string(), cookie));
+                    notes.push("death watch registered".to_string());
+                }
+            }
+            BC_CLEAR_DEATH_NOTIFICATION => {
+                if cur + 8 > stream.len() {
+                    break;
+                }
+                let cookie = u32_at(stream, cur + 4);
+                cur += 8;
+                for v in st.watchers.values_mut() {
+                    v.retain(|(a, c)| !(a == arena && *c == cookie));
+                }
+                if let Some(bp) = st.procs.get_mut(arena) {
+                    bp.queue
+                        .extend_from_slice(&BR_CLEAR_DEATH_NOTIFICATION_DONE.to_le_bytes());
+                    bp.queue.extend_from_slice(&cookie.to_le_bytes());
+                }
+            }
+            BC_DEAD_BINDER_DONE => {
+                if cur + 4 > stream.len() {
+                    break;
+                }
+                cur += 4;
+            }
+            BC_TRANSACTION | BC_REPLY => {
+                if cur + 40 > stream.len() {
+                    notes.push("short txn in write stream".to_string());
+                    break;
+                }
+                let txn: Vec<u8> = stream[cur..cur + 40].to_vec();
+                cur += 40;
+                binder_handle_txn(pid, arena, cmd == BC_REPLY, &txn, st, veuid, wakes, notes);
+            }
+            other => {
+                notes.push(format!("unknown BC {other:#010x}; stream parse stopped"));
+                break;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn binder_handle_txn(
+    pid: i32,
+    arena: &str,
+    is_reply: bool,
+    txn: &[u8],
+    st: &mut BinderState,
+    veuid: u32,
+    wakes: &mut Vec<i32>,
+    notes: &mut Vec<String>,
+) {
+    let target = u32_at(txn, 0);
+    let cookie = u32_at(txn, 4);
+    let code = u32_at(txn, 8);
+    let flags = u32_at(txn, 12);
+    let dsize = u32_at(txn, 24) as usize;
+    let osize = u32_at(txn, 28) as usize;
+    let daddr = u32_at(txn, 32);
+    let oaddr = u32_at(txn, 36);
+    if dsize > (1 << 20) || osize > (1 << 16) {
+        notes.push("txn too large; dropped".to_string());
+        return;
+    }
+    let Some(data) = read_mem_vec(pid, daddr as u64, dsize) else {
+        notes.push("txn data unreadable; dropped".to_string());
+        return;
+    };
+    let offs = if osize > 0 {
+        read_mem_vec(pid, oaddr as u64, osize).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if is_reply {
+        let w = st
+            .waiters
+            .get_mut(arena)
+            .and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) });
+        let Some(w) = w else {
+            notes.push("BC_REPLY with no waiter; dropped".to_string());
+            return;
+        };
+        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs);
+        let ok = binder_deliver(
+            st,
+            &w.sender_arena,
+            BR_REPLY,
+            w.target_handle,
+            w.cookie,
+            0,
+            flags,
+            pid,
+            veuid,
+            &tdata,
+            &offs,
+        );
+        if !ok {
+            if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
+                bp.queue.extend_from_slice(&BR_FAILED_REPLY.to_le_bytes());
+            }
+        }
+        binder_maybe_wake(st, &w.sender_arena, wakes);
+        notes.push(format!("REPLY -> pid {} ({}B)", w.sender_pid, tdata.len()));
+        return;
+    }
+    let node = if target == 0 {
+        st.mgr_node
+    } else {
+        st.procs.get(arena).and_then(|p| p.handles.get(&target).copied())
+    };
+    let Some(node) = node else {
+        if let Some(bp) = st.procs.get_mut(arena) {
+            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+        }
+        notes.push(format!("TRANSACTION to unknown handle {target} -> DEAD_REPLY"));
+        return;
+    };
+    let (owner, nptr, ncookie) = {
+        let n = &st.nodes[node];
+        (n.owner.clone(), n.ptr, n.cookie)
+    };
+    let tdata = binder_translate(st, arena, &owner, &data, &offs);
+    let ok = binder_deliver(
+        st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
+    );
+    if !ok {
+        if let Some(bp) = st.procs.get_mut(arena) {
+            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+        }
+        notes.push("TRANSACTION target cannot receive -> DEAD_REPLY".to_string());
+        return;
+    }
+    if flags & TF_ONE_WAY == 0 {
+        st.waiters.entry(owner.clone()).or_default().push(ReplyWait {
+            sender_pid: pid,
+            sender_arena: arena.to_string(),
+            cookie,
+            target_handle: target,
+        });
+    }
+    if let Some(bp) = st.procs.get_mut(arena) {
+        bp.queue
+            .extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+    }
+    binder_maybe_wake(st, &owner, wakes);
+    notes.push(format!("TRANSACTION code {code} -> node in {owner} ({}B)", tdata.len()));
+}
+
+/// Emulate one BINDER_WRITE_READ ioctl at its entry stop.
+#[allow(clippy::too_many_arguments)]
+fn binder_write_read(
+    pid: i32,
+    arena: &str,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    st: &mut BinderState,
+    vcreds: &HashMap<i32, (u32, u32)>,
+    wakes: &mut Vec<i32>,
+) -> String {
+    let bwr_addr = regs.arg(2);
+    let Some(bwr) = read_mem_vec(pid, bwr_addr, 24) else {
+        skip_syscall(pid, regs, pend, -14);
+        return "binder WRITE_READ: bwr unreadable -> -EFAULT".to_string();
+    };
+    let ws = u32_at(&bwr, 0);
+    let wc0 = u32_at(&bwr, 4);
+    let wb = u32_at(&bwr, 8);
+    let rs = u32_at(&bwr, 12);
+    let rb = u32_at(&bwr, 20);
+    let arena = arena.to_string();
+    let veuid = vcreds.get(&pid).copied().unwrap_or((0, 0)).0;
+    let mut notes: Vec<String> = Vec::new();
+    if ws > wc0 && ws <= (1 << 20) {
+        match read_mem_vec(pid, (wb + wc0) as u64, (ws - wc0) as usize) {
+            Some(stream) => {
+                binder_process_stream(pid, &arena, &stream, st, veuid, wakes, &mut notes)
+            }
+            None => notes.push("write stream unreadable".to_string()),
+        }
+    }
+    let writeback = |rc: u32| {
+        let mut b = [0u8; 24];
+        put_u32(&mut b, 0, ws);
+        put_u32(&mut b, 4, ws);
+        put_u32(&mut b, 8, wb);
+        put_u32(&mut b, 12, rs);
+        put_u32(&mut b, 16, rc);
+        put_u32(&mut b, 20, rb);
+        b
+    };
+    let queue_len = st.procs.get(&arena).map(|p| p.queue.len()).unwrap_or(0);
+    if rs > 0 && queue_len > 0 {
+        let n = queue_len.min(rs as usize);
+        let bytes: Vec<u8> = st
+            .procs
+            .get_mut(&arena)
+            .map(|bp| bp.queue.drain(..n).collect())
+            .unwrap_or_default();
+        let _ = write_mem(pid, rb as u64, &bytes);
+        let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
+        skip_syscall(pid, regs, pend, 0);
+        notes.push(format!("read filled {}B", bytes.len()));
+    } else if rs > 0 {
+        skip_syscall(pid, regs, pend, 0);
+        st.parked.insert(
+            pid,
+            ParkedIoctl {
+                bwr: bwr_addr as u32,
+                read_buf: rb,
+                read_size: rs,
+                write_consumed: ws,
+            },
+        );
+        pend.binder_parked = true;
+        notes.push("parked awaiting work".to_string());
+    } else {
+        let _ = write_mem(pid, bwr_addr, &writeback(0));
+        skip_syscall(pid, regs, pend, 0);
+    }
+    if notes.is_empty() {
+        notes.push("no work".to_string());
+    }
+    format!("binder WRITE_READ [{}]", notes.join("; "))
+}
+
+/// Finish a parked binder ioctl now that its arena has bytes:
+/// fill the read buffer, settle the bwr consumed fields, make
+/// the exit stop report 0, and continue the tracee into it.
+fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut BinderState) {
+    let Some(park) = st.parked.remove(&pid) else {
+        return;
+    };
+    let Some(arena) = st.thread_arena.get(&pid).cloned() else {
+        return;
+    };
+    let bytes: Vec<u8> = {
+        let Some(bp) = st.procs.get_mut(&arena) else {
+            return;
+        };
+        let n = bp.queue.len().min(park.read_size as usize);
+        bp.queue.drain(..n).collect()
+    };
+    if bytes.is_empty() {
+        st.parked.insert(pid, park);
+        return;
+    }
+    let _ = write_mem(pid, park.read_buf as u64, &bytes);
+    let _ = write_mem(pid, (park.bwr + 4) as u64, &park.write_consumed.to_le_bytes());
+    let _ = write_mem(pid, (park.bwr + 16) as u64, &(bytes.len() as u32).to_le_bytes());
+    if let Some(proc) = procs.get_mut(&pid) {
+        if let Some(pend) = proc.pending.as_mut() {
+            pend.inject = None;
+        }
+        if let Some(mut regs) = get_regs(pid, proc.compat) {
+            regs.set_retval(0);
+            let _ = set_regs(pid, &regs);
+        }
+    }
+    cont_syscall(pid, 0);
+}
+
+/// True when this open-family call targets /dev/binder.
+fn open_targets_binder(pid: i32, vcwd: &str, compat: bool, nr: u64, regs: &Regs) -> bool {
+    let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
+        1
+    } else {
+        0
+    };
+    match read_path(pid, regs.arg(path_arg)) {
+        Some(p) => guest_abs(vcwd, &p) == "/dev/binder",
+        None => false,
+    }
+}
+
+/// open("/dev/binder"): point the call at a fresh per-opener
+/// arena file the supervisor owns, and register the arena.
+fn entry_open_binder(
+    pid: i32,
+    rootfs: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+    st: &mut BinderState,
+) -> String {
+    let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
+        1
+    } else {
+        0
+    };
+    let arena = format!("{rootfs}/.binder/{pid}");
+    let _ = std::fs::create_dir_all(format!("{rootfs}/.binder"));
+    match std::fs::OpenOptions::new().create(true).write(true).open(&arena) {
+        Ok(f) => {
+            if f.metadata().map(|m| m.len()).unwrap_or(0) < BINDER_ARENA_CAP as u64 {
+                let _ = f.set_len(BINDER_ARENA_CAP as u64);
+            }
+            st.procs.entry(arena.clone()).or_insert_with(|| BinderProc {
+                file: f,
+                base: HashMap::new(),
+                bump: 0,
+                free: Vec::new(),
+                used: HashMap::new(),
+                handles: HashMap::new(),
+                next_handle: 1,
+                queue: Vec::new(),
+                loopers: HashSet::new(),
+            });
+        }
+        Err(e) => return format!("binder arena create failed: {e}"),
+    }
+    st.thread_arena.insert(pid, arena.clone());
+    let mut cursor = regs.sp().saturating_sub(256);
+    match scratch_write(pid, &mut cursor, &arena) {
+        Some(addr) => {
+            regs.set_arg(path_arg, addr);
+            "open '/dev/binder' -> binder arena (virtual driver)".to_string()
+        }
+        None => "open '/dev/binder' (scratch write failed)".to_string(),
     }
 }
 
@@ -2029,6 +2755,11 @@ fn main() {
     // creds while another ProcState is borrowed.
     let mut vcreds: HashMap<i32, (u32, u32)> = HashMap::new();
     vcreds.insert(root_pid, (0, 0));
+    // The virtual binder driver (S5): all state lives here,
+    // keyed by arena host path; wakes collects parked tracees
+    // to complete after each entry stop.
+    let mut binder = BinderState::default();
+    let mut wakes: Vec<i32> = Vec::new();
     let mut root_launched = false;
     // Keyed by (compat, nr): the root's launch execve is counted
     // under the native table, everything else under the guest's.
@@ -2068,6 +2799,12 @@ fn main() {
             }
             procs.remove(&pid);
             vcreds.remove(&pid);
+            if let Some(a) = binder.thread_arena.remove(&pid) {
+                if let Some(bp) = binder.procs.get_mut(&a) {
+                    bp.loopers.remove(&pid);
+                }
+            }
+            binder.parked.remove(&pid);
             if is_root {
                 // The session ends with the root: kill whatever is
                 // left of the tree and drain the exit reports.
@@ -2145,6 +2882,8 @@ fn main() {
                     mem_restore: None,
                     rescue_only: false,
                     peercred: None,
+                    binder_parked: false,
+                    mmap_binder: None,
                 };
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -2312,6 +3051,100 @@ fn main() {
                         nr
                     ));
                     dirty = true;
+                } else if is_open_family(proc.compat, nr)
+                    && open_targets_binder(pid, &proc.vcwd, proc.compat, nr, &regs)
+                {
+                    // open("/dev/binder"): reroute to the
+                    // supervisor-owned arena file (S5).
+                    pend.desc = Some(entry_open_binder(
+                        pid,
+                        &rootfs,
+                        proc.compat,
+                        nr,
+                        &mut regs,
+                        &mut binder,
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
+                    && fd_arena(pid, regs.arg(4) as i32).is_some()
+                {
+                    // mmap on a binder arena: flip PRIVATE to
+                    // SHARED so driver writes are visible.
+                    let arena = fd_arena(pid, regs.arg(4) as i32).unwrap();
+                    let flags = regs.arg(3);
+                    regs.set_arg(3, (flags & !2) | 1);
+                    binder.thread_arena.insert(pid, arena.clone());
+                    pend.mmap_binder = Some(arena);
+                    pend.desc = Some(format!(
+                        "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
+                    && matches!(
+                        regs.arg(1) as u32,
+                        BINDER_WRITE_READ
+                            | BINDER_SET_IDLE_TIMEOUT
+                            | BINDER_SET_MAX_THREADS
+                            | BINDER_SET_IDLE_PRIORITY
+                            | BINDER_SET_CONTEXT_MGR
+                            | BINDER_THREAD_EXIT
+                            | BINDER_VERSION
+                    )
+                    && fd_arena(pid, regs.arg(0) as i32).is_some()
+                {
+                    let arena = fd_arena(pid, regs.arg(0) as i32).unwrap();
+                    binder.thread_arena.insert(pid, arena.clone());
+                    match regs.arg(1) as u32 {
+                        BINDER_VERSION => {
+                            let _ = write_mem(pid, regs.arg(2), &7u32.to_le_bytes());
+                            skip_syscall(pid, &mut regs, &mut pend, 0);
+                            pend.desc = Some("binder VERSION -> 7".to_string());
+                        }
+                        BINDER_SET_CONTEXT_MGR => {
+                            let ok = match &binder.mgr_arena {
+                                None => {
+                                    binder.mgr_arena = Some(arena.clone());
+                                    let n = binder.node_for_local(&arena, 0, 0);
+                                    binder.mgr_node = Some(n);
+                                    true
+                                }
+                                Some(a) => *a == arena,
+                            };
+                            skip_syscall(pid, &mut regs, &mut pend, if ok { 0 } else { -1 });
+                            pend.desc = Some(format!(
+                                "binder SET_CONTEXT_MGR -> {}",
+                                if ok {
+                                    "ok (this process is the context manager)"
+                                } else {
+                                    "denied (a manager already exists)"
+                                }
+                            ));
+                        }
+                        BINDER_THREAD_EXIT => {
+                            if let Some(bp) = binder.procs.get_mut(&arena) {
+                                bp.loopers.remove(&pid);
+                            }
+                            binder.parked.remove(&pid);
+                            skip_syscall(pid, &mut regs, &mut pend, 0);
+                            pend.desc = Some("binder THREAD_EXIT".to_string());
+                        }
+                        BINDER_WRITE_READ => {
+                            pend.desc = Some(binder_write_read(
+                                pid,
+                                &arena,
+                                &mut regs,
+                                &mut pend,
+                                &mut binder,
+                                &vcreds,
+                                &mut wakes,
+                            ));
+                        }
+                        req => {
+                            skip_syscall(pid, &mut regs, &mut pend, 0);
+                            pend.desc = Some(format!("binder ioctl {req:#010x} (no-op)"));
+                        }
+                    }
+                    dirty = true;
                 } else if ((proc.compat && nr == 295) || (!proc.compat && nr == 209))
                     && regs.arg(1) == 1
                     && regs.arg(2) == 17
@@ -2353,12 +3186,23 @@ fn main() {
                         );
                     }
                 }
+                let parked = pend.binder_parked;
                 if dirty {
                     set_regs(pid, &regs);
                 }
                 proc.pending = Some(pend);
                 proc.expect_exit = true;
-                cont_syscall(pid, 0);
+                if !parked {
+                    cont_syscall(pid, 0);
+                }
+                // Complete parked binder ioctls this stop's
+                // work woke (other tracees only; our own read
+                // side was settled inline or parked above).
+                for wpid in std::mem::take(&mut wakes) {
+                    if wpid != pid {
+                        complete_parked(wpid, &mut procs, &mut binder);
+                    }
+                }
             } else {
                 // ---- syscall-exit stop ----
                 if let Some(mut pend) = proc.pending.take() {
@@ -2379,6 +3223,13 @@ fn main() {
                         if let Some((optval, optlen)) = pend.peercred {
                             if ret == 0 {
                                 patch_peercred(pid, optval, optlen, &vcreds);
+                            }
+                        }
+                        if let Some(arena) = &pend.mmap_binder {
+                            if ret > 0 {
+                                if let Some(bp) = binder.procs.get_mut(arena) {
+                                    bp.base.insert(pid, ret as u32);
+                                }
                             }
                         }
                     }

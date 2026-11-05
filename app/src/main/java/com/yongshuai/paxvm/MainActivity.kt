@@ -108,10 +108,16 @@ class MainActivity : Activity() {
         "",
         "on boot",
         "    setprop pax.stage boot",
+        "    start servicemanager",
         "    start paxprobe",
         "",
         "service paxprobe /bin/sh /probe.sh",
         "    oneshot",
+        "",
+        // S5: the real servicemanager, served by the
+        // supervisor's virtual binder driver. Not oneshot:
+        // init restarts it if it ever exits.
+        "service servicemanager /system/bin/servicemanager",
         "",
     ).joinToString("\n")
 
@@ -134,7 +140,6 @@ class MainActivity : Activity() {
         "/system/bin/setprop debug.fromprobe yes",
         "W=$(/system/bin/getprop debug.fromprobe)",
         "mkdir /data/FROMPROBE_IS_\$W",
-        "/system/bin/servicemanager &",
         "sleep 1",
         "ls /",
         "echo paxprobe-end",
@@ -337,6 +342,11 @@ class MainActivity : Activity() {
                 appendLog("[shell] symlink sh failed: $e")
             }
         }
+        // Binder arenas belong to one session's supervisor;
+        // stale files from a dead session must not be reused
+        // (the supervisor also recreates state per pid, this is
+        // belt and braces).
+        File(rootfs, ".binder").deleteRecursively()
         writeFresh(File(rootfs, "init.rc"), gbInitRc)
         writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
         // init reads the kernel cmdline for androidboot.hardware
