@@ -31,6 +31,7 @@ const PTRACE_SETOPTIONS: i32 = 0x4200;
 const PTRACE_GETEVENTMSG: i32 = 0x4201;
 const PTRACE_GETREGSET: i32 = 0x4204;
 const PTRACE_SETREGSET: i32 = 0x4205;
+const PTRACE_GETSIGINFO: i32 = 0x4207; // not exposed by libc on Android
 const PTRACE_O_TRACESYSGOOD: usize = 0x1;
 const PTRACE_O_TRACEFORK: usize = 0x2;
 const PTRACE_O_TRACEVFORK: usize = 0x4;
@@ -45,6 +46,7 @@ const NT_PRSTATUS: usize = 1;
 
 const SIGTRAP: i32 = 5;
 const SIGSTOP: i32 = 19;
+const SIGSYS: i32 = 31;
 const SYSCALL_STOP_SIG: i32 = SIGTRAP | 0x80;
 const WALL: i32 = 0x40000000; // __WALL: wait for threads too
 
@@ -319,6 +321,42 @@ fn get_event_msg(pid: i32) -> Option<u64> {
         Some(msg)
     } else {
         None
+    }
+}
+
+/// SIGSYS forensics (purely additive; never alters handling).
+/// A seccomp trap fires *before* the syscall-entry stop, so the
+/// culprit syscall leaves no [sys] line. The siginfo the kernel
+/// attached to the signal names it: for si_code == SYS_SECCOMP (1)
+/// the _sigsys union carries the trapped syscall number, the audit
+/// arch and the userspace call address. aarch64 siginfo_t layout:
+/// si_signo@0 (i32), si_errno@4, si_code@8, union@16 —
+/// _call_addr@16 (u64), _syscall@24 (i32), _arch@28 (u32).
+fn dump_sigsys_info(pid: i32) {
+    let mut buf = [0u8; 128];
+    let rc = ptrace4(
+        PTRACE_GETSIGINFO,
+        pid,
+        std::ptr::null_mut(),
+        buf.as_mut_ptr() as *mut libc::c_void,
+    );
+    if rc != 0 {
+        sup!("SIGSYS detail pid={pid}: GETSIGINFO failed errno={}", errno());
+    } else {
+        let si_code = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let call_addr = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let sc = i32::from_ne_bytes(buf[24..28].try_into().unwrap());
+        let arch = u32::from_ne_bytes(buf[28..32].try_into().unwrap());
+        let name = if sc >= 0 { nr_name(sc as u64) } else { "unknown-id" };
+        sup!(
+            "SIGSYS detail pid={pid}: si_code={si_code} syscall={sc} name={name} arch=0x{arch:x} call_addr=0x{call_addr:x}"
+        );
+    }
+    if let Some(r) = get_regs(pid) {
+        sup!(
+            "SIGSYS regs pid={pid}: pc=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}",
+            r.pc, r.regs[0], r.regs[1], r.regs[2]
+        );
     }
 }
 
@@ -1167,6 +1205,12 @@ fn main() {
             cont_syscall(pid, 0);
         } else {
             // Signal-delivery stop: reinject the signal unchanged.
+            // A trapped guest dies by this SIGSYS reinjection; dump
+            // the kernel's siginfo first so the log names the syscall
+            // the seccomp filter objected to.
+            if sig == SIGSYS {
+                dump_sigsys_info(pid);
+            }
             cont_syscall(pid, sig);
         }
     }
