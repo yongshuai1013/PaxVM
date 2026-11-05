@@ -61,24 +61,42 @@ jobs:
       # exec handler rewrites to this same binary (M1 spec 2b/5).
       - name: Build busybox (aarch64, static)
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu bzip2
           curl -fsSL -o busybox-1.36.1.tar.bz2 \
             https://busybox.net/downloads/busybox-1.36.1.tar.bz2
           echo "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314  busybox-1.36.1.tar.bz2" | sha256sum -c -
           tar xjf busybox-1.36.1.tar.bz2
+          # The tarball's top-level directory is busybox-1.36.1/
+          # (verified against the tar listing); everything below
+          # runs inside it.
           cd busybox-1.36.1
+          test -f Makefile
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          ./scripts/config --enable STATIC
-          ./scripts/config --enable FEATURE_SH_STANDALONE
+          # BusyBox ships no scripts/config (that helper is a
+          # Linux-kernel tool and is absent from the 1.36.1 tree),
+          # so flip the two options in .config directly, then let
+          # oldconfig settle dependencies. The grep assertions fail
+          # the step if either option does not end up =y, checked
+          # both before and after oldconfig.
+          sed -i 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' .config
+          sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set$/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+          grep -q "^CONFIG_STATIC=y" .config
+          grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          # pipefail would let yes(1)'s SIGPIPE fail this pipeline;
+          # the status that matters is make's, i.e. the last
+          # command's, which is what remains with pipefail off.
+          set +o pipefail
           yes '' | make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig
+          set -o pipefail
           grep -q "^CONFIG_STATIC=y" .config
           grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
           file busybox | grep -q "statically linked"
-          mkdir -p ../app/src/main/jniLibs/arm64-v8a
-          cp busybox ../app/src/main/jniLibs/arm64-v8a/libbusybox.so
-          ls -la ../app/src/main/jniLibs/arm64-v8a/
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox.so"
+          ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
 
       # Guard the payloads' static-ness and the APK contents: if a
       # payload ever gains an INTERP segment it cannot be exec'd
