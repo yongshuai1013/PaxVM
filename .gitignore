@@ -8,3 +8,7 @@
 target/
 # Native payloads are built by CI and copied into jniLibs; do not commit them.
 app/src/main/jniLibs/arm64-v8a/*.so
+# Signing keystores never enter the repo; CI receives the pinned key
+# via GitHub secrets (see build.yml), backups live outside the clone.
+*.jks
+*.keystore

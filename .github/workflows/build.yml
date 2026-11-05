@@ -105,6 +105,35 @@ jobs:
             exit 1
           fi
 
+      # Pinned signing: decode the project's permanent keystore from
+      # secrets and hand its coordinates to gradle (build.gradle.kts
+      # reads the four env vars). Without this, AGP signs with a debug
+      # key generated fresh on the runner, so every build's signature
+      # differs and Android refuses overlay installs. Passwords travel
+      # only via secrets/env, never through repo files; when the
+      # secrets are absent (e.g. forks) nothing is set and gradle
+      # falls back to the default debug signature.
+      - name: Set up pinned signing key
+        env:
+          PAXVM_KEYSTORE_B64: ${{ secrets.PAXVM_KEYSTORE_B64 }}
+          PAXVM_KEYSTORE_PASSWORD: ${{ secrets.PAXVM_KEYSTORE_PASSWORD }}
+          PAXVM_KEY_ALIAS: ${{ secrets.PAXVM_KEY_ALIAS }}
+          PAXVM_KEY_PASSWORD: ${{ secrets.PAXVM_KEY_PASSWORD }}
+        run: |
+          if [ -n "$PAXVM_KEYSTORE_B64" ] && [ -n "$PAXVM_KEYSTORE_PASSWORD" ] \
+             && [ -n "$PAXVM_KEY_ALIAS" ] && [ -n "$PAXVM_KEY_PASSWORD" ]; then
+            echo "$PAXVM_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/paxvm.jks"
+            {
+              echo "PAXVM_KEYSTORE_PATH=$RUNNER_TEMP/paxvm.jks"
+              echo "PAXVM_KEYSTORE_PASSWORD=$PAXVM_KEYSTORE_PASSWORD"
+              echo "PAXVM_KEY_ALIAS=$PAXVM_KEY_ALIAS"
+              echo "PAXVM_KEY_PASSWORD=$PAXVM_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "Pinned signing key configured for this build."
+          else
+            echo "Signing secrets absent; using default debug signing."
+          fi
+
       - name: Build APK (debug)
         run: |
           chmod +x gradlew
