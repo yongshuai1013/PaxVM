@@ -140,7 +140,15 @@ class MainActivity : Activity() {
         "/system/bin/setprop debug.fromprobe yes",
         "W=$(/system/bin/getprop debug.fromprobe)",
         "mkdir /data/FROMPROBE_IS_\$W",
+        // S5b: exercise the virtual binder driver end to end.
+        // serve registers "paxsvc" and parks in its looper;
+        // list enumerates the manager's registry; ping does a
+        // cross-process transaction and checks the reply. All
+        // evidence lands as /data markers + svc-list.txt.
+        "/system/bin/paxsvc serve &",
         "sleep 1",
+        "/system/bin/paxsvc list",
+        "/system/bin/paxsvc ping",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")

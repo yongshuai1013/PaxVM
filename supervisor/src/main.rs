@@ -857,10 +857,10 @@ struct Pending {
     /// continued until the virtual driver has data for it (see
     /// complete_parked).
     binder_parked: bool,
-    /// An mmap on a binder arena fd: the arena's host path. At
-    /// the exit stop the returned address becomes the arena
-    /// base for this thread.
-    mmap_binder: Option<String>,
+    /// An mmap on a binder arena fd: (arena host path, map
+    /// length). At the exit stop the returned address becomes
+    /// the arena base for this thread.
+    mmap_binder: Option<(String, u32)>,
 }
 
 struct ProcState {
@@ -1247,6 +1247,10 @@ struct BinderProc {
     file: std::fs::File,
     /// thread pid -> guest address of this arena's mmap
     base: HashMap<i32, u32>,
+    /// thread pid -> mapped length: deliveries must stay
+    /// inside what the guest actually mapped (2.3 maps
+    /// 128KB), not merely inside the arena file
+    maplen: HashMap<i32, u32>,
     bump: u32,
     free: Vec<(u32, u32)>,
     used: HashMap<u32, u32>,
@@ -1339,7 +1343,14 @@ impl BinderState {
                 return Some(o);
             }
         }
-        if bp.bump + size > BINDER_ARENA_CAP {
+        let cap = bp
+            .maplen
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(128 * 1024)
+            .min(BINDER_ARENA_CAP);
+        if bp.bump + size > cap {
             return None;
         }
         let o = bp.bump;
@@ -1852,6 +1863,7 @@ fn entry_open_binder(
             st.procs.entry(arena.clone()).or_insert_with(|| BinderProc {
                 file: f,
                 base: HashMap::new(),
+                maplen: HashMap::new(),
                 bump: 0,
                 free: Vec::new(),
                 used: HashMap::new(),
@@ -3066,7 +3078,7 @@ fn main() {
                     let flags = regs.arg(3);
                     regs.set_arg(3, (flags & !2) | 1);
                     binder.thread_arena.insert(pid, arena.clone());
-                    pend.mmap_binder = Some(arena);
+                    pend.mmap_binder = Some((arena, regs.arg(1) as u32));
                     pend.desc = Some(format!(
                         "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
                     ));
@@ -3217,10 +3229,11 @@ fn main() {
                                 patch_peercred(pid, optval, optlen, &vcreds);
                             }
                         }
-                        if let Some(arena) = &pend.mmap_binder {
+                        if let Some((arena, maplen)) = &pend.mmap_binder {
                             if ret > 0 {
                                 if let Some(bp) = binder.procs.get_mut(arena) {
                                     bp.base.insert(pid, ret as u32);
+                                    bp.maplen.insert(pid, *maplen);
                                 }
                             }
                         }

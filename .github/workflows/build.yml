@@ -295,6 +295,38 @@ jobs:
       # it into the GB rootfs and recreates the toolbox symlinks
       # (getprop/setprop). The two anchor binaries are
       # sha256-pinned like the init.
+      # paxsvc (S5b): our own guest binder client/server,
+      # freestanding against the guest's libc. Linked via a
+      # generated stub (soname libc.so, empty bodies) because
+      # lld refuses the 2011 libc.so's symbol table; the guest
+      # linker resolves the names against the real libc.so at
+      # runtime. Output lands in gbsys/bin so the next step's
+      # zip walk picks it up.
+      - name: Build paxsvc (guest binder client/server)
+        run: |
+          set -euo pipefail
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > /tmp/libcst.c <<'CEOF'
+          int open(void){return 0;} int close(void){return 0;} int read(void){return 0;}
+          int write(void){return 0;} int ioctl(void){return 0;} void *mmap(void){return 0;}
+          int munmap(void){return 0;} int mkdir(void){return 0;} void _exit(int x){(void)x;}
+          void __libc_init(void){}
+          CEOF
+          "$TC/clang" --target=armv7a-linux-androideabi -nostdlib -shared \
+            -Wl,-soname,libc.so -o /tmp/libc_stub.so /tmp/libcst.c
+          mkdir -p gbsys/bin
+          "$TC/clang" --target=armv7a-linux-androideabi -marm -O2 \
+            -fno-stack-protector -fno-builtin -nostdlib -no-pie \
+            -Wl,-e,_start -Wl,--no-undefined \
+            -Wl,-dynamic-linker,/system/bin/linker \
+            -o gbsys/bin/paxsvc paxsvc/paxsvc.c /tmp/libc_stub.so
+          "$TC/llvm-readelf" -h gbsys/bin/paxsvc | grep -q 'Class:.*ELF32'
+          "$TC/llvm-readelf" -h gbsys/bin/paxsvc | grep -q 'Type:.*EXEC'
+          "$TC/llvm-readelf" -d gbsys/bin/paxsvc | grep -q 'NEEDED.*libc.so'
+          if "$TC/llvm-readelf" -r gbsys/bin/paxsvc | grep -q IRELATIVE; then
+            echo "paxsvc carries IRELATIVE relocs (2.3 linker cannot)" >&2; exit 1
+          fi
+          ls -la gbsys/bin/paxsvc
       - name: Fetch Gingerbread system subset (SDK API 10 system image)
         run: |
           set -euo pipefail
