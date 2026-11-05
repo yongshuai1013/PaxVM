@@ -29,6 +29,15 @@ import kotlin.concurrent.thread
  * 0.2.8 adds a second entry: the same session with a 32-bit ARM
  * busybox guest (libbusybox32.so) in its own rootfs, probing the
  * supervisor's compat-personality support (gingerbread spike S2).
+ *
+ * 0.3.0 adds the S3a entry: Android 2.3.7's init (libgbinit.so,
+ * the static init from Google's API 10 SDK system image) as the
+ * guest root in its own rootfs, with a minimal init.rc and one
+ * busybox service as the probe. The supervisor is told via --bb
+ * that applet execs still belong to libbusybox32.so. When the
+ * session ends, the shell dumps the guest's captured kernel log
+ * (rootfsGB/.kmsg, fed by the supervisor's /dev/__kmsg__
+ * redirection) into the log view as [init] lines.
  */
 class MainActivity : Activity() {
 
@@ -37,6 +46,7 @@ class MainActivity : Activity() {
     private lateinit var scrollView: ScrollView
     private lateinit var startButton: Button
     private lateinit var probeButton: Button
+    private lateinit var gbButton: Button
     private lateinit var stopButton: Button
 
     private var supervisor: Process? = null
@@ -49,6 +59,51 @@ class MainActivity : Activity() {
      * guests never share a tree. */
     private val rootfs32Dir: File
         get() = File(filesDir, "vm0/rootfs32")
+
+    /** Gingerbread guest rootfs (S3a): Android 2.3.7 init's tree. */
+    private val rootfsGBDir: File
+        get() = File(filesDir, "vm0/rootfsGB")
+
+    /** Minimal init.rc for the S3a probe: no ueventd (netlink
+     * coldplug is a later phase), no mounts (the supervisor
+     * answers -ENOSYS and init carries on), stage markers as
+     * properties, and one oneshot busybox service as the proof
+     * that init's service machinery works under supervision.
+     * Rewritten on every GB start, like verify.sh. */
+    private val gbInitRc: String = listOf(
+        "on early-init",
+        "    setprop pax.stage early-init",
+        "",
+        "on init",
+        "    export PATH /sbin:/bin:/system/bin",
+        "    export ANDROID_ROOT /system",
+        "    export ANDROID_DATA /data",
+        "    mkdir /data/misc",
+        "    setprop pax.stage init",
+        "",
+        "on fs",
+        "    setprop pax.stage fs",
+        "",
+        "on boot",
+        "    setprop pax.stage boot",
+        "    start paxprobe",
+        "",
+        "service paxprobe /bin/sh /probe.sh",
+        "    oneshot",
+        "",
+    ).joinToString("\n")
+
+    /** The probe service's script: its file write and the
+     * supervisor's syscall log are the evidence (service stdio
+     * goes to /dev/null under init). */
+    private val gbProbeScript: String = listOf(
+        "echo paxprobe-begin",
+        "echo paxprobe-ok > /data/probe-ok.txt",
+        "cat /data/probe-ok.txt",
+        "ls /",
+        "sleep 1",
+        "echo paxprobe-end",
+    ).joinToString("\n", postfix = "\n")
 
     /** Applet names linked to busybox inside the guest rootfs. */
     private val applets = listOf(
@@ -106,11 +161,27 @@ class MainActivity : Activity() {
         }
         startButton = Button(this).apply {
             text = "啟動"
-            setOnClickListener { startSupervisor(rootfsDir, "libbusybox.so") }
+            setOnClickListener {
+                startSupervisor(rootfsDir, "libbusybox.so", listOf("sh", "/verify.sh"))
+            }
         }
         probeButton = Button(this).apply {
             text = "啟動32"
-            setOnClickListener { startSupervisor(rootfs32Dir, "libbusybox32.so") }
+            setOnClickListener {
+                startSupervisor(rootfs32Dir, "libbusybox32.so", listOf("sh", "/verify.sh"))
+            }
+        }
+        gbButton = Button(this).apply {
+            text = "啟動GB"
+            setOnClickListener {
+                startSupervisor(
+                    rootfsGBDir,
+                    "libgbinit.so",
+                    listOf("/init"),
+                    bbLib = "libbusybox32.so",
+                    gb = true,
+                )
+            }
         }
         stopButton = Button(this).apply {
             text = "停止"
@@ -119,6 +190,7 @@ class MainActivity : Activity() {
         }
         buttons.addView(startButton)
         buttons.addView(probeButton)
+        buttons.addView(gbButton)
         buttons.addView(stopButton)
         root.addView(buttons)
 
@@ -174,18 +246,65 @@ class MainActivity : Activity() {
         File(rootfs, "verify.sh").writeText(verifyScript)
     }
 
-    private fun startSupervisor(rootfs: File, guestLib: String) {
+    /** Idempotent: build the rootfs tree the Gingerbread init
+     * expects, plus the probe files. The .kmsg capture file is
+     * truncated on every start: init opens it without O_TRUNC,
+     * so last session's log would otherwise be overwritten in
+     * place and garbled. */
+    private fun prepareGBRootfs(rootfs: File) {
+        for (d in listOf("bin", "dev", "proc", "sys", "system", "data", "sbin", "tmp")) {
+            File(rootfs, d).mkdirs()
+        }
+        // Same busybox placeholder + sh symlink arrangement as
+        // the probe rootfs: the exec of /bin/sh is rewritten by
+        // the supervisor to libbusybox32.so (via --bb).
+        val bin = File(rootfs, "bin")
+        val bb = File(bin, "busybox")
+        if (!bb.exists()) {
+            bb.writeBytes(ByteArray(0))
+        }
+        val sh = File(bin, "sh")
+        if (!sh.exists()) {
+            try {
+                Os.symlink("busybox", sh.absolutePath)
+            } catch (e: Exception) {
+                appendLog("[shell] symlink sh failed: $e")
+            }
+        }
+        File(rootfs, "init.rc").writeText(gbInitRc)
+        File(rootfs, "probe.sh").writeText(gbProbeScript)
+        // init reads the kernel cmdline for androidboot.hardware
+        // (and looks for /init.<hardware>.rc, absent on purpose).
+        File(rootfs, "proc/cmdline")
+            .writeText("androidboot.hardware=paxvm androidboot.console=tty0\n")
+        File(rootfs, ".kmsg").writeText("")
+    }
+
+    private fun startSupervisor(
+        rootfs: File,
+        guestLib: String,
+        guestArgs: List<String>,
+        bbLib: String? = null,
+        gb: Boolean = false,
+    ) {
         if (supervisor != null) return
-        prepareRootfs(rootfs)
+        if (gb) {
+            prepareGBRootfs(rootfs)
+        } else {
+            prepareRootfs(rootfs)
+        }
         val libDir = applicationInfo.nativeLibraryDir
-        val cmd = listOf(
+        val cmd = mutableListOf(
             "$libDir/libsupervisor.so",
             rootfs.absolutePath,
             "$libDir/$guestLib",
-            "--",
-            "sh",
-            "/verify.sh",
         )
+        if (bbLib != null) {
+            cmd.add("--bb")
+            cmd.add("$libDir/$bbLib")
+        }
+        cmd.add("--")
+        cmd.addAll(guestArgs)
         val proc = try {
             ProcessBuilder(cmd)
                 .redirectErrorStream(true)
@@ -199,6 +318,7 @@ class MainActivity : Activity() {
         supervisor = proc
         startButton.isEnabled = false
         probeButton.isEnabled = false
+        gbButton.isEnabled = false
         stopButton.isEnabled = true
         statusView.text = "rootfs: ${rootfs.absolutePath}\n狀態：監督器執行中"
         appendLog("[shell] supervisor started")
@@ -211,10 +331,21 @@ class MainActivity : Activity() {
                 // Stream closed while destroying; exit line below is enough.
             }
             val code = proc.waitFor()
+            if (gb) {
+                // The guest init's own log, captured by the
+                // supervisor's /dev/__kmsg__ redirection.
+                val kmsg = File(rootfs, ".kmsg")
+                if (kmsg.exists() && kmsg.length() > 0) {
+                    kmsg.readLines().forEach { appendLog("[init] $it") }
+                } else {
+                    appendLog("[init] (kmsg capture empty)")
+                }
+            }
             runOnUiThread {
                 supervisor = null
                 startButton.isEnabled = true
                 probeButton.isEnabled = true
+                gbButton.isEnabled = true
                 stopButton.isEnabled = false
                 statusView.text =
                     "rootfs: ${rootfs.absolutePath}\n狀態：監督器已結束"

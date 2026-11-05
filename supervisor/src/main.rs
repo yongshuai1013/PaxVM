@@ -951,12 +951,19 @@ fn entry_translate(
         let addr = regs.arg(argi);
         match read_path(pid, addr) {
             Some(old) => match translate(rootfs, vcwd, dirfd, &old) {
-                Some(new) => match scratch_write(pid, &mut cursor, &new) {
+                Some(new) => {
+                    let new = if is_open_family(compat, nr) {
+                        device_map(rootfs, &guest_abs(vcwd, &old)).unwrap_or(new)
+                    } else {
+                        new
+                    };
+                    match scratch_write(pid, &mut cursor, &new) {
                     Some(scratch) => {
                         regs.set_arg(argi, scratch);
                         parts.push(format!("'{old}' -> '{new}'"));
                     }
                     None => parts.push(format!("'{old}' (scratch write failed, untranslated)")),
+                    }
                 },
                 None => parts.push(format!("'{old}' (untranslated)")),
             },
@@ -1071,6 +1078,60 @@ fn entry_chdir(
             (format!("chdir({cnr}) '{p}' -> -ENOENT (target {target})"), None)
         }
     }
+}
+
+/// Open-family calls (the ones that turn a path into a live
+/// object) get device-node redirections; every other path call
+/// keeps plain rootfs translation.
+fn is_open_family(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 5 | 8 | 322) // open, creat, openat
+    } else {
+        nr == 56 // openat
+    }
+}
+
+/// Device nodes an Android guest expects to exist before any
+/// filesystem is mounted. The guest uid cannot mknod and the
+/// rootfs cannot hold real nodes, so opens of a tiny whitelist
+/// are redirected: the null family and console to the host's
+/// /dev/null (init points its stdio there before logging
+/// exists), ashmem/zero/urandom to the real host devices (same
+/// kernel, real semantics), and init's kernel-log node to a
+/// capture file inside the rootfs that the shell dumps after
+/// the session — that file is init's only voice in phase 1.
+fn device_map(rootfs: &str, guest_abs_path: &str) -> Option<String> {
+    match guest_abs_path {
+        "/dev/null" | "/dev/__null__" | "/dev/console" => Some("/dev/null".to_string()),
+        "/dev/ashmem" => Some("/dev/ashmem".to_string()),
+        "/dev/zero" => Some("/dev/zero".to_string()),
+        "/dev/urandom" | "/dev/random" => Some("/dev/urandom".to_string()),
+        "/dev/__kmsg__" => Some(format!("{rootfs}/.kmsg")),
+        _ => None,
+    }
+}
+
+/// Compat mknod(14) for /dev/* paths: faked successful. The
+/// guest uid has no CAP_MKNOD, so a passed-through mknod fails
+/// EPERM — and Android 2.3's init treats that as fatal in
+/// open_devnull_stdio (exit(1) before anything else runs).
+/// Device nodes are virtual in this engine anyway: creation is
+/// recorded nowhere, and opens of the whitelisted nodes are
+/// redirected by device_map. Non-/dev paths fall through to
+/// translation (and the kernel's EPERM) unchanged.
+fn entry_mknod_dev(
+    pid: i32,
+    vcwd: &str,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> Option<String> {
+    let p = read_path(pid, regs.arg(0))?;
+    let abs = guest_abs(vcwd, &p);
+    if !abs.starts_with("/dev/") {
+        return None;
+    }
+    skip_syscall(pid, regs, pend, 0);
+    Some(format!("mknod(14) '{p}' faked (virtual device node)"))
 }
 
 /// Compat rmdir(40), proxied by the supervisor itself. The
@@ -1293,6 +1354,15 @@ fn main() {
     }
     let rootfs = argv[1].clone();
     let guest_path = argv[2].clone();
+    // Optional "--bb <path>" (before "--"): the binary applet
+    // execs inside the rootfs are rewritten to. Defaults to the
+    // guest itself (M0-M1: the root guest IS busybox). A session
+    // whose root is another binary (S3: Android init) passes the
+    // busybox payload explicitly so its services can run applets.
+    let bb_path = match argv.iter().position(|a| a == "--bb") {
+        Some(i) if i + 1 < argv.len() && argv[i + 1] != "--" => argv[i + 1].clone(),
+        _ => guest_path.clone(),
+    };
     // Guest argv: everything after an optional "--", argv[0] first.
     // Defaults to the M0 single-word argv when absent.
     let guest_args: Vec<String> = match argv.iter().position(|a| a == "--") {
@@ -1520,7 +1590,7 @@ fn main() {
                     let (desc, d) = entry_exec(
                         pid,
                         &rootfs,
-                        &guest_path,
+                        &bb_path,
                         &proc.vcwd,
                         proc.compat,
                         nr,
@@ -1543,6 +1613,24 @@ fn main() {
                     if let Some(v) = new_vcwd {
                         proc.vcwd = v;
                     }
+                } else if proc.compat && nr == 14 {
+                    // Compat mknod: /dev/* faked (entry_mknod_dev).
+                    match entry_mknod_dev(pid, &proc.vcwd, &mut regs, &mut pend) {
+                        Some(desc) => {
+                            pend.desc = Some(desc);
+                        }
+                        None => {
+                            pend.desc = Some(entry_translate(
+                                pid,
+                                &rootfs,
+                                &proc.vcwd,
+                                proc.compat,
+                                nr,
+                                &mut regs,
+                            ));
+                        }
+                    }
+                    dirty = true;
                 } else if proc.compat && nr == 40 {
                     // Compat rmdir: proxied (see entry_rmdir).
                     pend.desc = Some(entry_rmdir(

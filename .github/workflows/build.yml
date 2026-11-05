@@ -210,6 +210,53 @@ jobs:
           cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox32.so"
           ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
 
+      # S3a guest root: Android 2.3.7's init, from Google's own
+      # SDK system image for API 10 (armeabi-v7a r05 — the
+      # goldfish-family AOSP build; its build.prop reads
+      # ro.build.version.release=2.3.7). The factory-image route
+      # is dead (S1: Nexus S images return 404) and a full 2.3
+      # source build is archaeology, while this is a first-party
+      # AOSP build of exactly the target version. Only the
+      # ramdisk's /init is used in S3a: it is fully static (no
+      # INTERP), so it runs under the supervisor's compat
+      # personality with no linker or libc files. Both the zip
+      # and the extracted binary are sha256-pinned.
+      - name: Fetch Gingerbread init (SDK API 10 system image)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --connect-timeout 30 -o sysimg10.zip \
+            "https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip"
+          echo "b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df  sysimg10.zip" | sha256sum -c -
+          unzip -o -q sysimg10.zip "armeabi-v7a/ramdisk.img"
+          python3 - <<'PYEOF'
+          import gzip
+          data = gzip.open('armeabi-v7a/ramdisk.img', 'rb').read()
+          i = 0
+          found = None
+          while i < len(data):
+              assert data[i:i+6] == b'070701'
+              h = data[i:i+110]
+              namesize = int(h[94:102], 16)
+              filesize = int(h[54:62], 16)
+              name = data[i+110:i+110+namesize-1].decode()
+              off = (i + 110 + namesize + 3) & ~3
+              if name == 'init':
+                  found = data[off:off+filesize]
+                  break
+              if name == 'TRAILER!!!':
+                  break
+              i = (off + filesize + 3) & ~3
+          assert found is not None, 'init not found in ramdisk'
+          open('gbinit', 'wb').write(found)
+          print('extracted init:', len(found), 'bytes')
+          PYEOF
+          echo "2d9cbb198d8367f434c5fd7bada245c9e7618dc910253190f5d4dd3d0f6d1a00  gbinit" | sha256sum -c -
+          readelf -h gbinit | grep -q "Class:.*ELF32"
+          readelf -h gbinit | grep -q "Machine:.*ARM"
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp gbinit app/src/main/jniLibs/arm64-v8a/libgbinit.so
+          ls -la app/src/main/jniLibs/arm64-v8a/
+
       # Guard the payloads' static-ness and the APK contents: if a
       # payload ever gains an INTERP segment it cannot be exec'd
       # without a loader, and if any payload is missing from the
@@ -230,6 +277,12 @@ jobs:
           fi
           readelf -h app/src/main/jniLibs/arm64-v8a/libbusybox32.so | grep -q "Class:.*ELF32" \
             || { echo "busybox32 must be ELF32" >&2; exit 1; }
+          if readelf -l app/src/main/jniLibs/arm64-v8a/libgbinit.so | grep -q INTERP; then
+            echo "gbinit must be fully static (no INTERP)" >&2
+            exit 1
+          fi
+          readelf -h app/src/main/jniLibs/arm64-v8a/libgbinit.so | grep -q "Class:.*ELF32" \
+            || { echo "gbinit must be ELF32" >&2; exit 1; }
 
       # Pinned signing: decode the project's permanent keystore from
       # secrets and hand its coordinates to gradle (build.gradle.kts
@@ -272,6 +325,7 @@ jobs:
           grep -q "lib/arm64-v8a/libguest.so" apk-list.txt
           grep -q "lib/arm64-v8a/libbusybox.so" apk-list.txt
           grep -q "lib/arm64-v8a/libbusybox32.so" apk-list.txt
+          grep -q "lib/arm64-v8a/libgbinit.so" apk-list.txt
           # useLegacyPackaging must survive into the merged manifest:
           # without extractNativeLibs=true the .so payloads never
           # land as executable files in nativeLibraryDir (spec 1.2).
