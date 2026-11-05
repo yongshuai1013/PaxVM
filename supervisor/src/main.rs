@@ -846,6 +846,11 @@ struct Pending {
     /// be rescued with the fabricated value. Used by the
     /// accept -> accept4 rewrite (see entry_accept).
     rescue_only: bool,
+    /// getsockopt(SO_PEERCRED) in flight: (optval, optlen)
+    /// guest addresses. The call passes through; at the exit
+    /// stop the returned ucred is rewritten to the peer's
+    /// virtual credentials (see patch_peercred).
+    peercred: Option<(u64, u64)>,
 }
 
 struct ProcState {
@@ -1014,6 +1019,131 @@ fn entry_translate(
 /// to their own current values, so 0 is the semantically correct
 /// answer -- the same treatment proot gives the uid/gid family.
 /// getresuid(148)/getresgid(150) are harmless queries and pass.
+/// The get*id family: answered from the virtual credentials.
+fn is_getid(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 24 | 47 | 49 | 50 | 199 | 200 | 201 | 202)
+    } else {
+        matches!(nr, 174 | 175 | 176 | 177)
+    }
+}
+
+/// Which half of the virtual credential pair a get*id call asks
+/// for: true = uid, false = gid (real and effective ids share
+/// the virtual value; the guest world has no separate saved id).
+fn getid_is_uid(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 24 | 49 | 199 | 201)
+    } else {
+        matches!(nr, 174 | 176)
+    }
+}
+
+/// Apply an emulated set*id call to the virtual credentials.
+/// Only the effective-id outcome is tracked (ruid/suid slots of
+/// setre*/setres* are ignored beyond their effect on the
+/// effective id); setfsuid/setfsgid/setgroups carry no tracked
+/// state. A -1 argument leaves its slot unchanged.
+fn apply_setid(compat: bool, nr: u64, regs: &Regs, creds: &mut (u32, u32)) {
+    let a0 = regs.arg(0);
+    let a1 = regs.arg(1);
+    let neg = |v: u64| v == u64::MAX || v == 0xFFFF_FFFF;
+    let set_either = |slot: &mut u32| {
+        if !neg(a1) {
+            *slot = a1 as u32;
+        } else if !neg(a0) {
+            *slot = a0 as u32;
+        }
+    };
+    if compat {
+        match nr {
+            23 | 213 => creds.0 = a0 as u32, // setuid(32)
+            46 | 214 => creds.1 = a0 as u32, // setgid(32)
+            70 | 203 => set_either(&mut creds.0), // setreuid(32)
+            71 | 204 => set_either(&mut creds.1), // setregid(32)
+            164 | 208 => {
+                if !neg(a1) {
+                    creds.0 = a1 as u32;
+                }
+            } // setresuid(32): euid slot
+            170 | 210 => {
+                if !neg(a1) {
+                    creds.1 = a1 as u32;
+                }
+            } // setresgid(32): egid slot
+            _ => {}
+        }
+    } else {
+        match nr {
+            143 => creds.0 = a0 as u32, // setuid
+            144 => creds.1 = a0 as u32, // setgid
+            145 => set_either(&mut creds.0), // setreuid
+            146 => set_either(&mut creds.1), // setregid
+            147 => {
+                if !neg(a1) {
+                    creds.0 = a1 as u32;
+                }
+            } // setresuid
+            149 => {
+                if !neg(a1) {
+                    creds.1 = a1 as u32;
+                }
+            } // setresgid
+            _ => {}
+        }
+    }
+}
+
+/// Rewrite a SO_PEERCRED answer in the tracee's memory to the
+/// peer's virtual credentials. The kernel reports the host app
+/// uid for every guest process; a guest daemon that authorizes
+/// by peer creds (GB init's property service is the first) must
+/// see the guest-world identity instead: the peer tracee's
+/// virtual uid/gid, or 0/0 for a peer that is not a tracee but
+/// runs under our own host uid (the supervisor itself, e.g.
+/// future brokers). Unknown peers keep the kernel's answer.
+fn patch_peercred(
+    pid: i32,
+    optval: u64,
+    optlen: u64,
+    vcreds: &HashMap<i32, (u32, u32)>,
+) {
+    let mut lenb = [0u8; 4];
+    if read_mem(pid, optlen, &mut lenb).is_err() {
+        return;
+    }
+    let len = u32::from_ne_bytes(lenb);
+    if len < 12 {
+        sup!("WARN peercred: optlen {len} < 12 pid={pid}");
+        return;
+    }
+    let mut b = [0u8; 12];
+    if read_mem(pid, optval, &mut b).is_err() {
+        return;
+    }
+    let peer = i32::from_ne_bytes(b[0..4].try_into().unwrap());
+    let ruid = u32::from_ne_bytes(b[4..8].try_into().unwrap());
+    let rgid = u32::from_ne_bytes(b[8..12].try_into().unwrap());
+    let (vu, vg) = match vcreds.get(&peer) {
+        Some(c) => *c,
+        None => {
+            if ruid == unsafe { libc::getuid() } as u32 {
+                (0, 0)
+            } else {
+                return;
+            }
+        }
+    };
+    if vu == ruid && vg == rgid {
+        return;
+    }
+    b[4..8].copy_from_slice(&vu.to_ne_bytes());
+    b[8..12].copy_from_slice(&vg.to_ne_bytes());
+    if write_mem(pid, optval, &b).is_ok() {
+        sup!("peercred pid={pid}: peer {peer} uid {ruid} -> {vu}, gid {rgid} -> {vg}");
+    }
+}
+
 fn is_setid_emulated(compat: bool, nr: u64) -> bool {
     if compat {
         // The 16-bit and 32-bit uid forms, both: musl calls the
@@ -1889,6 +2019,16 @@ fn main() {
     // exec completes it is still our own fork child running the
     // supervisor image. It flips at the exec event (see below).
     procs.insert(root_pid, ProcState::new("/", true, false));
+    // Virtual credentials per tracee (guest-world uid/gid). The
+    // whole guest tree really runs under the host app uid; this
+    // map is the guest's belief: the root starts as 0/0,
+    // children inherit, the emulated set*id family updates it,
+    // the get*id family reports it, and SO_PEERCRED answers are
+    // rewritten from it (see patch_peercred). Kept outside
+    // ProcState so the exit-stop handler can consult a peer's
+    // creds while another ProcState is borrowed.
+    let mut vcreds: HashMap<i32, (u32, u32)> = HashMap::new();
+    vcreds.insert(root_pid, (0, 0));
     let mut root_launched = false;
     // Keyed by (compat, nr): the root's launch execve is counted
     // under the native table, everything else under the guest's.
@@ -1927,6 +2067,7 @@ fn main() {
                 sup!("PROC_SIGNALED pid={pid} sig={}", libc::WTERMSIG(status));
             }
             procs.remove(&pid);
+            vcreds.remove(&pid);
             if is_root {
                 // The session ends with the root: kill whatever is
                 // left of the tree and drain the exit reports.
@@ -1962,6 +2103,7 @@ fn main() {
         if !procs.contains_key(&pid) {
             sup!("new tracee pid={pid} (registered on first stop)");
             procs.insert(pid, ProcState::new("/", false, guest_compat));
+            vcreds.entry(pid).or_insert((0, 0));
         }
 
         // Initial stop of a fresh tracee: set the option set,
@@ -2002,6 +2144,7 @@ fn main() {
                     applied: false,
                     mem_restore: None,
                     rescue_only: false,
+                    peercred: None,
                 };
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -2137,17 +2280,50 @@ fn main() {
                         &mut regs,
                     ));
                     dirty = true;
-                } else if is_setid_emulated(proc.compat, nr) {
-                    // Cancel before the kernel (and its seccomp
-                    // filter) ever evaluates it; answer 0 at the
-                    // exit stop via the standard inject path.
-                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                } else if is_getid(proc.compat, nr) {
+                    // Answered from the virtual credentials:
+                    // inside the guest world this process has the
+                    // identity its set*id history says it has.
+                    let creds = vcreds.get(&pid).copied().unwrap_or((0, 0));
+                    let v = if getid_is_uid(proc.compat, nr) {
+                        creds.0
+                    } else {
+                        creds.1
+                    };
+                    skip_syscall(pid, &mut regs, &mut pend, v as i64);
                     pend.desc = Some(format!(
-                        "{}({}) emulated (return 0)",
+                        "{}({}) FAKED -> {v} (virtual creds)",
                         nr_name(proc.compat, nr),
                         nr
                     ));
                     dirty = true;
+                } else if is_setid_emulated(proc.compat, nr) {
+                    // Cancel before the kernel (and its seccomp
+                    // filter) ever evaluates it; answer 0 at the
+                    // exit stop via the standard inject path. The
+                    // call also updates the virtual credentials.
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                    let creds = vcreds.entry(pid).or_insert((0, 0));
+                    apply_setid(proc.compat, nr, &regs, creds);
+                    let (vu, vg) = *creds;
+                    pend.desc = Some(format!(
+                        "{}({}) emulated (return 0); virtual creds now uid={vu} gid={vg}",
+                        nr_name(proc.compat, nr),
+                        nr
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 295) || (!proc.compat && nr == 209))
+                    && regs.arg(1) == 1
+                    && regs.arg(2) == 17
+                {
+                    // getsockopt(SOL_SOCKET, SO_PEERCRED): the
+                    // call passes through untouched; at the exit
+                    // stop the returned ucred is rewritten to
+                    // the peer's virtual credentials.
+                    pend.peercred = Some((regs.arg(3), regs.arg(4)));
+                    pend.desc = Some(format!(
+                        "getsockopt({nr}) SO_PEERCRED (virtual creds patch armed)"
+                    ));
                 } else if is_faked(proc.compat, nr) {
                     pend.desc = Some(entry_fake(
                         pid,
@@ -2199,6 +2375,11 @@ fn main() {
                         }
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
+                        }
+                        if let Some((optval, optlen)) = pend.peercred {
+                            if ret == 0 {
+                                patch_peercred(pid, optval, optlen, &vcreds);
+                            }
                         }
                     }
                     if let Some((addr, orig)) = &pend.mem_restore {
@@ -2275,6 +2456,8 @@ fn main() {
                         procs.insert(child, ProcState::new(&parent_vcwd, false, parent_compat));
                     }
                 }
+                let parent_creds = vcreds.get(&pid).copied().unwrap_or((0, 0));
+                vcreds.insert(child, parent_creds);
                 let ev_name = match event {
                     x if x == PTRACE_EVENT_FORK => "fork",
                     x if x == PTRACE_EVENT_VFORK => "vfork",
