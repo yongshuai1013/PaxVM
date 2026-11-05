@@ -148,6 +148,68 @@ jobs:
           cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox.so"
           ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
 
+      # S2 probe guest: the same busybox 1.36.1, built the same way
+      # (musl, from source, FEATURE_SUID=n) but for 32-bit ARM with
+      # Bootlin's armv7-eabihf musl toolchain (sha256 pinned from
+      # Bootlin's published .sha256 sidecar). The supervisor gained
+      # compat-personality support in 0.2.8; this binary is the
+      # probe that exercises it -- same source, same config, only
+      # the word size differs, so the probe isolates exactly one
+      # variable. It ships inside the arm64-v8a jniLibs folder as a
+      # payload file: it is exec'd from nativeLibraryDir, never
+      # dlopen'd, so its ELF class does not have to match the
+      # folder's ABI.
+      - name: Build busybox32 (musl, from source, FEATURE_SUID=n, ARM32)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --connect-timeout 30 -o bootlin-musl32.tar.bz2 \
+            "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--musl--stable-2023.11-1.tar.bz2"
+          echo "c01a2b2a762b0e19a7847f4877ba5b35d90bd7e23704956dfe575e8113a1ad7a  bootlin-musl32.tar.bz2" | sha256sum -c -
+          mkdir -p bootlin-musl32
+          tar -xjf bootlin-musl32.tar.bz2 -C bootlin-musl32 --strip-components=1
+          # Discover the cross prefix from the toolchain itself
+          # (bin/<prefix>gcc) instead of assuming its spelling.
+          GCC_BIN="$(ls "$PWD/bootlin-musl32/bin/"*-gcc | head -1)"
+          PREFIX="$(basename "$GCC_BIN" | sed 's/gcc$//')"
+          test -n "$PREFIX"
+          echo "busybox32 cross prefix: $PREFIX"
+          export PATH="$PWD/bootlin-musl32/bin:$PATH"
+          curl -fsSL -o busybox32.tar.bz2 \
+            "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
+          echo "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314  busybox32.tar.bz2" | sha256sum -c -
+          mkdir -p bb32build
+          tar xjf busybox32.tar.bz2 -C bb32build --strip-components=1
+          cd bb32build
+          test -f Makefile
+          make ARCH=arm CROSS_COMPILE="$PREFIX" defconfig
+          sed -i 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' .config
+          sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set$/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+          sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' .config
+          sed -i 's/^CONFIG_FEATURE_SUID=y$/# CONFIG_FEATURE_SUID is not set/' .config
+          grep -q "^CONFIG_STATIC=y" .config
+          grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
+          grep -q "^# CONFIG_FEATURE_SUID is not set" .config
+          set +o pipefail
+          yes '' | make ARCH=arm CROSS_COMPILE="$PREFIX" oldconfig
+          set -o pipefail
+          grep -q "^CONFIG_STATIC=y" .config
+          grep -q "^CONFIG_FEATURE_SH_STANDALONE=y" .config
+          grep -q "^# CONFIG_TC is not set" .config
+          grep -q "^# CONFIG_FEATURE_SUID is not set" .config
+          make ARCH=arm CROSS_COMPILE="$PREFIX" -j"$(nproc)"
+          file busybox | grep -q "statically linked"
+          readelf -h busybox | grep -q "Class:.*ELF32"
+          readelf -h busybox | grep -q "Machine:.*ARM"
+          strings -n 2 busybox > ../bb32-strings.txt
+          for applet in sh echo pwd cd cat ls wc mkdir touch rm uname; do
+            grep -qx "$applet" ../bb32-strings.txt \
+              || { echo "busybox32 missing applet: $applet" >&2; exit 1; }
+          done
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox32.so"
+          ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
+
       # Guard the payloads' static-ness and the APK contents: if a
       # payload ever gains an INTERP segment it cannot be exec'd
       # without a loader, and if any payload is missing from the
@@ -162,6 +224,12 @@ jobs:
             echo "busybox must be fully static (no INTERP)" >&2
             exit 1
           fi
+          if readelf -l app/src/main/jniLibs/arm64-v8a/libbusybox32.so | grep -q INTERP; then
+            echo "busybox32 must be fully static (no INTERP)" >&2
+            exit 1
+          fi
+          readelf -h app/src/main/jniLibs/arm64-v8a/libbusybox32.so | grep -q "Class:.*ELF32" \
+            || { echo "busybox32 must be ELF32" >&2; exit 1; }
 
       # Pinned signing: decode the project's permanent keystore from
       # secrets and hand its coordinates to gradle (build.gradle.kts
@@ -203,6 +271,7 @@ jobs:
           grep -q "lib/arm64-v8a/libsupervisor.so" apk-list.txt
           grep -q "lib/arm64-v8a/libguest.so" apk-list.txt
           grep -q "lib/arm64-v8a/libbusybox.so" apk-list.txt
+          grep -q "lib/arm64-v8a/libbusybox32.so" apk-list.txt
           # useLegacyPackaging must survive into the merged manifest:
           # without extractNativeLibs=true the .so payloads never
           # land as executable files in nativeLibraryDir (spec 1.2).

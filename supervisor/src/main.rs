@@ -15,6 +15,17 @@
 //!   (log-first principle).
 //! - stdout is a line protocol for the shell: [sup] supervisor
 //!   events, [sys] syscall events, [guest] forwarded guest output.
+//! - Dual personality (0.2.8): the guest tree's personality is
+//!   detected once from the guest binary's ELF class -- the rootfs
+//!   can only ever exec that one binary, so a single personality
+//!   covers the whole tree. AArch64 guests use the layout and the
+//!   asm-generic numbering below; 32-bit ARM (compat) guests use
+//!   the compat_pt_regs layout and the ARM EABI table (names32.rs).
+//!   The stop state machine, path translation and the SIGSYS
+//!   rescue are personality-agnostic; only register access,
+//!   syscall numbering and a few argument layouts differ.
+
+mod names32;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -59,55 +70,122 @@ const EACCES: i64 = 13;
 const ENOENT: i64 = 2;
 const ENOTDIR: i64 = 20;
 
-// ---- aarch64 syscall numbers (asm-generic table) ----
-const NR_GETCWD: u64 = 17;
-const NR_CHDIR: u64 = 49;
-const NR_FCHDIR: u64 = 50;
-const NR_EXECVE: u64 = 221;
-const NR_EXECVEAT: u64 = 281;
-
-/// Syscalls whose only path argument is (dirfd=a0, path=a1): T class.
-fn is_t_dirfd_path(nr: u64) -> bool {
-    matches!(
-        nr,
-        33 | 34 | 35 | 48 | 53 | 54 | 56 | 78 | 79 | 88 | 291 | 439
-    )
+// ---- syscall numbers that differ per personality ----
+// AArch64 values are the asm-generic table; compat values are the
+// ARM EABI table (Linux v5.4 arch/arm/tools/syscall.tbl, the same
+// source names32.rs was generated from).
+fn nr_getcwd(compat: bool) -> u64 {
+    if compat { 183 } else { 17 }
+}
+fn nr_chdir(compat: bool) -> u64 {
+    if compat { 12 } else { 49 }
+}
+fn nr_fchdir(compat: bool) -> u64 {
+    if compat { 133 } else { 50 }
+}
+fn nr_execve(compat: bool) -> u64 {
+    if compat { 11 } else { 221 }
+}
+fn nr_execveat(compat: bool) -> u64 {
+    if compat { 387 } else { 281 }
+}
+fn nr_readlinkat(compat: bool) -> u64 {
+    if compat { 332 } else { 78 }
 }
 
-/// Syscalls with two path arguments (paths a1 and a3, dirfds a0/a2).
-fn is_t_two_paths(nr: u64) -> bool {
-    matches!(nr, 37 | 38) // linkat, renameat
+/// Syscalls whose only path argument is (dirfd=a0, path=a1): T class.
+fn is_t_dirfd_path(compat: bool, nr: u64) -> bool {
+    if compat {
+        // openat, mkdirat, mknodat, fchownat, futimesat, fstatat64,
+        // unlinkat, readlinkat, fchmodat, faccessat, utimensat, statx
+        matches!(
+            nr,
+            322 | 323 | 324 | 325 | 326 | 327 | 328 | 332 | 333 | 334 | 348 | 397
+        )
+    } else {
+        matches!(
+            nr,
+            33 | 34 | 35 | 48 | 53 | 54 | 56 | 78 | 79 | 88 | 291 | 439
+        )
+    }
+}
+
+/// Syscalls with two path arguments. The *at forms carry the paths
+/// at a1 and a3 with dirfds a0/a2; the compat table also has the
+/// classic link/rename, whose paths sit at a0 and a1 with cwd
+/// semantics (entry_translate picks the layout).
+fn is_t_two_paths(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 329 | 330 | 9 | 38) // renameat, linkat, link, rename
+    } else {
+        matches!(nr, 37 | 38) // linkat, renameat
+    }
 }
 
 /// symlinkat: a0 is the symlink *content* (not translated); the
-/// linkpath is a2 with dirfd a1.
-fn is_t_symlinkat(nr: u64) -> bool {
-    nr == 36
+/// linkpath is a2 with dirfd a1. The compat table's classic symlink
+/// has the content at a0 and the linkpath at a1 with cwd semantics.
+fn is_t_symlinkat(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 331 | 83) // symlinkat, symlink
+    } else {
+        nr == 36
+    }
 }
 
-/// Syscalls whose path is a0 with cwd semantics (no dirfd).
-fn is_t_path0(nr: u64) -> bool {
-    matches!(nr, 43 | 45) // statfs, truncate
+/// Syscalls whose path is a0 with cwd semantics (no dirfd). The
+/// compat table keeps the classic forms AArch64 dropped (open,
+/// creat, the stat64 family, ...), all with the path at a0.
+fn is_t_path0(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(
+            nr,
+            5 | 8 | 10 | 14 | 15 | 30 | 33 | 39 | 40 | 85 | 92 | 99 | 193 | 195
+                | 196 | 198 | 212 | 266 | 269
+        )
+    } else {
+        matches!(nr, 43 | 45) // statfs, truncate
+    }
 }
 
 /// F class answered purely from supervisor state (getcwd, fchdir).
 /// chdir is also F class (the real syscall never runs) but needs
 /// vcwd mutation, so it is dispatched separately in the entry path.
-fn is_faked(nr: u64) -> bool {
-    matches!(nr, NR_GETCWD | NR_FCHDIR)
+fn is_faked(compat: bool, nr: u64) -> bool {
+    nr == nr_getcwd(compat) || nr == nr_fchdir(compat)
 }
 
 /// X class: blocked with -ENOSYS. clone/clone3 left this class in
 /// M1 (children are followed via TRACEFORK/TRACECLONE), and
 /// execve/execveat are routed to the exec handler instead.
-fn is_blocked(nr: u64) -> bool {
-    matches!(
-        nr,
-        39 | 40 | 41 | 51 | 97 | 117 | 264 | 265 | 268 | 277 | 280 | 437
-    )
+fn is_blocked(compat: bool, nr: u64) -> bool {
+    if compat {
+        // mount, umount, ptrace, umount2, chroot, pivot_root,
+        // unshare, name_to_handle_at, open_by_handle_at, setns,
+        // seccomp, bpf
+        matches!(
+            nr,
+            21 | 22 | 26 | 52 | 61 | 218 | 337 | 370 | 371 | 375 | 383 | 386
+        )
+    } else {
+        matches!(
+            nr,
+            39 | 40 | 41 | 51 | 97 | 117 | 264 | 265 | 268 | 277 | 280 | 437
+        )
+    }
 }
 
-fn nr_name(nr: u64) -> &'static str {
+/// Syscall name in the tracee's personality: asm-generic names
+/// for AArch64 guests, ARM EABI names (names32.rs) for compat.
+fn nr_name(compat: bool, nr: u64) -> &'static str {
+    if compat {
+        names32::nr_name32(nr)
+    } else {
+        nr_name64(nr)
+    }
+}
+
+fn nr_name64(nr: u64) -> &'static str {
     match nr {
         17 => "getcwd",
         23 => "dup",
@@ -264,29 +342,167 @@ struct UserPtRegs {
     pstate: u64,
 }
 
-fn get_regs(pid: i32) -> Option<UserPtRegs> {
-    let mut r = UserPtRegs::default();
-    let mut iov = libc::iovec {
-        iov_base: &mut r as *mut UserPtRegs as *mut libc::c_void,
-        iov_len: std::mem::size_of::<UserPtRegs>(),
-    };
-    let rc = ptrace4(
-        PTRACE_GETREGSET,
-        pid,
-        NT_PRSTATUS as *mut libc::c_void,
-        &mut iov as *mut libc::iovec as *mut libc::c_void,
-    );
-    if rc != 0 {
-        sup!("GETREGSET failed pid={pid}: errno={}", errno());
-        return None;
-    }
-    Some(r)
+/// The kernel's compat_pt_regs for a 32-bit tracee on arm64:
+/// r0..r15 at uregs[0..16] (sp = uregs[13], pc = uregs[15]),
+/// the syscall number at uregs[7] (r7), cpsr at uregs[16],
+/// orig_r0 at uregs[17].
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CompatPtRegs {
+    uregs: [u32; 18],
 }
 
-fn set_regs(pid: i32, r: &UserPtRegs) -> bool {
+/// A tracee's register set in whichever personality it currently
+/// runs. Every register touch in the supervisor goes through this
+/// access surface, so the syscall machinery above and below stays
+/// personality-agnostic.
+#[derive(Clone, Copy)]
+enum Regs {
+    A64(UserPtRegs),
+    A32(CompatPtRegs),
+}
+
+impl Regs {
+    fn nr(&self) -> u64 {
+        match self {
+            Regs::A64(r) => r.regs[8],
+            Regs::A32(r) => r.uregs[7] as u64,
+        }
+    }
+    fn arg(&self, i: usize) -> u64 {
+        match self {
+            Regs::A64(r) => r.regs[i],
+            Regs::A32(r) => r.uregs[i] as u64,
+        }
+    }
+    fn set_arg(&mut self, i: usize, v: u64) {
+        match self {
+            Regs::A64(r) => r.regs[i] = v,
+            Regs::A32(r) => r.uregs[i] = v as u32,
+        }
+    }
+    fn sp(&self) -> u64 {
+        match self {
+            Regs::A64(r) => r.sp,
+            Regs::A32(r) => r.uregs[13] as u64,
+        }
+    }
+    fn pc(&self) -> u64 {
+        match self {
+            Regs::A64(r) => r.pc,
+            Regs::A32(r) => r.uregs[15] as u64,
+        }
+    }
+    /// Return value as the guest reads it: x0 sign-extended from
+    /// 64 bits, r0 sign-extended from 32 (a -errno in r0 is a small
+    /// u32; reading it as u64 would hide the sign).
+    fn retval(&self) -> i64 {
+        match self {
+            Regs::A64(r) => r.regs[0] as i64,
+            Regs::A32(r) => r.uregs[0] as i32 as i64,
+        }
+    }
+    fn set_retval(&mut self, v: i64) {
+        match self {
+            Regs::A64(r) => r.regs[0] = v as u64,
+            Regs::A32(r) => r.uregs[0] = v as u32,
+        }
+    }
+    /// The tracee-visible syscall-number register to -1 (x8 on
+    /// AArch64, r7 on compat). See skip_syscall for why this alone
+    /// cancels nothing and is only kept for honesty of the dump.
+    fn cancel_nr_reg(&mut self) {
+        match self {
+            Regs::A64(r) => r.regs[8] = u64::MAX,
+            Regs::A32(r) => r.uregs[7] = u32::MAX,
+        }
+    }
+}
+
+/// The guest binary's personality, from its ELF header: EI_CLASS
+/// 1 (ELF32) with EM_ARM means compat tracees, EI_CLASS 2 means
+/// native AArch64. None when the header cannot be read or is not
+/// an ARM-family ELF at all.
+fn guest_is_compat(path: &str) -> Option<bool> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = [0u8; 20];
+    f.read_exact(&mut h).ok()?;
+    if &h[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let machine = u16::from_le_bytes([h[18], h[19]]);
+    match (h[4], machine) {
+        (1, 40) => Some(true),   // ELF32, EM_ARM
+        (2, 183) => Some(false), // ELF64, EM_AARCH64
+        _ => None,
+    }
+}
+
+fn get_regs(pid: i32, compat: bool) -> Option<Regs> {
+    if compat {
+        let mut r = CompatPtRegs::default();
+        let mut iov = libc::iovec {
+            iov_base: &mut r as *mut CompatPtRegs as *mut libc::c_void,
+            iov_len: std::mem::size_of::<CompatPtRegs>(),
+        };
+        let rc = ptrace4(
+            PTRACE_GETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut libc::iovec as *mut libc::c_void,
+        );
+        if rc != 0 {
+            sup!("GETREGSET failed pid={pid}: errno={}", errno());
+            return None;
+        }
+        if iov.iov_len != std::mem::size_of::<CompatPtRegs>() {
+            // The kernel answered with a different regset size
+            // than the personality we assumed: say so in the log
+            // instead of parsing garbage (the probe's core
+            // question is exactly whether this matches).
+            sup!(
+                "WARN: GETREGSET pid={pid}: compat layout expected {} bytes, kernel gave {}",
+                std::mem::size_of::<CompatPtRegs>(),
+                iov.iov_len
+            );
+            return None;
+        }
+        Some(Regs::A32(r))
+    } else {
+        let mut r = UserPtRegs::default();
+        let mut iov = libc::iovec {
+            iov_base: &mut r as *mut UserPtRegs as *mut libc::c_void,
+            iov_len: std::mem::size_of::<UserPtRegs>(),
+        };
+        let rc = ptrace4(
+            PTRACE_GETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut libc::iovec as *mut libc::c_void,
+        );
+        if rc != 0 {
+            sup!("GETREGSET failed pid={pid}: errno={}", errno());
+            return None;
+        }
+        Some(Regs::A64(r))
+    }
+}
+
+fn set_regs(pid: i32, regs: &Regs) -> bool {
+    let (base, len) = match regs {
+        Regs::A64(r) => (
+            r as *const UserPtRegs as *mut libc::c_void,
+            std::mem::size_of::<UserPtRegs>(),
+        ),
+        Regs::A32(r) => (
+            r as *const CompatPtRegs as *mut libc::c_void,
+            std::mem::size_of::<CompatPtRegs>(),
+        ),
+    };
     let mut iov = libc::iovec {
-        iov_base: r as *const UserPtRegs as *mut libc::c_void,
-        iov_len: std::mem::size_of::<UserPtRegs>(),
+        iov_base: base,
+        iov_len: len,
     };
     ptrace4(
         PTRACE_SETREGSET,
@@ -341,10 +557,12 @@ fn get_event_msg(pid: i32) -> Option<u64> {
 /// culprit syscall leaves no [sys] line. The siginfo the kernel
 /// attached to the signal names it: for si_code == SYS_SECCOMP (1)
 /// the _sigsys union carries the trapped syscall number, the audit
-/// arch and the userspace call address. aarch64 siginfo_t layout:
-/// si_signo@0 (i32), si_errno@4, si_code@8, union@16 —
-/// _call_addr@16 (u64), _syscall@24 (i32), _arch@28 (u32).
-fn dump_sigsys_info(pid: i32) {
+/// arch and the userspace call address. siginfo_t layout:
+/// si_signo@0 (i32), si_errno@4, si_code@8; the union starts at
+/// @16 for a native tracee (_call_addr@16 u64, _syscall@24 i32,
+/// _arch@28 u32) and at @12 for a compat tracee (_call_addr@12
+/// u32, _syscall@16 i32, _arch@20 u32).
+fn dump_sigsys_info(pid: i32, compat: bool) {
     let mut buf = [0u8; 128];
     let rc = ptrace4(
         PTRACE_GETSIGINFO,
@@ -356,18 +574,36 @@ fn dump_sigsys_info(pid: i32) {
         sup!("SIGSYS detail pid={pid}: GETSIGINFO failed errno={}", errno());
     } else {
         let si_code = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
-        let call_addr = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
-        let sc = i32::from_ne_bytes(buf[24..28].try_into().unwrap());
-        let arch = u32::from_ne_bytes(buf[28..32].try_into().unwrap());
-        let name = if sc >= 0 { nr_name(sc as u64) } else { "unknown-id" };
+        let (call_addr, sc, arch) = if compat {
+            (
+                u32::from_ne_bytes(buf[12..16].try_into().unwrap()) as u64,
+                i32::from_ne_bytes(buf[16..20].try_into().unwrap()),
+                u32::from_ne_bytes(buf[20..24].try_into().unwrap()),
+            )
+        } else {
+            (
+                u64::from_ne_bytes(buf[16..24].try_into().unwrap()),
+                i32::from_ne_bytes(buf[24..28].try_into().unwrap()),
+                u32::from_ne_bytes(buf[28..32].try_into().unwrap()),
+            )
+        };
+        let name = if sc >= 0 {
+            nr_name(compat, sc as u64)
+        } else {
+            "unknown-id"
+        };
         sup!(
             "SIGSYS detail pid={pid}: si_code={si_code} syscall={sc} name={name} arch=0x{arch:x} call_addr=0x{call_addr:x}"
         );
     }
-    if let Some(r) = get_regs(pid) {
+    if let Some(r) = get_regs(pid, compat) {
         sup!(
-            "SIGSYS regs pid={pid}: pc=0x{:x} x8=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}",
-            r.pc, r.regs[8], r.regs[0], r.regs[1], r.regs[2]
+            "SIGSYS regs pid={pid}: pc=0x{:x} nr_reg=0x{:x} a0=0x{:x} a1=0x{:x} a2=0x{:x}",
+            r.pc(),
+            r.nr(),
+            r.arg(0),
+            r.arg(1),
+            r.arg(2)
         );
     }
 }
@@ -597,10 +833,19 @@ struct ProcState {
     /// fork event may still correct it from the parent.
     syscall_seen: bool,
     is_root: bool,
+    /// The personality this tracee's registers and syscall numbers
+    /// are read in. The root starts native (it is our own fork
+    /// child, still running the supervisor image) and flips to the
+    /// guest's personality at its exec event; children inherit the
+    /// parent's current value at birth -- every birth in the tree
+    /// happens after the launch exec, from an already-flipped
+    /// parent. Execs inside the tree only ever land on the same
+    /// guest binary, so the value never flips back.
+    compat: bool,
 }
 
 impl ProcState {
-    fn new(vcwd: &str, is_root: bool) -> Self {
+    fn new(vcwd: &str, is_root: bool, compat: bool) -> Self {
         ProcState {
             expect_exit: false,
             pending: None,
@@ -609,6 +854,7 @@ impl ProcState {
             started: false,
             syscall_seen: false,
             is_root,
+            compat,
         }
     }
 }
@@ -647,10 +893,11 @@ fn set_syscallno(pid: i32, value: i32) -> bool {
 /// "emulated" setgid really executed -- that handset happened to
 /// allow it and returned the same 0 we injected -- and the
 /// following setuid really executed into the seccomp TRAP).
-/// regs[8] is still set to -1 as well: harmless, and it keeps any
+/// The tracee-visible number register (x8 on AArch64, r7 on
+/// compat) is still set to -1 as well: harmless, and it keeps any
 /// reader of x8 (including our own SIGSYS regs dump) honest.
-fn skip_syscall(pid: i32, regs: &mut UserPtRegs, pend: &mut Pending, value: i64) {
-    regs.regs[8] = u64::MAX;
+fn skip_syscall(pid: i32, regs: &mut Regs, pend: &mut Pending, value: i64) {
+    regs.cancel_nr_reg();
     if !set_syscallno(pid, -1) {
         sup!(
             "WARN: NT_ARM_SYSTEM_CALL set failed pid={pid} errno={}",
@@ -662,26 +909,39 @@ fn skip_syscall(pid: i32, regs: &mut UserPtRegs, pend: &mut Pending, value: i64)
 
 /// T class: rewrite each path argument into the rootfs and return a
 /// log description of what was done.
-fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserPtRegs) -> String {
+fn entry_translate(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+) -> String {
     // (arg index of path, arg index of its dirfd or -1 for cwd semantics)
-    let pairs: Vec<(usize, i64)> = if is_t_dirfd_path(nr) {
-        vec![(1, regs.regs[0] as i64)]
-    } else if is_t_two_paths(nr) {
-        vec![(1, regs.regs[0] as i64), (3, regs.regs[2] as i64)]
-    } else if is_t_symlinkat(nr) {
-        vec![(2, regs.regs[1] as i64)]
+    let pairs: Vec<(usize, i64)> = if compat && (nr == 9 || nr == 38) {
+        // Classic link/rename: both paths carry cwd semantics.
+        vec![(0, AT_FDCWD), (1, AT_FDCWD)]
+    } else if compat && nr == 83 {
+        // Classic symlink: a0 is the content, a1 the linkpath.
+        vec![(1, AT_FDCWD)]
+    } else if is_t_dirfd_path(compat, nr) {
+        vec![(1, regs.arg(0) as i64)]
+    } else if is_t_two_paths(compat, nr) {
+        vec![(1, regs.arg(0) as i64), (3, regs.arg(2) as i64)]
+    } else if is_t_symlinkat(compat, nr) {
+        vec![(2, regs.arg(1) as i64)]
     } else {
         vec![(0, AT_FDCWD)]
     };
-    let mut cursor = regs.sp.saturating_sub(256);
+    let mut cursor = regs.sp().saturating_sub(256);
     let mut parts: Vec<String> = Vec::new();
     for (argi, dirfd) in pairs {
-        let addr = regs.regs[argi];
+        let addr = regs.arg(argi);
         match read_path(pid, addr) {
             Some(old) => match translate(rootfs, vcwd, dirfd, &old) {
                 Some(new) => match scratch_write(pid, &mut cursor, &new) {
                     Some(scratch) => {
-                        regs.regs[argi] = scratch;
+                        regs.set_arg(argi, scratch);
                         parts.push(format!("'{old}' -> '{new}'"));
                     }
                     None => parts.push(format!("'{old}' (scratch write failed, untranslated)")),
@@ -691,8 +951,8 @@ fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserP
             None => parts.push(format!("path@{addr:#x} (unreadable)")),
         }
     }
-    let mut desc = format!("{}({}) {}", nr_name(nr), nr, parts.join(", "));
-    if nr == 78 {
+    let mut desc = format!("{}({}) {}", nr_name(compat, nr), nr, parts.join(", "));
+    if nr == nr_readlinkat(compat) {
         // readlinkat: the result buffer gets the real (prefixed)
         // path written back; accepted per M0 spec 2.4.
         desc.push_str(" [note: readlink result may carry the rootfs prefix]");
@@ -716,34 +976,49 @@ fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserP
 /// to their own current values, so 0 is the semantically correct
 /// answer -- the same treatment proot gives the uid/gid family.
 /// getresuid(148)/getresgid(150) are harmless queries and pass.
-fn is_setid_emulated(nr: u64) -> bool {
-    matches!(nr, 143 | 144 | 145 | 146 | 147 | 149 | 151 | 152 | 159)
+fn is_setid_emulated(compat: bool, nr: u64) -> bool {
+    if compat {
+        // The 16-bit and 32-bit uid forms, both: musl calls the
+        // *32 variants, but the legacy numbers cost nothing to
+        // cover -- the whole family is trapped by the filter.
+        matches!(
+            nr,
+            23 | 46 | 70 | 71 | 81 | 138 | 139 | 164 | 170 | 203 | 204 | 206 | 208
+                | 210 | 213 | 214 | 215 | 216
+        )
+    } else {
+        matches!(nr, 143 | 144 | 145 | 146 | 147 | 149 | 151 | 152 | 159)
+    }
 }
 
 /// F class (getcwd, fchdir): cancel the syscall and fabricate the
 /// answer from the virtual cwd (M1 spec section 3).
-fn entry_fake(pid: i32, vcwd: &str, nr: u64, regs: &mut UserPtRegs, pend: &mut Pending) -> String {
-    match nr {
-        NR_GETCWD => {
-            let buf = regs.regs[0];
-            let size = regs.regs[1];
-            let need = (vcwd.len() + 1) as u64;
-            let mut bytes = vcwd.as_bytes().to_vec();
-            bytes.push(0);
-            if size >= need && write_mem(pid, buf, &bytes).is_ok() {
-                skip_syscall(pid, regs, pend, need as i64);
-                format!("getcwd(17) FAKED -> \"{vcwd}\"")
-            } else {
-                skip_syscall(pid, regs, pend, -ERANGE);
-                "getcwd(17) FAKED -> -ERANGE (buffer too small)".to_string()
-            }
+fn entry_fake(
+    pid: i32,
+    vcwd: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    if nr == nr_getcwd(compat) {
+        let buf = regs.arg(0);
+        let size = regs.arg(1);
+        let need = (vcwd.len() + 1) as u64;
+        let mut bytes = vcwd.as_bytes().to_vec();
+        bytes.push(0);
+        if size >= need && write_mem(pid, buf, &bytes).is_ok() {
+            skip_syscall(pid, regs, pend, need as i64);
+            format!("getcwd({nr}) FAKED -> \"{vcwd}\"")
+        } else {
+            skip_syscall(pid, regs, pend, -ERANGE);
+            format!("getcwd({nr}) FAKED -> -ERANGE (buffer too small)")
         }
-        _ => {
-            // fchdir: succeed without touching the vcwd. The guest
-            // shell's cd uses chdir, not fchdir (M1 spec section 3).
-            skip_syscall(pid, regs, pend, 0);
-            format!("fchdir(50) FAKED -> 0 (vcwd stays {vcwd})")
-        }
+    } else {
+        // fchdir: succeed without touching the vcwd. The guest
+        // shell's cd uses chdir, not fchdir (M1 spec section 3).
+        skip_syscall(pid, regs, pend, 0);
+        format!("fchdir({nr}) FAKED -> 0 (vcwd stays {vcwd})")
     }
 }
 
@@ -755,13 +1030,15 @@ fn entry_chdir(
     pid: i32,
     rootfs: &str,
     vcwd: &str,
-    regs: &mut UserPtRegs,
+    compat: bool,
+    regs: &mut Regs,
     pend: &mut Pending,
 ) -> (String, Option<String>) {
-    let addr = regs.regs[0];
+    let cnr = nr_chdir(compat);
+    let addr = regs.arg(0);
     let Some(p) = read_path(pid, addr) else {
         skip_syscall(pid, regs, pend, -ENOENT);
-        return ("chdir(49) path unreadable -> -ENOENT".to_string(), None);
+        return (format!("chdir({cnr}) path unreadable -> -ENOENT"), None);
     };
     let target = guest_abs(vcwd, &p);
     let host = format!("{rootfs}{target}");
@@ -769,17 +1046,17 @@ fn entry_chdir(
         Ok(md) if md.is_dir() => {
             skip_syscall(pid, regs, pend, 0);
             (
-                format!("chdir(49) '{p}' vcwd {vcwd} -> {target}"),
+                format!("chdir({cnr}) '{p}' vcwd {vcwd} -> {target}"),
                 Some(target),
             )
         }
         Ok(_) => {
             skip_syscall(pid, regs, pend, -ENOTDIR);
-            (format!("chdir(49) '{p}' -> -ENOTDIR (target {target})"), None)
+            (format!("chdir({cnr}) '{p}' -> -ENOTDIR (target {target})"), None)
         }
         Err(_) => {
             skip_syscall(pid, regs, pend, -ENOENT);
-            (format!("chdir(49) '{p}' -> -ENOENT (target {target})"), None)
+            (format!("chdir({cnr}) '{p}' -> -ENOENT (target {target})"), None)
         }
     }
 }
@@ -821,25 +1098,26 @@ fn entry_exec(
     rootfs: &str,
     bb_native: &str,
     vcwd: &str,
+    compat: bool,
     nr: u64,
-    regs: &mut UserPtRegs,
+    regs: &mut Regs,
     pend: &mut Pending,
 ) -> (String, bool) {
-    let name = nr_name(nr);
-    let (path_arg, dirfd) = if nr == NR_EXECVE {
+    let name = nr_name(compat, nr);
+    let (path_arg, dirfd) = if nr == nr_execve(compat) {
         (0usize, AT_FDCWD)
     } else {
-        (1usize, regs.regs[0] as i64)
+        (1usize, regs.arg(0) as i64)
     };
-    let addr = regs.regs[path_arg];
+    let addr = regs.arg(path_arg);
     let Some(gpath) = read_path(pid, addr) else {
         return (format!("{name}({nr}) path@{addr:#x} (unreadable, passed)"), false);
     };
-    let rewrite_to_bb = |regs: &mut UserPtRegs| -> bool {
-        let mut cursor = regs.sp.saturating_sub(256);
+    let rewrite_to_bb = |regs: &mut Regs| -> bool {
+        let mut cursor = regs.sp().saturating_sub(256);
         match scratch_write(pid, &mut cursor, bb_native) {
             Some(scratch) => {
-                regs.regs[path_arg] = scratch;
+                regs.set_arg(path_arg, scratch);
                 true
             }
             None => false,
@@ -888,10 +1166,10 @@ fn entry_exec(
     // deliver the natural verdict (usually ENOENT) -- the shell's
     // PATH search depends on trying candidates one by one.
     let host = format!("{rootfs}{abs}");
-    let mut cursor = regs.sp.saturating_sub(256);
+    let mut cursor = regs.sp().saturating_sub(256);
     match scratch_write(pid, &mut cursor, &host) {
         Some(scratch) => {
-            regs.regs[path_arg] = scratch;
+            regs.set_arg(path_arg, scratch);
             (format!("exec '{gpath}' -> '{host}' (pass, kernel verdict)"), true)
         }
         None => (format!("exec '{gpath}' (scratch write failed, passed)"), false),
@@ -978,6 +1256,22 @@ fn main() {
     sup!("kernel: {}", kernel_release());
     sup!("selinux: {}", read_context());
     sup!("rootfs={rootfs} guest={guest_path}");
+    // The whole tree shares the guest binary's personality: the
+    // rootfs can only ever exec that one binary (see entry_exec).
+    let guest_compat = match guest_is_compat(&guest_path) {
+        Some(c) => {
+            sup!(
+                "guest ELF: {} -> {} tracee mode",
+                if c { "ELF32/ARM" } else { "ELF64/AArch64" },
+                if c { "compat" } else { "native" }
+            );
+            c
+        }
+        None => {
+            sup!("WARN: guest ELF header unreadable or not ARM-family; assuming native 64-bit");
+            false
+        }
+    };
 
     unsafe {
         libc::signal(libc::SIGTERM, on_sigterm as usize as libc::sighandler_t);
@@ -1046,10 +1340,15 @@ fn main() {
 
     let root_pid = pid;
     let mut procs: HashMap<i32, ProcState> = HashMap::new();
-    procs.insert(root_pid, ProcState::new("/", true));
+    // The root starts in the native personality: until its launch
+    // exec completes it is still our own fork child running the
+    // supervisor image. It flips at the exec event (see below).
+    procs.insert(root_pid, ProcState::new("/", true, false));
     let mut root_launched = false;
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut counts: HashMap<u64, u64> = HashMap::new();
+    // Keyed by (compat, nr): the root's launch execve is counted
+    // under the native table, everything else under the guest's.
+    let mut seen: HashSet<(bool, u64)> = HashSet::new();
+    let mut counts: HashMap<(bool, u64), u64> = HashMap::new();
 
     // ---- main tracing loop over the whole guest tree ----
     'main_loop: loop {
@@ -1117,7 +1416,7 @@ fn main() {
         // fork event refreshes the vcwd if it arrives later.
         if !procs.contains_key(&pid) {
             sup!("new tracee pid={pid} (registered on first stop)");
-            procs.insert(pid, ProcState::new("/", false));
+            procs.insert(pid, ProcState::new("/", false, guest_compat));
         }
 
         // Initial stop of a fresh tracee: set the option set,
@@ -1146,66 +1445,106 @@ fn main() {
             if !proc.expect_exit {
                 // ---- syscall-entry stop ----
                 proc.syscall_seen = true;
-                let Some(mut regs) = get_regs(pid) else {
+                let Some(mut regs) = get_regs(pid, proc.compat) else {
                     cont_syscall(pid, 0);
                     continue;
                 };
-                let nr = regs.regs[8];
+                let nr = regs.nr();
                 let mut pend = Pending { nr, desc: None, inject: None, applied: false };
                 let mut dirty = false;
-                if (nr == NR_EXECVE || nr == NR_EXECVEAT) && pid == root_pid && !root_launched {
+                if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
+                    && pid == root_pid
+                    && !root_launched
+                {
                     // The guest root's own launch exec must pass;
                     // every later exec goes through the exec rules.
-                    *counts.entry(nr).or_insert(0) += 1;
-                    if seen.insert(nr) {
-                        sys!("{}({}) pass (guest launch exec, allowed)", nr_name(nr), nr);
+                    *counts.entry((proc.compat, nr)).or_insert(0) += 1;
+                    if seen.insert((proc.compat, nr)) {
+                        sys!(
+                            "{}({}) pass (guest launch exec, allowed)",
+                            nr_name(proc.compat, nr),
+                            nr
+                        );
                     }
-                } else if nr == NR_EXECVE || nr == NR_EXECVEAT {
+                } else if nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat) {
                     let (desc, d) = entry_exec(
                         pid,
                         &rootfs,
                         &guest_path,
                         &proc.vcwd,
+                        proc.compat,
                         nr,
                         &mut regs,
                         &mut pend,
                     );
                     pend.desc = Some(desc);
                     dirty = d;
-                } else if nr == NR_CHDIR {
-                    let (desc, new_vcwd) =
-                        entry_chdir(pid, &rootfs, &proc.vcwd, &mut regs, &mut pend);
+                } else if nr == nr_chdir(proc.compat) {
+                    let (desc, new_vcwd) = entry_chdir(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        proc.compat,
+                        &mut regs,
+                        &mut pend,
+                    );
                     pend.desc = Some(desc);
                     dirty = true;
                     if let Some(v) = new_vcwd {
                         proc.vcwd = v;
                     }
-                } else if is_t_dirfd_path(nr)
-                    || is_t_two_paths(nr)
-                    || is_t_symlinkat(nr)
-                    || is_t_path0(nr)
+                } else if is_t_dirfd_path(proc.compat, nr)
+                    || is_t_two_paths(proc.compat, nr)
+                    || is_t_symlinkat(proc.compat, nr)
+                    || is_t_path0(proc.compat, nr)
                 {
-                    pend.desc = Some(entry_translate(pid, &rootfs, &proc.vcwd, nr, &mut regs));
+                    pend.desc = Some(entry_translate(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        proc.compat,
+                        nr,
+                        &mut regs,
+                    ));
                     dirty = true;
-                } else if is_setid_emulated(nr) {
+                } else if is_setid_emulated(proc.compat, nr) {
                     // Cancel before the kernel (and its seccomp
                     // filter) ever evaluates it; answer 0 at the
                     // exit stop via the standard inject path.
                     skip_syscall(pid, &mut regs, &mut pend, 0);
-                    pend.desc = Some(format!("{}({}) emulated (return 0)", nr_name(nr), nr));
+                    pend.desc = Some(format!(
+                        "{}({}) emulated (return 0)",
+                        nr_name(proc.compat, nr),
+                        nr
+                    ));
                     dirty = true;
-                } else if is_faked(nr) {
-                    pend.desc = Some(entry_fake(pid, &proc.vcwd, nr, &mut regs, &mut pend));
+                } else if is_faked(proc.compat, nr) {
+                    pend.desc = Some(entry_fake(
+                        pid,
+                        &proc.vcwd,
+                        proc.compat,
+                        nr,
+                        &mut regs,
+                        &mut pend,
+                    ));
                     dirty = true;
-                } else if is_blocked(nr) {
+                } else if is_blocked(proc.compat, nr) {
                     skip_syscall(pid, &mut regs, &mut pend, -ENOSYS);
-                    pend.desc = Some(format!("{}({}) BLOCKED -> -ENOSYS", nr_name(nr), nr));
+                    pend.desc = Some(format!(
+                        "{}({}) BLOCKED -> -ENOSYS",
+                        nr_name(proc.compat, nr),
+                        nr
+                    ));
                     dirty = true;
                 } else {
                     // P class and unlisted: pass, log first occurrence.
-                    *counts.entry(nr).or_insert(0) += 1;
-                    if seen.insert(nr) {
-                        sys!("{}({}) pass (first occurrence)", nr_name(nr), nr);
+                    *counts.entry((proc.compat, nr)).or_insert(0) += 1;
+                    if seen.insert((proc.compat, nr)) {
+                        sys!(
+                            "{}({}) pass (first occurrence)",
+                            nr_name(proc.compat, nr),
+                            nr
+                        );
                     }
                 }
                 if dirty {
@@ -1217,10 +1556,10 @@ fn main() {
             } else {
                 // ---- syscall-exit stop ----
                 if let Some(mut pend) = proc.pending.take() {
-                    if let Some(mut regs) = get_regs(pid) {
-                        let mut ret = regs.regs[0] as i64;
+                    if let Some(mut regs) = get_regs(pid, proc.compat) {
+                        let mut ret = regs.retval();
                         if let Some(v) = pend.inject {
-                            regs.regs[0] = v as u64;
+                            regs.set_retval(v);
                             if set_regs(pid, &regs) {
                                 pend.applied = true;
                             }
@@ -1260,6 +1599,12 @@ fn main() {
             }
             if pid == root_pid {
                 root_launched = true;
+                // From here on the root runs the guest image: its
+                // registers and syscall numbers switch to the
+                // guest's personality.
+                if let Some(p) = procs.get_mut(&pid) {
+                    p.compat = guest_compat;
+                }
                 sup!("guest exec completed (launch)");
             } else {
                 sup!("exec completed pid={pid}");
@@ -1272,10 +1617,10 @@ fn main() {
         {
             if let Some(child) = get_event_msg(pid) {
                 let child = child as i32;
-                let parent_vcwd = procs
+                let (parent_vcwd, parent_compat) = procs
                     .get(&pid)
-                    .map(|p| p.vcwd.clone())
-                    .unwrap_or_else(|| "/".to_string());
+                    .map(|p| (p.vcwd.clone(), p.compat))
+                    .unwrap_or_else(|| ("/".to_string(), guest_compat));
                 match procs.get_mut(&child) {
                     Some(cp) => {
                         // Registered early by its own initial stop.
@@ -1285,10 +1630,11 @@ fn main() {
                         // vcwd is still exact.
                         if !cp.syscall_seen {
                             cp.vcwd = parent_vcwd;
+                            cp.compat = parent_compat;
                         }
                     }
                     None => {
-                        procs.insert(child, ProcState::new(&parent_vcwd, false));
+                        procs.insert(child, ProcState::new(&parent_vcwd, false, parent_compat));
                     }
                 }
                 let ev_name = match event {
@@ -1325,7 +1671,11 @@ fn main() {
             // path already tolerates a missing record.
             let mut deliver = sig;
             if sig == SIGSYS {
-                dump_sigsys_info(pid);
+                let sig_compat = procs
+                    .get(&pid)
+                    .map(|p| p.compat)
+                    .unwrap_or(guest_compat);
+                dump_sigsys_info(pid, sig_compat);
                 if let Some(proc) = procs.get_mut(&pid) {
                     let fake = proc
                         .pending
@@ -1334,16 +1684,16 @@ fn main() {
                         .map(|p| (p.nr, p.inject.unwrap(), p.applied));
                     if let Some((fnr, value, applied)) = fake {
                         let mut pc = 0u64;
-                        if let Some(mut regs) = get_regs(pid) {
-                            pc = regs.pc;
+                        if let Some(mut regs) = get_regs(pid, proc.compat) {
+                            pc = regs.pc();
                             if !applied {
-                                regs.regs[0] = value as u64;
+                                regs.set_retval(value);
                                 set_regs(pid, &regs);
                             }
                         }
                         sup!(
                             "SIGSYS rescued pid={pid} fake={}({fnr}) pc=0x{pc:x}",
-                            nr_name(fnr)
+                            nr_name(proc.compat, fnr)
                         );
                         proc.pending = None;
                         deliver = 0;
@@ -1355,11 +1705,11 @@ fn main() {
     }
 
     if !counts.is_empty() {
-        let mut items: Vec<(u64, u64)> = counts.into_iter().collect();
-        items.sort_by_key(|(nr, _)| *nr);
+        let mut items: Vec<((bool, u64), u64)> = counts.into_iter().collect();
+        items.sort_by_key(|((_, nr), _)| *nr);
         let parts: Vec<String> = items
             .iter()
-            .map(|(nr, n)| format!("{}({})x{}", nr_name(*nr), nr, n))
+            .map(|((c, nr), n)| format!("{}({})x{}", nr_name(*c, *nr), nr, n))
             .collect();
         sys!("pass-through summary: {}", parts.join(", "));
     }

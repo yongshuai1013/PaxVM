@@ -25,6 +25,10 @@ import kotlin.concurrent.thread
  * (libbusybox.so) running `sh /verify.sh` inside the prepared
  * rootfs; the supervisor traces the whole process tree and rewrites
  * applet execs to the nativeLibraryDir busybox (M1 spec section 2).
+ *
+ * 0.2.8 adds a second entry: the same session with a 32-bit ARM
+ * busybox guest (libbusybox32.so) in its own rootfs, probing the
+ * supervisor's compat-personality support (gingerbread spike S2).
  */
 class MainActivity : Activity() {
 
@@ -32,12 +36,19 @@ class MainActivity : Activity() {
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
     private lateinit var startButton: Button
+    private lateinit var probeButton: Button
     private lateinit var stopButton: Button
 
     private var supervisor: Process? = null
 
     private val rootfsDir: File
         get() = File(filesDir, "vm0/rootfs")
+
+    /** Separate rootfs for the 32-bit probe: its /bin symlinks are
+     * resolved by the supervisor to libbusybox32.so, so the two
+     * guests never share a tree. */
+    private val rootfs32Dir: File
+        get() = File(filesDir, "vm0/rootfs32")
 
     /** Applet names linked to busybox inside the guest rootfs. */
     private val applets = listOf(
@@ -74,7 +85,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        prepareRootfs()
+        prepareRootfs(rootfsDir)
         statusView.text = "rootfs: ${rootfsDir.absolutePath}\n狀態：待命"
     }
 
@@ -95,7 +106,11 @@ class MainActivity : Activity() {
         }
         startButton = Button(this).apply {
             text = "啟動"
-            setOnClickListener { startSupervisor() }
+            setOnClickListener { startSupervisor(rootfsDir, "libbusybox.so") }
+        }
+        probeButton = Button(this).apply {
+            text = "啟動32"
+            setOnClickListener { startSupervisor(rootfs32Dir, "libbusybox32.so") }
         }
         stopButton = Button(this).apply {
             text = "停止"
@@ -103,6 +118,7 @@ class MainActivity : Activity() {
             setOnClickListener { stopSupervisor() }
         }
         buttons.addView(startButton)
+        buttons.addView(probeButton)
         buttons.addView(stopButton)
         root.addView(buttons)
 
@@ -126,8 +142,7 @@ class MainActivity : Activity() {
     }
 
     /** Idempotent: build the rootfs tree the busybox guest expects. */
-    private fun prepareRootfs() {
-        val rootfs = rootfsDir
+    private fun prepareRootfs(rootfs: File) {
         val bin = File(rootfs, "bin")
         bin.mkdirs()
         File(rootfs, "tmp").mkdirs()
@@ -159,14 +174,14 @@ class MainActivity : Activity() {
         File(rootfs, "verify.sh").writeText(verifyScript)
     }
 
-    private fun startSupervisor() {
+    private fun startSupervisor(rootfs: File, guestLib: String) {
         if (supervisor != null) return
-        prepareRootfs()
+        prepareRootfs(rootfs)
         val libDir = applicationInfo.nativeLibraryDir
         val cmd = listOf(
             "$libDir/libsupervisor.so",
-            rootfsDir.absolutePath,
-            "$libDir/libbusybox.so",
+            rootfs.absolutePath,
+            "$libDir/$guestLib",
             "--",
             "sh",
             "/verify.sh",
@@ -183,8 +198,9 @@ class MainActivity : Activity() {
         }
         supervisor = proc
         startButton.isEnabled = false
+        probeButton.isEnabled = false
         stopButton.isEnabled = true
-        statusView.text = "rootfs: ${rootfsDir.absolutePath}\n狀態：監督器執行中"
+        statusView.text = "rootfs: ${rootfs.absolutePath}\n狀態：監督器執行中"
         appendLog("[shell] supervisor started")
         thread(name = "supervisor-reader") {
             try {
@@ -198,9 +214,10 @@ class MainActivity : Activity() {
             runOnUiThread {
                 supervisor = null
                 startButton.isEnabled = true
+                probeButton.isEnabled = true
                 stopButton.isEnabled = false
                 statusView.text =
-                    "rootfs: ${rootfsDir.absolutePath}\n狀態：監督器已結束"
+                    "rootfs: ${rootfs.absolutePath}\n狀態：監督器已結束"
             }
             appendLog("[shell] supervisor exited: $code")
         }
