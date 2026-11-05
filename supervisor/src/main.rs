@@ -1,16 +1,18 @@
-//! PaxVM M0 supervisor: a standalone native process that forks a
-//! static guest binary, attaches to it with ptrace, and proxies a
-//! minimal syscall set so the guest's file accesses land inside the
-//! app sandbox rootfs (M0 spec, sections 2.1-2.7).
+//! PaxVM M1 supervisor: a standalone native process that forks a
+//! static busybox binary, attaches to it with ptrace, and traces the
+//! whole guest process tree (M1 spec). It builds on the M0 design:
 //!
-//! Design points fixed by the spec:
-//! - ptrace is used raw through libc, only in the classic
-//!   PTRACE_SYSCALL double-stop model with GETREGSET/SETREGSET
-//!   (NT_PRSTATUS). No seccomp, no PTRACE_GET_SYSCALL_INFO.
+//! - Classic PTRACE_SYSCALL double-stop model with GETREGSET /
+//!   SETREGSET (NT_PRSTATUS) per tracee; no seccomp, no
+//!   PTRACE_GET_SYSCALL_INFO.
 //! - Path-carrying syscalls are translated onto the rootfs by
-//!   rewriting the path argument to a stack scratch area.
-//! - Unlisted syscalls are passed through and logged on first
-//!   occurrence (log-first principle, spec 2.6).
+//!   rewriting the path argument to a stack scratch area, now
+//!   anchored at each process's virtual cwd (vcwd).
+//! - execve/execveat of busybox applets (rootfs symlinks to busybox)
+//!   is rewritten to the real busybox binary in nativeLibraryDir --
+//!   the rootfs lives in filesDir and cannot be exec'd directly.
+//! - Unlisted syscalls pass through, logged on first occurrence
+//!   (log-first principle).
 //! - stdout is a line protocol for the shell: [sup] supervisor
 //!   events, [sys] syscall events, [guest] forwarded guest output.
 
@@ -20,32 +22,46 @@ use std::io::Write;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 
-// ---- ptrace constants (raw, per spec 2.1; bionic ptrace takes c_int) ----
+// ---- ptrace constants (raw; bionic ptrace takes c_int) ----
 const PTRACE_TRACEME: i32 = 0;
 const PTRACE_PEEKDATA: i32 = 2;
 const PTRACE_POKEDATA: i32 = 5;
 const PTRACE_SYSCALL: i32 = 24;
 const PTRACE_SETOPTIONS: i32 = 0x4200;
+const PTRACE_GETEVENTMSG: i32 = 0x4201;
 const PTRACE_GETREGSET: i32 = 0x4204;
 const PTRACE_SETREGSET: i32 = 0x4205;
 const PTRACE_O_TRACESYSGOOD: usize = 0x1;
+const PTRACE_O_TRACEFORK: usize = 0x2;
+const PTRACE_O_TRACEVFORK: usize = 0x4;
+const PTRACE_O_TRACECLONE: usize = 0x8;
 const PTRACE_O_TRACEEXEC: usize = 0x10;
 const PTRACE_O_EXITKILL: usize = 0x100000;
+const PTRACE_EVENT_FORK: i32 = 1;
+const PTRACE_EVENT_VFORK: i32 = 2;
+const PTRACE_EVENT_CLONE: i32 = 3;
 const PTRACE_EVENT_EXEC: i32 = 4;
 const NT_PRSTATUS: usize = 1;
 
 const SIGTRAP: i32 = 5;
+const SIGSTOP: i32 = 19;
 const SYSCALL_STOP_SIG: i32 = SIGTRAP | 0x80;
+const WALL: i32 = 0x40000000; // __WALL: wait for threads too
 
 const AT_FDCWD: i64 = -100;
 
 const ENOSYS: i64 = 38;
 const ERANGE: i64 = 34;
+const EACCES: i64 = 13;
+const ENOENT: i64 = 2;
+const ENOTDIR: i64 = 20;
 
-// ---- aarch64 syscall numbers (asm-generic table, spec 2.5/2.6) ----
+// ---- aarch64 syscall numbers (asm-generic table) ----
 const NR_GETCWD: u64 = 17;
 const NR_CHDIR: u64 = 49;
 const NR_FCHDIR: u64 = 50;
+const NR_EXECVE: u64 = 221;
+const NR_EXECVEAT: u64 = 281;
 
 /// Syscalls whose only path argument is (dirfd=a0, path=a1): T class.
 fn is_t_dirfd_path(nr: u64) -> bool {
@@ -71,18 +87,20 @@ fn is_t_path0(nr: u64) -> bool {
     matches!(nr, 43 | 45) // statfs, truncate
 }
 
-/// F class: answered by the supervisor itself.
+/// F class answered purely from supervisor state (getcwd, fchdir).
+/// chdir is also F class (the real syscall never runs) but needs
+/// vcwd mutation, so it is dispatched separately in the entry path.
 fn is_faked(nr: u64) -> bool {
-    matches!(nr, NR_GETCWD | NR_CHDIR | NR_FCHDIR)
+    matches!(nr, NR_GETCWD | NR_FCHDIR)
 }
 
-/// X class: blocked with -ENOSYS (spec 2.6). execve/execveat are
-/// handled specially in the entry path: the guest's own launch exec
-/// must pass, later ones are blocked.
+/// X class: blocked with -ENOSYS. clone/clone3 left this class in
+/// M1 (children are followed via TRACEFORK/TRACECLONE), and
+/// execve/execveat are routed to the exec handler instead.
 fn is_blocked(nr: u64) -> bool {
     matches!(
         nr,
-        39 | 40 | 41 | 51 | 97 | 117 | 220 | 264 | 265 | 268 | 277 | 280 | 281 | 435 | 437
+        39 | 40 | 41 | 51 | 97 | 117 | 264 | 265 | 268 | 277 | 280 | 437
     )
 }
 
@@ -123,6 +141,9 @@ fn nr_name(nr: u64) -> &'static str {
         67 => "pread64",
         68 => "pwrite64",
         71 => "sendfile",
+        72 => "pselect6",
+        73 => "ppoll",
+        76 => "splice",
         78 => "readlinkat",
         79 => "newfstatat",
         80 => "fstat",
@@ -131,6 +152,7 @@ fn nr_name(nr: u64) -> &'static str {
         88 => "utimensat",
         93 => "exit",
         94 => "exit_group",
+        95 => "waitid",
         96 => "set_tid_address",
         97 => "unshare",
         98 => "futex",
@@ -172,6 +194,7 @@ fn nr_name(nr: u64) -> &'static str {
         222 => "mmap",
         226 => "mprotect",
         233 => "madvise",
+        260 => "wait4",
         261 => "prlimit64",
         264 => "name_to_handle_at",
         265 => "open_by_handle_at",
@@ -190,7 +213,7 @@ fn nr_name(nr: u64) -> &'static str {
     }
 }
 
-// ---- line output (the shell's only view of us; spec 2.7) ----
+// ---- line output (the shell's only view of us) ----
 static OUT_LOCK: Mutex<()> = Mutex::new(());
 
 fn emit(tag: &str, msg: &str) {
@@ -240,7 +263,7 @@ fn get_regs(pid: i32) -> Option<UserPtRegs> {
         &mut iov as *mut libc::iovec as *mut libc::c_void,
     );
     if rc != 0 {
-        sup!("GETREGSET failed: errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno()));
+        sup!("GETREGSET failed pid={pid}: errno={}", errno());
         return None;
     }
     Some(r)
@@ -263,7 +286,43 @@ fn cont_syscall(pid: i32, sig: i32) {
     ptrace4(PTRACE_SYSCALL, pid, std::ptr::null_mut(), sig as usize as *mut libc::c_void);
 }
 
-// ---- guest memory access (process_vm_*, PEEK/POKE fallback; spec 2.4) ----
+/// The one option set every tracee gets (M1 spec section 1):
+/// syscall stops, exec events, fork/vfork/clone following, and
+/// EXITKILL so no tracee can outlive the supervisor.
+fn set_trace_options(pid: i32) -> bool {
+    let opts = (PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEEXEC
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_EXITKILL) as *mut libc::c_void;
+    if ptrace4(PTRACE_SETOPTIONS, pid, std::ptr::null_mut(), opts) != 0 {
+        sup!(
+            "PTRACE_SETOPTIONS failed pid={pid}: errno={} ({})",
+            errno(),
+            std::io::Error::from_raw_os_error(errno())
+        );
+        return false;
+    }
+    true
+}
+
+fn get_event_msg(pid: i32) -> Option<u64> {
+    let mut msg: u64 = 0;
+    let rc = ptrace4(
+        PTRACE_GETEVENTMSG,
+        pid,
+        std::ptr::null_mut(),
+        &mut msg as *mut u64 as *mut libc::c_void,
+    );
+    if rc == 0 {
+        Some(msg)
+    } else {
+        None
+    }
+}
+
+// ---- guest memory access (process_vm_*, PEEK/POKE fallback) ----
 fn read_mem(pid: i32, addr: u64, buf: &mut [u8]) -> Result<usize, i32> {
     let mut local = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -368,11 +427,11 @@ fn read_path(pid: i32, addr: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&all).into_owned())
 }
 
-// ---- path translation (spec 2.5) ----
+// ---- path translation (M0 spec 2.5, vcwd-anchored per M1 spec 3) ----
 
 /// Lexically normalize a guest path into components under the guest
 /// root: collapses duplicate '/', drops '.', and clamps '..' at the
-/// root. No symlink resolution (the M0 rootfs contains none).
+/// root. No symlink resolution at this layer.
 fn normalize_components(path: &str) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
     for c in path.split('/') {
@@ -387,8 +446,29 @@ fn normalize_components(path: &str) -> Vec<&str> {
     out
 }
 
+/// Normalize to a canonical absolute guest path ("/" for the root).
+fn normalize_path_str(path: &str) -> String {
+    let comps = normalize_components(path);
+    if comps.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", comps.join("/"))
+    }
+}
+
+/// Resolve a guest path argument to its canonical absolute guest
+/// form: absolute paths stand alone; relative paths anchor at the
+/// process's virtual cwd.
+fn guest_abs(vcwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        normalize_path_str(path)
+    } else {
+        normalize_path_str(&format!("{vcwd}/{path}"))
+    }
+}
+
 /// Decide the host path for (dirfd, path); None = do not translate.
-fn translate(rootfs: &str, dirfd: i64, path: &str) -> Option<String> {
+fn translate(rootfs: &str, vcwd: &str, dirfd: i64, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
@@ -397,11 +477,11 @@ fn translate(rootfs: &str, dirfd: i64, path: &str) -> Option<String> {
         // path, so kernel resolution is already inside the rootfs.
         return None;
     }
-    let comps = normalize_components(path);
-    if comps.is_empty() {
+    let abs = guest_abs(vcwd, path);
+    if abs == "/" {
         Some(format!("{rootfs}/"))
     } else {
-        Some(format!("{rootfs}/{}", comps.join("/")))
+        Some(format!("{rootfs}{abs}"))
     }
 }
 
@@ -410,8 +490,8 @@ fn roundup16(n: u64) -> u64 {
 }
 
 /// Write `s` plus NUL into the guest's stack scratch area below `sp`
-/// (spec 2.4) and return its address. `cursor` starts at sp and moves
-/// down, keeping a 256-byte safety margin under the live stack.
+/// and return its address. `cursor` starts at sp and moves down,
+/// keeping a 256-byte safety margin under the live stack.
 fn scratch_write(pid: i32, cursor: &mut u64, s: &str) -> Option<u64> {
     let len = s.len() as u64 + 1;
     *cursor = cursor.saturating_sub(roundup16(len));
@@ -427,7 +507,9 @@ fn scratch_write(pid: i32, cursor: &mut u64, s: &str) -> Option<u64> {
     }
 }
 
-// ---- SIGTERM handling: kill the guest, then exit (spec 4) ----
+// ---- SIGTERM handling: kill the guest root, then exit. Every
+// tracee carries PTRACE_O_EXITKILL, so supervisor death takes the
+// whole tree down with it (M0 spec section 4, extended to the tree).
 static GUEST_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_sigterm(_sig: i32) {
@@ -438,11 +520,43 @@ extern "C" fn on_sigterm(_sig: i32) {
     unsafe { libc::_exit(128 + 15) };
 }
 
-// ---- syscall-stop entry handling ----
+// ---- per-process tracing state (M1 spec section 1) ----
 struct Pending {
     nr: u64,
     desc: Option<String>,
     inject: Option<i64>,
+}
+
+struct ProcState {
+    expect_exit: bool,
+    pending: Option<Pending>,
+    /// Virtual cwd in guest path space; "/" at birth, inherited
+    /// across fork/vfork/clone, unchanged by exec.
+    vcwd: String,
+    /// True once we have set ptrace options at the initial stop.
+    options_set: bool,
+    /// True once the initial stop has been consumed and the process
+    /// has been continued for the first time.
+    started: bool,
+    /// True once a syscall-entry stop has been processed. Until
+    /// then no translation has used this process's vcwd, so a late
+    /// fork event may still correct it from the parent.
+    syscall_seen: bool,
+    is_root: bool,
+}
+
+impl ProcState {
+    fn new(vcwd: &str, is_root: bool) -> Self {
+        ProcState {
+            expect_exit: false,
+            pending: None,
+            vcwd: vcwd.to_string(),
+            options_set: false,
+            started: false,
+            syscall_seen: false,
+            is_root,
+        }
+    }
 }
 
 /// Cancel the syscall the guest is about to enter: with x8 = -1 the
@@ -452,9 +566,9 @@ fn skip_syscall(regs: &mut UserPtRegs, pend: &mut Pending, value: i64) {
     pend.inject = Some(value);
 }
 
-/// T class: rewrite each path argument into the rootfs (spec 2.4/2.5)
-/// and return a log description of what was done.
-fn entry_translate(pid: i32, rootfs: &str, nr: u64, regs: &mut UserPtRegs) -> String {
+/// T class: rewrite each path argument into the rootfs and return a
+/// log description of what was done.
+fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserPtRegs) -> String {
     // (arg index of path, arg index of its dirfd or -1 for cwd semantics)
     let pairs: Vec<(usize, i64)> = if is_t_dirfd_path(nr) {
         vec![(1, regs.regs[0] as i64)]
@@ -470,7 +584,7 @@ fn entry_translate(pid: i32, rootfs: &str, nr: u64, regs: &mut UserPtRegs) -> St
     for (argi, dirfd) in pairs {
         let addr = regs.regs[argi];
         match read_path(pid, addr) {
-            Some(old) => match translate(rootfs, dirfd, &old) {
+            Some(old) => match translate(rootfs, vcwd, dirfd, &old) {
                 Some(new) => match scratch_write(pid, &mut cursor, &new) {
                     Some(scratch) => {
                         regs.regs[argi] = scratch;
@@ -486,39 +600,192 @@ fn entry_translate(pid: i32, rootfs: &str, nr: u64, regs: &mut UserPtRegs) -> St
     let mut desc = format!("{}({}) {}", nr_name(nr), nr, parts.join(", "));
     if nr == 78 {
         // readlinkat: the result buffer gets the real (prefixed)
-        // path written back; accepted for M0 per spec 2.4.
+        // path written back; accepted per M0 spec 2.4.
         desc.push_str(" [note: readlink result may carry the rootfs prefix]");
     }
     desc
 }
 
-/// F class: cancel the syscall and fabricate the answer (spec 2.6).
-fn entry_fake(pid: i32, nr: u64, regs: &mut UserPtRegs, pend: &mut Pending) -> String {
+/// F class (getcwd, fchdir): cancel the syscall and fabricate the
+/// answer from the virtual cwd (M1 spec section 3).
+fn entry_fake(pid: i32, vcwd: &str, nr: u64, regs: &mut UserPtRegs, pend: &mut Pending) -> String {
     match nr {
         NR_GETCWD => {
             let buf = regs.regs[0];
             let size = regs.regs[1];
-            if size >= 2 && write_mem(pid, buf, b"/\0").is_ok() {
-                skip_syscall(regs, pend, 2);
-                "getcwd(17) FAKED -> \"/\"".to_string()
+            let need = (vcwd.len() + 1) as u64;
+            let mut bytes = vcwd.as_bytes().to_vec();
+            bytes.push(0);
+            if size >= need && write_mem(pid, buf, &bytes).is_ok() {
+                skip_syscall(regs, pend, need as i64);
+                format!("getcwd(17) FAKED -> \"{vcwd}\"")
             } else {
                 skip_syscall(regs, pend, -ERANGE);
                 "getcwd(17) FAKED -> -ERANGE (buffer too small)".to_string()
             }
         }
-        NR_CHDIR => {
-            // Logical cwd never moves; relative opens anchor at "/".
-            skip_syscall(regs, pend, 0);
-            "chdir(49) FAKED -> 0 (logical cwd stays /)".to_string()
-        }
         _ => {
+            // fchdir: succeed without touching the vcwd. The guest
+            // shell's cd uses chdir, not fchdir (M1 spec section 3).
             skip_syscall(regs, pend, 0);
-            "fchdir(50) FAKED -> 0 (logical cwd stays /)".to_string()
+            format!("fchdir(50) FAKED -> 0 (vcwd stays {vcwd})")
         }
     }
 }
 
-// ---- guest output forwarding (spec 2.7) ----
+/// chdir: true proxying at the virtual level (M1 spec section 3).
+/// The real syscall never runs -- the guest process's host cwd must
+/// stay at "/" so relative resolution has exactly one anchor, the
+/// vcwd. Returns the log description and, on success, the new vcwd.
+fn entry_chdir(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    regs: &mut UserPtRegs,
+    pend: &mut Pending,
+) -> (String, Option<String>) {
+    let addr = regs.regs[0];
+    let Some(p) = read_path(pid, addr) else {
+        skip_syscall(regs, pend, -ENOENT);
+        return ("chdir(49) path unreadable -> -ENOENT".to_string(), None);
+    };
+    let target = guest_abs(vcwd, &p);
+    let host = format!("{rootfs}{target}");
+    match std::fs::metadata(&host) {
+        Ok(md) if md.is_dir() => {
+            skip_syscall(regs, pend, 0);
+            (
+                format!("chdir(49) '{p}' vcwd {vcwd} -> {target}"),
+                Some(target),
+            )
+        }
+        Ok(_) => {
+            skip_syscall(regs, pend, -ENOTDIR);
+            (format!("chdir(49) '{p}' -> -ENOTDIR (target {target})"), None)
+        }
+        Err(_) => {
+            skip_syscall(regs, pend, -ENOENT);
+            (format!("chdir(49) '{p}' -> -ENOENT (target {target})"), None)
+        }
+    }
+}
+
+/// Resolve a canonical guest path through one symlink level inside
+/// the rootfs. Returns (final guest path, entity exists there).
+fn resolve_guest_target(rootfs: &str, abs: &str) -> (String, bool) {
+    let host = format!("{rootfs}{abs}");
+    match std::fs::symlink_metadata(&host) {
+        Ok(md) => {
+            if md.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(&host) {
+                    let t = target.to_string_lossy().into_owned();
+                    let resolved = if t.starts_with('/') {
+                        normalize_path_str(&t)
+                    } else {
+                        let parent = match abs.rfind('/') {
+                            Some(0) | None => "/".to_string(),
+                            Some(i) => abs[..i].to_string(),
+                        };
+                        normalize_path_str(&format!("{parent}/{t}"))
+                    };
+                    return (resolved, true);
+                }
+            }
+            (abs.to_string(), true)
+        }
+        Err(_) => (abs.to_string(), false),
+    }
+}
+
+/// Internal execve/execveat (M1 spec section 2b). Only the busybox
+/// binary itself may truly exec, and only from its nativeLibraryDir
+/// home: the rootfs lives in filesDir, where exec is forbidden.
+/// argv and envp are never touched (busybox dispatches on argv[0]).
+/// Returns (log description, regs were modified).
+fn entry_exec(
+    pid: i32,
+    rootfs: &str,
+    bb_native: &str,
+    vcwd: &str,
+    nr: u64,
+    regs: &mut UserPtRegs,
+    pend: &mut Pending,
+) -> (String, bool) {
+    let name = nr_name(nr);
+    let (path_arg, dirfd) = if nr == NR_EXECVE {
+        (0usize, AT_FDCWD)
+    } else {
+        (1usize, regs.regs[0] as i64)
+    };
+    let addr = regs.regs[path_arg];
+    let Some(gpath) = read_path(pid, addr) else {
+        return (format!("{name}({nr}) path@{addr:#x} (unreadable, passed)"), false);
+    };
+    let rewrite_to_bb = |regs: &mut UserPtRegs| -> bool {
+        let mut cursor = regs.sp.saturating_sub(256);
+        match scratch_write(pid, &mut cursor, bb_native) {
+            Some(scratch) => {
+                regs.regs[path_arg] = scratch;
+                true
+            }
+            None => false,
+        }
+    };
+    if gpath == "/proc/self/exe" {
+        // Standalone ash re-execs itself by this name to run an
+        // applet; the guest really is bb_native, so point it home.
+        let ok = rewrite_to_bb(regs);
+        return (format!("{name}({nr}) '/proc/self/exe' -> busybox (native)"), ok);
+    }
+    if !gpath.starts_with('/') && dirfd != AT_FDCWD {
+        // execveat relative to a real dirfd: out of M1 scope.
+        skip_syscall(regs, pend, -EACCES);
+        return (format!("{name}({nr}) '{gpath}' BLOCKED (dirfd-relative) -> -EACCES"), true);
+    }
+    let abs = guest_abs(vcwd, &gpath);
+    if abs == "/bin/busybox" {
+        let ok = rewrite_to_bb(regs);
+        return (format!("exec '{gpath}' -> busybox (native)"), ok);
+    }
+    let (final_abs, exists) = resolve_guest_target(rootfs, &abs);
+    if exists && final_abs == "/bin/busybox" {
+        let ok = rewrite_to_bb(regs);
+        return (format!("exec '{gpath}' -> busybox (native)"), ok);
+    }
+    if exists {
+        // A real rootfs file that is not busybox: filesDir cannot be
+        // exec'd, and M1 opens no other door. #! scripts land here.
+        let host = format!("{rootfs}{abs}");
+        let mut note = "";
+        if let Ok(mut f) = std::fs::File::open(&host) {
+            use std::io::Read;
+            let mut head = [0u8; 2];
+            if f.read_exact(&mut head).is_ok() && &head == b"#!" {
+                note = " [script, unsupported in M1]";
+            }
+        }
+        skip_syscall(regs, pend, -EACCES);
+        return (
+            format!("exec '{gpath}' BLOCKED (rootfs file, not busybox) -> -EACCES{note}"),
+            true,
+        );
+    }
+    // Does not exist in the rootfs: translate and let the kernel
+    // deliver the natural verdict (usually ENOENT) -- the shell's
+    // PATH search depends on trying candidates one by one.
+    let host = format!("{rootfs}{abs}");
+    let mut cursor = regs.sp.saturating_sub(256);
+    match scratch_write(pid, &mut cursor, &host) {
+        Some(scratch) => {
+            regs.regs[path_arg] = scratch;
+            (format!("exec '{gpath}' -> '{host}' (pass, kernel verdict)"), true)
+        }
+        None => (format!("exec '{gpath}' (scratch write failed, passed)"), false),
+    }
+}
+
+// ---- guest output forwarding: one pipe carries the whole tree's
+// stdout/stderr (children inherit the root's fds 1/2) ----
 fn spawn_guest_reader(fd: i32) -> std::thread::JoinHandle<()> {
     use std::io::Read;
     use std::os::unix::io::FromRawFd;
@@ -570,14 +837,20 @@ fn read_context() -> String {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
-        sup!("usage: libsupervisor.so <rootfs_abs_path> <guest_abs_path>");
+        sup!("usage: libsupervisor.so <rootfs_abs_path> <guest_abs_path> [-- guest_argv...]");
         std::process::exit(2);
     }
     let rootfs = argv[1].clone();
     let guest_path = argv[2].clone();
+    // Guest argv: everything after an optional "--", argv[0] first.
+    // Defaults to the M0 single-word argv when absent.
+    let guest_args: Vec<String> = match argv.iter().position(|a| a == "--") {
+        Some(i) if i + 1 < argv.len() => argv[i + 1..].to_vec(),
+        _ => vec!["guest".to_string()],
+    };
 
-    // Startup self-check lines (spec 2.2 step 2): the evidence that
-    // separates "device policy" from "our bug" on the first run.
+    // Startup self-check lines: the evidence that separates
+    // "device policy" from "our bug" on the first run.
     sup!("supervisor pid={}", std::process::id());
     sup!("kernel: {}", read_first_line("/proc/version"));
     sup!("selinux: {}", read_context());
@@ -594,13 +867,18 @@ fn main() {
     }
     let (pipe_rd, pipe_wr) = (pipe_fds[0], pipe_fds[1]);
 
-    // Build exec arguments before fork: after fork the child may only
-    // use async-signal-safe calls (spec 2.2 step 4).
+    // Build exec arguments before fork: after fork the child may
+    // only use async-signal-safe calls.
     let guest_c = CString::new(guest_path.clone()).unwrap();
-    let argv0_c = CString::new("guest").unwrap();
-    let env_path = CString::new("PATH=/usr/bin:/bin").unwrap();
-    let child_argv: [*const libc::c_char; 2] = [argv0_c.as_ptr(), std::ptr::null()];
-    let child_envp: [*const libc::c_char; 2] = [env_path.as_ptr(), std::ptr::null()];
+    let guest_arg_cs: Vec<CString> =
+        guest_args.iter().map(|a| CString::new(a.clone()).unwrap()).collect();
+    let mut child_argv: Vec<*const libc::c_char> =
+        guest_arg_cs.iter().map(|c| c.as_ptr()).collect();
+    child_argv.push(std::ptr::null());
+    let env_path = CString::new("PATH=/bin:/usr/bin").unwrap();
+    let env_home = CString::new("HOME=/").unwrap();
+    let child_envp: [*const libc::c_char; 3] =
+        [env_path.as_ptr(), env_home.as_ptr(), std::ptr::null()];
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -608,7 +886,7 @@ fn main() {
         std::process::exit(1);
     }
     if pid == 0 {
-        // ---- guest child ----
+        // ---- guest root child ----
         unsafe {
             libc::close(pipe_rd);
             if pipe_wr != 1 {
@@ -627,6 +905,8 @@ fn main() {
                     libc::close(devnull);
                 }
             }
+            // The real host cwd stays at "/" for the whole tree; all
+            // relative resolution is virtualized through the vcwd.
             libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
             ptrace4(PTRACE_TRACEME, 0, std::ptr::null_mut(), std::ptr::null_mut());
             libc::raise(libc::SIGSTOP);
@@ -641,49 +921,67 @@ fn main() {
     let reader = spawn_guest_reader(pipe_rd);
     sup!("guest pid={pid}");
 
-    let mut status: i32 = 0;
-    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if r != pid || !libc::WIFSTOPPED(status) {
-        sup!("initial waitpid unexpected: r={r} status={status:#x}");
-        std::process::exit(1);
-    }
-    let opts = (PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL) as *mut libc::c_void;
-    if ptrace4(PTRACE_SETOPTIONS, pid, std::ptr::null_mut(), opts) != 0 {
-        sup!(
-            "PTRACE_SETOPTIONS failed: errno={} ({})",
-            errno(),
-            std::io::Error::from_raw_os_error(errno())
-        );
-        std::process::exit(1);
-    }
-    sup!("ptrace options set (TRACESYSGOOD|TRACEEXEC|EXITKILL)");
-    cont_syscall(pid, 0);
-
-    // ---- main tracing loop (spec 2.2) ----
-    let mut expect_exit = false;
-    let mut pending: Option<Pending> = None;
-    let mut launched = false;
+    let root_pid = pid;
+    let mut procs: HashMap<i32, ProcState> = HashMap::new();
+    procs.insert(root_pid, ProcState::new("/", true));
+    let mut root_launched = false;
     let mut seen: HashSet<u64> = HashSet::new();
     let mut counts: HashMap<u64, u64> = HashMap::new();
 
-    loop {
+    // ---- main tracing loop over the whole guest tree ----
+    'main_loop: loop {
         let mut status: i32 = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let r = unsafe { libc::waitpid(-1, &mut status, WALL) };
         if r < 0 {
             let e = errno();
             if e == libc::EINTR {
                 continue;
             }
+            if e == libc::ECHILD {
+                sup!("waitpid: no tracees left");
+                break;
+            }
             sup!("waitpid failed: errno={e}");
             break;
         }
-        if libc::WIFEXITED(status) {
-            sup!("GUEST_EXITED code={}", libc::WEXITSTATUS(status));
-            break;
-        }
-        if libc::WIFSIGNALED(status) {
-            sup!("GUEST_SIGNALED sig={}", libc::WTERMSIG(status));
-            break;
+        let pid = r;
+
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            let is_root = pid == root_pid;
+            if libc::WIFEXITED(status) {
+                if is_root {
+                    sup!("GUEST_EXITED code={}", libc::WEXITSTATUS(status));
+                }
+                sup!("PROC_EXITED pid={pid} code={}", libc::WEXITSTATUS(status));
+            } else {
+                if is_root {
+                    sup!("GUEST_SIGNALED sig={}", libc::WTERMSIG(status));
+                }
+                sup!("PROC_SIGNALED pid={pid} sig={}", libc::WTERMSIG(status));
+            }
+            procs.remove(&pid);
+            if is_root {
+                // The session ends with the root: kill whatever is
+                // left of the tree and drain the exit reports.
+                let rest: Vec<i32> = procs.keys().cloned().collect();
+                if !rest.is_empty() {
+                    sup!("root done; killing {} remaining tracee(s)", rest.len());
+                    for p in &rest {
+                        unsafe { libc::kill(*p, libc::SIGKILL) };
+                    }
+                    loop {
+                        let mut st2: i32 = 0;
+                        let r2 = unsafe { libc::waitpid(-1, &mut st2, WALL) };
+                        if r2 < 0 || procs.is_empty() {
+                            break;
+                        }
+                        sup!("PROC_EXITED pid={r2} (cleanup)");
+                        procs.remove(&r2);
+                    }
+                }
+                break 'main_loop;
+            }
+            continue;
         }
         if !libc::WIFSTOPPED(status) {
             continue;
@@ -691,9 +989,40 @@ fn main() {
         let sig = libc::WSTOPSIG(status);
         let event = status >> 16;
 
+        // First sight of a pid (its initial stop may beat the
+        // parent's fork event): register it with a root vcwd; the
+        // fork event refreshes the vcwd if it arrives later.
+        if !procs.contains_key(&pid) {
+            sup!("new tracee pid={pid} (registered on first stop)");
+            procs.insert(pid, ProcState::new("/", false));
+        }
+
+        // Initial stop of a fresh tracee: set the option set,
+        // swallow the initial SIGSTOP, and continue it. A tracee
+        // cannot produce syscall stops before TRACESYSGOOD is set.
+        if !procs.get(&pid).map(|p| p.options_set).unwrap_or(false) {
+            let ok = set_trace_options(pid);
+            if pid == root_pid {
+                sup!("ptrace options set (TRACESYSGOOD|TRACEEXEC|TRACEFORK|TRACEVFORK|TRACECLONE|EXITKILL)");
+            } else {
+                sup!("ptrace options set pid={pid}");
+            }
+            if let Some(p) = procs.get_mut(&pid) {
+                p.options_set = ok;
+                p.started = true;
+            }
+            cont_syscall(pid, if sig == SIGSTOP { 0 } else { sig });
+            continue;
+        }
+
         if sig == SYSCALL_STOP_SIG {
-            if !expect_exit {
+            let Some(proc) = procs.get_mut(&pid) else {
+                cont_syscall(pid, 0);
+                continue;
+            };
+            if !proc.expect_exit {
                 // ---- syscall-entry stop ----
+                proc.syscall_seen = true;
                 let Some(mut regs) = get_regs(pid) else {
                     cont_syscall(pid, 0);
                     continue;
@@ -701,24 +1030,44 @@ fn main() {
                 let nr = regs.regs[8];
                 let mut pend = Pending { nr, desc: None, inject: None };
                 let mut dirty = false;
-                if (nr == 221 || nr == 281) && !launched {
-                    // The guest's own launch exec (after TRACEME) must
-                    // pass; only later execs are X class.
+                if (nr == NR_EXECVE || nr == NR_EXECVEAT) && pid == root_pid && !root_launched {
+                    // The guest root's own launch exec must pass;
+                    // every later exec goes through the exec rules.
                     *counts.entry(nr).or_insert(0) += 1;
                     if seen.insert(nr) {
                         sys!("{}({}) pass (guest launch exec, allowed)", nr_name(nr), nr);
+                    }
+                } else if nr == NR_EXECVE || nr == NR_EXECVEAT {
+                    let (desc, d) = entry_exec(
+                        pid,
+                        &rootfs,
+                        &guest_path,
+                        &proc.vcwd,
+                        nr,
+                        &mut regs,
+                        &mut pend,
+                    );
+                    pend.desc = Some(desc);
+                    dirty = d;
+                } else if nr == NR_CHDIR {
+                    let (desc, new_vcwd) =
+                        entry_chdir(pid, &rootfs, &proc.vcwd, &mut regs, &mut pend);
+                    pend.desc = Some(desc);
+                    dirty = true;
+                    if let Some(v) = new_vcwd {
+                        proc.vcwd = v;
                     }
                 } else if is_t_dirfd_path(nr)
                     || is_t_two_paths(nr)
                     || is_t_symlinkat(nr)
                     || is_t_path0(nr)
                 {
-                    pend.desc = Some(entry_translate(pid, &rootfs, nr, &mut regs));
+                    pend.desc = Some(entry_translate(pid, &rootfs, &proc.vcwd, nr, &mut regs));
                     dirty = true;
                 } else if is_faked(nr) {
-                    pend.desc = Some(entry_fake(pid, nr, &mut regs, &mut pend));
+                    pend.desc = Some(entry_fake(pid, &proc.vcwd, nr, &mut regs, &mut pend));
                     dirty = true;
-                } else if is_blocked(nr) || nr == 221 || nr == 281 {
+                } else if is_blocked(nr) {
                     skip_syscall(&mut regs, &mut pend, -ENOSYS);
                     pend.desc = Some(format!("{}({}) BLOCKED -> -ENOSYS", nr_name(nr), nr));
                     dirty = true;
@@ -732,10 +1081,12 @@ fn main() {
                 if dirty {
                     set_regs(pid, &regs);
                 }
-                pending = Some(pend);
+                proc.pending = Some(pend);
+                proc.expect_exit = true;
+                cont_syscall(pid, 0);
             } else {
                 // ---- syscall-exit stop ----
-                if let Some(pend) = pending.take() {
+                if let Some(pend) = proc.pending.take() {
                     if let Some(mut regs) = get_regs(pid) {
                         let mut ret = regs.regs[0] as i64;
                         if let Some(v) = pend.inject {
@@ -748,18 +1099,65 @@ fn main() {
                         }
                     }
                 }
+                proc.expect_exit = false;
+                cont_syscall(pid, 0);
             }
-            expect_exit = !expect_exit;
-            cont_syscall(pid, 0);
         } else if sig == SIGTRAP && event == PTRACE_EVENT_EXEC {
-            launched = true;
-            sup!("guest exec completed (launch)");
+            // The exec event stop sits between the execve entry and
+            // exit stops; surface the entry's description here and
+            // clear it so the exit stop stays silent (M0 pairing).
+            if let Some(p) = procs.get_mut(&pid) {
+                if let Some(pend) = &mut p.pending {
+                    if let Some(d) = pend.desc.take() {
+                        sys!("{d} (exec completed)");
+                    }
+                }
+            }
+            if pid == root_pid {
+                root_launched = true;
+                sup!("guest exec completed (launch)");
+            } else {
+                sup!("exec completed pid={pid}");
+            }
+            cont_syscall(pid, 0);
+        } else if sig == SIGTRAP
+            && (event == PTRACE_EVENT_FORK
+                || event == PTRACE_EVENT_VFORK
+                || event == PTRACE_EVENT_CLONE)
+        {
+            if let Some(child) = get_event_msg(pid) {
+                let child = child as i32;
+                let parent_vcwd = procs
+                    .get(&pid)
+                    .map(|p| p.vcwd.clone())
+                    .unwrap_or_else(|| "/".to_string());
+                match procs.get_mut(&child) {
+                    Some(cp) => {
+                        // Registered early by its own initial stop.
+                        // No syscall of the child has been processed
+                        // yet, so no translation has consumed its
+                        // vcwd and adopting the parent's current
+                        // vcwd is still exact.
+                        if !cp.syscall_seen {
+                            cp.vcwd = parent_vcwd;
+                        }
+                    }
+                    None => {
+                        procs.insert(child, ProcState::new(&parent_vcwd, false));
+                    }
+                }
+                let ev_name = match event {
+                    x if x == PTRACE_EVENT_FORK => "fork",
+                    x if x == PTRACE_EVENT_VFORK => "vfork",
+                    _ => "clone",
+                };
+                sup!("tracee born: parent={pid} child={child} ({ev_name})");
+            }
             cont_syscall(pid, 0);
         } else if sig == SIGTRAP {
             cont_syscall(pid, 0);
         } else {
-            // Signal-delivery stop: reinject the signal unchanged
-            // (M0 swallows none, spec 2.2).
+            // Signal-delivery stop: reinject the signal unchanged.
             cont_syscall(pid, sig);
         }
     }
