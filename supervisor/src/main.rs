@@ -962,7 +962,24 @@ fn entry_translate(
     compat: bool,
     nr: u64,
     regs: &mut Regs,
+    binder: &mut BinderState,
 ) -> String {
+    // /dev/binder belongs to the virtual binder driver (S5):
+    // the open is rerouted to a supervisor-owned arena file.
+    // (This intercept lives here, not in the dispatch chain:
+    // the generic path branch matches opens first.)
+    if is_open_family(compat, nr) {
+        let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
+            1
+        } else {
+            0
+        };
+        if let Some(p) = read_path(pid, regs.arg(path_arg)) {
+            if guest_abs(vcwd, &p) == "/dev/binder" {
+                return entry_open_binder(pid, rootfs, compat, nr, regs, binder);
+            }
+        }
+    }
     // (arg index of path, arg index of its dirfd or -1 for cwd semantics)
     let pairs: Vec<(usize, i64)> = if compat && (nr == 9 || nr == 38) {
         // Classic link/rename: both paths carry cwd semantics.
@@ -1808,19 +1825,6 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
         }
     }
     cont_syscall(pid, 0);
-}
-
-/// True when this open-family call targets /dev/binder.
-fn open_targets_binder(pid: i32, vcwd: &str, compat: bool, nr: u64, regs: &Regs) -> bool {
-    let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
-        1
-    } else {
-        0
-    };
-    match read_path(pid, regs.arg(path_arg)) {
-        Some(p) => guest_abs(vcwd, &p) == "/dev/binder",
-        None => false,
-    }
 }
 
 /// open("/dev/binder"): point the call at a fresh per-opener
@@ -2942,6 +2946,7 @@ fn main() {
                                 proc.compat,
                                 nr,
                                 &mut regs,
+                                &mut binder,
                             ));
                         }
                     }
@@ -3017,6 +3022,7 @@ fn main() {
                         proc.compat,
                         nr,
                         &mut regs,
+                        &mut binder,
                     ));
                     dirty = true;
                 } else if is_getid(proc.compat, nr) {
@@ -3049,20 +3055,6 @@ fn main() {
                         "{}({}) emulated (return 0); virtual creds now uid={vu} gid={vg}",
                         nr_name(proc.compat, nr),
                         nr
-                    ));
-                    dirty = true;
-                } else if is_open_family(proc.compat, nr)
-                    && open_targets_binder(pid, &proc.vcwd, proc.compat, nr, &regs)
-                {
-                    // open("/dev/binder"): reroute to the
-                    // supervisor-owned arena file (S5).
-                    pend.desc = Some(entry_open_binder(
-                        pid,
-                        &rootfs,
-                        proc.compat,
-                        nr,
-                        &mut regs,
-                        &mut binder,
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
