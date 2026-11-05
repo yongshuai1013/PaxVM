@@ -203,9 +203,18 @@ static void load_image(const char *path, struct image *img) {
                 die("map segment", path);
         }
         /* Anonymous tail for memsz > filesz beyond the last file
-         * page. The partial page at filesz end is already
-         * zero-filled by the file mapping itself. */
-        uintptr_t fend = PAGE_UP(seg + p->p_filesz);
+         * page. The partial page at filesz end is NOT reliably
+         * zero in the tail when the file mapping shares the page
+         * with the file's own post-segment bytes (the GB linker
+         * parks its section header table exactly there), so
+         * explicitly clear [filesz_end, page_end) as well --
+         * kernel ELF loading zero-fills it (fs/binfmt_elf.c
+         * padzero); a guest reading its bss head expects zeros. */
+        uintptr_t fend_raw = seg + p->p_filesz;
+        uintptr_t fend = PAGE_UP(fend_raw);
+        if (p->p_memsz > p->p_filesz && (prot & PROT_WRITE)) {
+            memset((void *)fend_raw, 0, (size_t)(fend - fend_raw));
+        }
         uintptr_t mend = PAGE_UP(seg + p->p_memsz);
         if (mend > fend) {
             void *m = mmap((void *)fend, mend - fend, prot,
