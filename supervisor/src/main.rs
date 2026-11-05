@@ -43,6 +43,7 @@ const PTRACE_EVENT_VFORK: i32 = 2;
 const PTRACE_EVENT_CLONE: i32 = 3;
 const PTRACE_EVENT_EXEC: i32 = 4;
 const NT_PRSTATUS: usize = 1;
+const NT_ARM_SYSTEM_CALL: usize = 0x404;
 
 const SIGTRAP: i32 = 5;
 const SIGSTOP: i32 = 19;
@@ -608,10 +609,50 @@ impl ProcState {
     }
 }
 
-/// Cancel the syscall the guest is about to enter: with x8 = -1 the
-/// kernel skips execution, and we force x0 at the exit stop.
-fn skip_syscall(regs: &mut UserPtRegs, pend: &mut Pending, value: i64) {
+/// Write pt_regs.syscallno through the arm64 NT_ARM_SYSTEM_CALL
+/// regset. syscallno is the field the kernel dispatches on; it is
+/// NOT the tracee-visible x8 that NT_PRSTATUS exposes as regs[8].
+fn set_syscallno(pid: i32, value: i32) -> bool {
+    let mut v = value;
+    let mut iov = libc::iovec {
+        iov_base: &mut v as *mut i32 as *mut libc::c_void,
+        iov_len: std::mem::size_of::<i32>(),
+    };
+    ptrace4(
+        PTRACE_SETREGSET,
+        pid,
+        NT_ARM_SYSTEM_CALL as *mut libc::c_void,
+        &mut iov as *mut libc::iovec as *mut libc::c_void,
+    ) == 0
+}
+
+/// Cancel the syscall the guest is about to enter, and force x0 to
+/// `value` at the exit stop (via pend.inject).
+///
+/// On arm64, cancellation works by writing pt_regs.syscallno = -1
+/// through NT_ARM_SYSTEM_CALL -- never by regs[8]: in v5.4's
+/// arch/arm64/kernel/ptrace.c, syscall_trace_enter reports the
+/// ptrace entry stop first, then checks in_syscall(regs)
+/// (syscallno != -1) before calling secure_computing, and returns
+/// regs->syscallno for dispatch. So syscallno = -1 short-circuits
+/// *before* the seccomp filter is ever evaluated, and the syscall
+/// is never dispatched; the exit stop still arrives, so the
+/// fabricated return value is injected there as before. Writing
+/// regs[8] = -1 through NT_PRSTATUS changes only the tracee-visible
+/// x8 register and cancels nothing (proven on device in 0.2.4: the
+/// "emulated" setgid really executed -- that handset happened to
+/// allow it and returned the same 0 we injected -- and the
+/// following setuid really executed into the seccomp TRAP).
+/// regs[8] is still set to -1 as well: harmless, and it keeps any
+/// reader of x8 (including our own SIGSYS regs dump) honest.
+fn skip_syscall(pid: i32, regs: &mut UserPtRegs, pend: &mut Pending, value: i64) {
     regs.regs[8] = u64::MAX;
+    if !set_syscallno(pid, -1) {
+        sup!(
+            "WARN: NT_ARM_SYSTEM_CALL set failed pid={pid} errno={}",
+            errno()
+        );
+    }
     pend.inject = Some(value);
 }
 
@@ -657,10 +698,15 @@ fn entry_translate(pid: i32, rootfs: &str, vcwd: &str, nr: u64, regs: &mut UserP
 
 /// set*id family: emulated at the entry stop, always returning 0.
 /// Android's app seccomp filter traps the whole family (it is not on
-/// the app allowlist, and the filter's default action is TRAP), but
-/// the ptrace syscall-entry stop fires *before* seccomp evaluation
-/// on arm64, so cancelling the syscall here means the filter never
-/// sees it. The guest is a single-uid sandbox and busybox's startup
+/// the app allowlist, and the filter's default action is TRAP), so
+/// these syscalls must never actually be dispatched. Cancellation
+/// at the entry stop goes through NT_ARM_SYSTEM_CALL (see
+/// skip_syscall): v5.4's syscall_trace_enter checks in_syscall()
+/// after the ptrace entry report and *before* secure_computing, and
+/// dispatches on pt_regs.syscallno -- a field that regs[8], written
+/// through NT_PRSTATUS, does not touch. (0.2.4 relied on regs[8]
+/// and cancelled nothing: its setgid really ran, and its setuid
+/// really ran into the TRAP.) The guest is a single-uid sandbox and busybox's startup
 /// privilege-drop sequence (getuid/getgid, then setgid, then setuid,
 /// dispatched per-thread by musl's synccall) only ever sets the ids
 /// to their own current values, so 0 is the semantically correct
@@ -681,17 +727,17 @@ fn entry_fake(pid: i32, vcwd: &str, nr: u64, regs: &mut UserPtRegs, pend: &mut P
             let mut bytes = vcwd.as_bytes().to_vec();
             bytes.push(0);
             if size >= need && write_mem(pid, buf, &bytes).is_ok() {
-                skip_syscall(regs, pend, need as i64);
+                skip_syscall(pid, regs, pend, need as i64);
                 format!("getcwd(17) FAKED -> \"{vcwd}\"")
             } else {
-                skip_syscall(regs, pend, -ERANGE);
+                skip_syscall(pid, regs, pend, -ERANGE);
                 "getcwd(17) FAKED -> -ERANGE (buffer too small)".to_string()
             }
         }
         _ => {
             // fchdir: succeed without touching the vcwd. The guest
             // shell's cd uses chdir, not fchdir (M1 spec section 3).
-            skip_syscall(regs, pend, 0);
+            skip_syscall(pid, regs, pend, 0);
             format!("fchdir(50) FAKED -> 0 (vcwd stays {vcwd})")
         }
     }
@@ -710,25 +756,25 @@ fn entry_chdir(
 ) -> (String, Option<String>) {
     let addr = regs.regs[0];
     let Some(p) = read_path(pid, addr) else {
-        skip_syscall(regs, pend, -ENOENT);
+        skip_syscall(pid, regs, pend, -ENOENT);
         return ("chdir(49) path unreadable -> -ENOENT".to_string(), None);
     };
     let target = guest_abs(vcwd, &p);
     let host = format!("{rootfs}{target}");
     match std::fs::metadata(&host) {
         Ok(md) if md.is_dir() => {
-            skip_syscall(regs, pend, 0);
+            skip_syscall(pid, regs, pend, 0);
             (
                 format!("chdir(49) '{p}' vcwd {vcwd} -> {target}"),
                 Some(target),
             )
         }
         Ok(_) => {
-            skip_syscall(regs, pend, -ENOTDIR);
+            skip_syscall(pid, regs, pend, -ENOTDIR);
             (format!("chdir(49) '{p}' -> -ENOTDIR (target {target})"), None)
         }
         Err(_) => {
-            skip_syscall(regs, pend, -ENOENT);
+            skip_syscall(pid, regs, pend, -ENOENT);
             (format!("chdir(49) '{p}' -> -ENOENT (target {target})"), None)
         }
     }
@@ -803,7 +849,7 @@ fn entry_exec(
     }
     if !gpath.starts_with('/') && dirfd != AT_FDCWD {
         // execveat relative to a real dirfd: out of M1 scope.
-        skip_syscall(regs, pend, -EACCES);
+        skip_syscall(pid, regs, pend, -EACCES);
         return (format!("{name}({nr}) '{gpath}' BLOCKED (dirfd-relative) -> -EACCES"), true);
     }
     let abs = guest_abs(vcwd, &gpath);
@@ -828,7 +874,7 @@ fn entry_exec(
                 note = " [script, unsupported in M1]";
             }
         }
-        skip_syscall(regs, pend, -EACCES);
+        skip_syscall(pid, regs, pend, -EACCES);
         return (
             format!("exec '{gpath}' BLOCKED (rootfs file, not busybox) -> -EACCES{note}"),
             true,
@@ -1141,14 +1187,14 @@ fn main() {
                     // Cancel before the kernel (and its seccomp
                     // filter) ever evaluates it; answer 0 at the
                     // exit stop via the standard inject path.
-                    skip_syscall(&mut regs, &mut pend, 0);
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
                     pend.desc = Some(format!("{}({}) emulated (return 0)", nr_name(nr), nr));
                     dirty = true;
                 } else if is_faked(nr) {
                     pend.desc = Some(entry_fake(pid, &proc.vcwd, nr, &mut regs, &mut pend));
                     dirty = true;
                 } else if is_blocked(nr) {
-                    skip_syscall(&mut regs, &mut pend, -ENOSYS);
+                    skip_syscall(pid, &mut regs, &mut pend, -ENOSYS);
                     pend.desc = Some(format!("{}({}) BLOCKED -> -ENOSYS", nr_name(nr), nr));
                     dirty = true;
                 } else {
