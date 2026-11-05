@@ -75,10 +75,36 @@ static void die(const char *what, const char *path) {
     _exit(127);
 }
 
+/* The Gingerbread linker does not relocate itself: it runs
+ * correctly only because on a real device the kernel maps its
+ * first page at 0xb0000000: the address its ELF header and
+ * program headers were linked to live at. Map that page from
+ * the linker file
+ * itself, read-only, at the linker's linked home. This is the
+ * one piece of the kernel's interp loading that the generic
+ * segment walk cannot express (the first LOAD is a dummy with
+ * vaddr 0 / memsz 0 pointing at this page via its paddr). */
+static void map_linker_header_page(const char *path, uintptr_t base) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("header page open", path);
+    void *m = mmap((void *)base, 0x1000, PROT_READ,
+                   MAP_FIXED | MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m != (void *)base)
+        die("header page map", path);
+}
+
 struct image {
     uintptr_t bias;      /* load bias (0 for ET_EXEC) */
     uintptr_t entry;     /* absolute entry point */
     uintptr_t phdr;      /* absolute address of phdr table, or 0 */
+    uintptr_t hdr_addr;  /* where the ELF header page must live
+                          * (the GB linker's dummy LOAD carries it
+                          * in its paddr: 0xb0000000), or 0 */
+    uintptr_t load_base; /* the image's effective base, for
+                          * AT_BASE: hdr_addr when present, else
+                          * the reservation start */
     uint32_t phnum;
     char interp[128];    /* PT_INTERP string, "" when none */
 };
@@ -107,6 +133,7 @@ static void load_image(const char *path, struct image *img) {
         die("short phdr", path);
 
     img->interp[0] = 0;
+    img->hdr_addr = 0;
     uintptr_t lo = ~(uintptr_t)0, hi = 0;
     uint32_t i;
     for (i = 0; i < eh.e_phnum; i++) {
@@ -117,6 +144,12 @@ static void load_image(const char *path, struct image *img) {
                 img->interp[n] = 0;
             else
                 die("short interp", path);
+        }
+        if (p->p_type == PT_LOAD && p->p_memsz == 0 && p->p_filesz == 0 &&
+            p->p_paddr != 0) {
+            /* Dummy header segment: its paddr names the address
+             * the ELF header page is linked to live at. */
+            img->hdr_addr = p->p_paddr;
         }
         if (p->p_type == PT_LOAD && p->p_memsz > 0) {
             /* Zero-memsz segments occupy nothing and must not
@@ -193,6 +226,7 @@ static void load_image(const char *path, struct image *img) {
         }
     }
     img->entry = base + eh.e_entry;
+    img->load_base = img->hdr_addr != 0 ? img->hdr_addr : base + lo;
     img->phnum = eh.e_phnum;
     close(fd);
 }
@@ -256,7 +290,7 @@ __attribute__((noreturn)) static void launch(int pargc, char **pargv) {
         {AT_PHENT, (uint32_t)sizeof(Elf32_Phdr)},
         {AT_PHNUM, g_target.phnum},
         {AT_ENTRY, (uint32_t)g_target.entry},
-        {AT_BASE, (uint32_t)g_linker.bias},
+        {AT_BASE, (uint32_t)g_linker.load_base},
         {AT_UID, (uint32_t)getuid()},
         {AT_EUID, (uint32_t)geteuid()},
         {AT_GID, (uint32_t)getgid()},
@@ -307,6 +341,12 @@ int main(int argc, char **argv) {
     if (g_target.interp[0] == 0)
         die("target has no PT_INTERP", target);
     load_image(g_target.interp, &g_linker);
+    /* Place the linker's own header page where it was linked
+     * to live (0xb0000000, from the dummy LOAD's paddr), so the
+     * headers the linker reads about itself sit exactly where
+     * a real kernel puts them. */
+    if (g_linker.hdr_addr != 0)
+        map_linker_header_page(g_target.interp, g_linker.hdr_addr);
 
     char **pargv = argv + 1;
     int pargc = argc - 1;

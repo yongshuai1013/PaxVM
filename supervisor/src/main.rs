@@ -2271,7 +2271,21 @@ fn main() {
                     .get(&pid)
                     .map(|p| p.compat)
                     .unwrap_or(guest_compat);
-                let pc = get_regs(pid, fcompat).map(|r| r.pc()).unwrap_or(0);
+                let fregs = get_regs(pid, fcompat);
+                let pc = fregs.as_ref().map(|r| r.pc()).unwrap_or(0);
+                let regdump = fregs
+                    .as_ref()
+                    .map(|r| {
+                        format!(
+                            " r0=0x{:x} r1=0x{:x} r2=0x{:x} r3=0x{:x} sp=0x{:x}",
+                            r.arg(0),
+                            r.arg(1),
+                            r.arg(2),
+                            r.arg(3),
+                            r.sp()
+                        )
+                    })
+                    .unwrap_or_default();
                 let mut buf = [0u8; 128];
                 let ok = ptrace4(
                     PTRACE_GETSIGINFO,
@@ -2286,10 +2300,10 @@ fn main() {
                         u64::from_ne_bytes(buf[16..24].try_into().unwrap())
                     };
                     sup!(
-                        "FATAL sig={sig} pid={pid} pc=0x{pc:x} fault_addr=0x{addr:x}"
+                        "FATAL sig={sig} pid={pid} pc=0x{pc:x} fault_addr=0x{addr:x}{regdump}"
                     );
                 } else {
-                    sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo)");
+                    sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo){regdump}");
                 }
             }
             if sig == SIGSYS {
