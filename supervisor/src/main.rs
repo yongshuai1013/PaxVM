@@ -575,6 +575,10 @@ struct Pending {
     nr: u64,
     desc: Option<String>,
     inject: Option<i64>,
+    /// True once the fabricated return value has actually been
+    /// written into the tracee's regs (at the exit stop, or at a
+    /// SIGSYS rescue stop). Only meaningful when inject is Some.
+    applied: bool,
 }
 
 struct ProcState {
@@ -1147,7 +1151,7 @@ fn main() {
                     continue;
                 };
                 let nr = regs.regs[8];
-                let mut pend = Pending { nr, desc: None, inject: None };
+                let mut pend = Pending { nr, desc: None, inject: None, applied: false };
                 let mut dirty = false;
                 if (nr == NR_EXECVE || nr == NR_EXECVEAT) && pid == root_pid && !root_launched {
                     // The guest root's own launch exec must pass;
@@ -1212,17 +1216,32 @@ fn main() {
                 cont_syscall(pid, 0);
             } else {
                 // ---- syscall-exit stop ----
-                if let Some(pend) = proc.pending.take() {
+                if let Some(mut pend) = proc.pending.take() {
                     if let Some(mut regs) = get_regs(pid) {
                         let mut ret = regs.regs[0] as i64;
                         if let Some(v) = pend.inject {
                             regs.regs[0] = v as u64;
-                            set_regs(pid, &regs);
+                            if set_regs(pid, &regs) {
+                                pend.applied = true;
+                            }
                             ret = v;
                         }
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
                         }
+                    }
+                    if pend.inject.is_some() {
+                        // A faked syscall's record outlives its exit
+                        // stop. On device, the SIGSYS belonging to a
+                        // faked call can be delivered *after* the
+                        // exit stop has already settled the fake
+                        // (0.2.4 setgid, 0.2.6 getcwd), and the
+                        // signal-stop handler can only recognise
+                        // that SIGSYS as ours to rescue while the
+                        // record is still here. The record is never
+                        // consulted again otherwise: the next entry
+                        // stop for this pid overwrites it.
+                        proc.pending = Some(pend);
                     }
                 }
                 proc.expect_exit = false;
@@ -1283,14 +1302,55 @@ fn main() {
         } else if sig == SIGTRAP {
             cont_syscall(pid, 0);
         } else {
-            // Signal-delivery stop: reinject the signal unchanged.
-            // A trapped guest dies by this SIGSYS reinjection; dump
-            // the kernel's siginfo first so the log names the syscall
-            // the seccomp filter objected to.
+            // Signal-delivery stop. Default: reinject the signal
+            // unchanged -- a trapped guest dies by this SIGSYS
+            // reinjection; dump the kernel's siginfo first so the
+            // log names the syscall the seccomp filter objected to.
+            //
+            // Exception: a SIGSYS that belongs to a syscall we
+            // faked. On device (0.2.4, 0.2.6) the trap signal for a
+            // faked call arrives after the fake has been applied --
+            // in both observed cases after the exit stop already
+            // settled it -- and kills a guest whose call we had
+            // already answered. While this pid still holds the
+            // fake's record, swallow the signal instead: make sure
+            // the fabricated result is in place (a getcwd-style
+            // buffer was already written at the entry stop; only
+            // the return value can still be outstanding), drop the
+            // record, and continue with no signal delivered. The
+            // record is held past the exit stop for exactly this
+            // (see the exit-stop path). expect_exit is deliberately
+            // left alone: if this stop arrived before the fake's
+            // exit stop, that exit stop still follows, and the exit
+            // path already tolerates a missing record.
+            let mut deliver = sig;
             if sig == SIGSYS {
                 dump_sigsys_info(pid);
+                if let Some(proc) = procs.get_mut(&pid) {
+                    let fake = proc
+                        .pending
+                        .as_ref()
+                        .filter(|p| p.inject.is_some())
+                        .map(|p| (p.nr, p.inject.unwrap(), p.applied));
+                    if let Some((fnr, value, applied)) = fake {
+                        let mut pc = 0u64;
+                        if let Some(mut regs) = get_regs(pid) {
+                            pc = regs.pc;
+                            if !applied {
+                                regs.regs[0] = value as u64;
+                                set_regs(pid, &regs);
+                            }
+                        }
+                        sup!(
+                            "SIGSYS rescued pid={pid} fake={}({fnr}) pc=0x{pc:x}",
+                            nr_name(fnr)
+                        );
+                        proc.pending = None;
+                        deliver = 0;
+                    }
+                }
             }
-            cont_syscall(pid, sig);
+            cont_syscall(pid, deliver);
         }
     }
 
