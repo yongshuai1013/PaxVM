@@ -210,6 +210,35 @@ jobs:
           cp busybox "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libbusybox32.so"
           ls -la "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"
 
+      # S4: the manual ELF loader for dynamic guest binaries.
+      # Gingerbread's linker has no standalone mode and the host
+      # kernel cannot resolve the guest-absolute PT_INTERP, so
+      # dynamic execs are rerouted to this loader (see
+      # gbloader/gbloader.c). Built with the same Bootlin armv7
+      # musl toolchain as busybox32 (extracted by the step above,
+      # same job workspace), fully static and linked at a high
+      # text address (0x40000000) so its image stays clear of the
+      # target's fixed low addresses. (This GCC ignores
+      # -static-pie; the high fixed address is the deterministic
+      # equivalent.)
+      - name: Build gbloader (ARM32 static, high text address, musl)
+        run: |
+          set -euo pipefail
+          GCC_BIN="$(ls "$PWD/bootlin-musl32/bin/"*-gcc | head -1)"
+          test -n "$GCC_BIN"
+          "$GCC_BIN" -O2 -Wall -static -Wl,-Ttext-segment=0x40000000 \
+            -o libgbloader.so gbloader/gbloader.c
+          readelf -h libgbloader.so | grep -q "Class:.*ELF32"
+          readelf -h libgbloader.so | grep -q "Machine:.*ARM"
+          readelf -h libgbloader.so | grep -q "Type:.*EXEC"
+          if readelf -l libgbloader.so | grep -q INTERP; then
+            echo "gbloader must have no INTERP (fully static)" >&2
+            exit 1
+          fi
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp libgbloader.so app/src/main/jniLibs/arm64-v8a/
+          ls -la app/src/main/jniLibs/arm64-v8a/libgbloader.so
+
       # S3a guest root: Android 2.3.7's init, from Google's own
       # SDK system image for API 10 (armeabi-v7a r05 — the
       # goldfish-family AOSP build; its build.prop reads
@@ -257,6 +286,45 @@ jobs:
           cp gbinit app/src/main/jniLibs/arm64-v8a/libgbinit.so
           ls -la app/src/main/jniLibs/arm64-v8a/
 
+      # S4: the Gingerbread /system subset the dynamic world
+      # needs -- linker, servicemanager, toolbox, sh and their
+      # DT_NEEDED closure (libc, libm, libstdc++, libdl, liblog,
+      # libcutils; 667,096 bytes total), taken from the same SDK
+      # system image as the init above (an ext4 filesystem, read
+      # with debugfs). Packed as an app asset; the shell extracts
+      # it into the GB rootfs and recreates the toolbox symlinks
+      # (getprop/setprop). The two anchor binaries are
+      # sha256-pinned like the init.
+      - name: Fetch Gingerbread system subset (SDK API 10 system image)
+        run: |
+          set -euo pipefail
+          test -f sysimg10.zip || curl -fsSL --retry 3 --connect-timeout 30 -o sysimg10.zip \
+            "https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip"
+          echo "b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df  sysimg10.zip" | sha256sum -c -
+          unzip -o -q sysimg10.zip "armeabi-v7a/system.img"
+          mkdir -p gbsys/bin gbsys/lib
+          for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
+                   lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
+                   lib/liblog.so lib/libcutils.so; do
+            debugfs -R "dump -p /$p gbsys/$p" armeabi-v7a/system.img 2>/dev/null
+            test -s "gbsys/$p" || { echo "missing from system.img: $p" >&2; exit 1; }
+          done
+          ls -la gbsys/bin gbsys/lib
+          (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
+          mkdir -p app/src/main/assets
+          python3 - <<'PYEOF'
+          import os, zipfile
+          files = []
+          for root, _dirs, names in os.walk('gbsys'):
+              for n in sorted(names):
+                  files.append(os.path.join(root, n))
+          with zipfile.ZipFile('app/src/main/assets/gbsystem.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+              for f in sorted(files):
+                  z.write(f, os.path.relpath(f, 'gbsys'))
+          print('gbsystem.zip entries:', len(files))
+          PYEOF
+          ls -la app/src/main/assets/
+
       # Guard the payloads' static-ness and the APK contents: if a
       # payload ever gains an INTERP segment it cannot be exec'd
       # without a loader, and if any payload is missing from the
@@ -283,6 +351,14 @@ jobs:
           fi
           readelf -h app/src/main/jniLibs/arm64-v8a/libgbinit.so | grep -q "Class:.*ELF32" \
             || { echo "gbinit must be ELF32" >&2; exit 1; }
+          if readelf -l app/src/main/jniLibs/arm64-v8a/libgbloader.so | grep -q INTERP; then
+            echo "gbloader must have no INTERP (fully static)" >&2
+            exit 1
+          fi
+          readelf -h app/src/main/jniLibs/arm64-v8a/libgbloader.so | grep -q "Class:.*ELF32" \
+            || { echo "gbloader must be ELF32" >&2; exit 1; }
+          test -s app/src/main/assets/gbsystem.zip \
+            || { echo "gbsystem.zip asset missing" >&2; exit 1; }
 
       # Pinned signing: decode the project's permanent keystore from
       # secrets and hand its coordinates to gradle (build.gradle.kts
@@ -326,6 +402,8 @@ jobs:
           grep -q "lib/arm64-v8a/libbusybox.so" apk-list.txt
           grep -q "lib/arm64-v8a/libbusybox32.so" apk-list.txt
           grep -q "lib/arm64-v8a/libgbinit.so" apk-list.txt
+          grep -q "lib/arm64-v8a/libgbloader.so" apk-list.txt
+          grep -q "assets/gbsystem.zip" apk-list.txt
           # useLegacyPackaging must survive into the merged manifest:
           # without extractNativeLibs=true the .so payloads never
           # land as executable files in nativeLibraryDir (spec 1.2).

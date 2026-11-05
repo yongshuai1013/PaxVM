@@ -22,6 +22,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.io.File
+import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
 /**
@@ -117,12 +118,25 @@ class MainActivity : Activity() {
     /** The probe service's script: its file write and the
      * supervisor's syscall log are the evidence (service stdio
      * goes to /dev/null under init). */
+    /** S4 probe: after the static checks, exercise the dynamic
+     * world — getprop/setprop are toolbox symlinks (dynamic,
+     * bionic) run through the supervisor's gbloader reroute, and
+     * servicemanager is started to record where the binder wall
+     * is. A service's stdio is /dev/null, so values the probe
+     * learns are encoded into mkdir paths, which the supervisor
+     * log shows verbatim. */
     private val gbProbeScript: String = listOf(
         "echo paxprobe-begin",
         "echo paxprobe-ok > /data/probe-ok.txt",
         "cat /data/probe-ok.txt",
-        "ls /",
+        "V=$(/system/bin/getprop pax.stage)",
+        "mkdir /data/STAGE_IS_\$V",
+        "/system/bin/setprop pax.fromprobe yes",
+        "W=$(/system/bin/getprop pax.fromprobe)",
+        "mkdir /data/FROMPROBE_IS_\$W",
+        "/system/bin/servicemanager &",
         "sleep 1",
+        "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
 
@@ -200,6 +214,7 @@ class MainActivity : Activity() {
                     "libgbinit.so",
                     listOf("/init"),
                     bbLib = "libbusybox32.so",
+                    loaderLib = "libgbloader.so",
                     gb = true,
                 )
             }
@@ -333,6 +348,50 @@ class MainActivity : Activity() {
             "androidboot.hardware=paxvm androidboot.console=tty0\n",
         )
         writeFresh(File(rootfs, ".kmsg"), "")
+        installGBSystem(rootfs)
+    }
+
+    /** Extract the bundled Gingerbread /system subset (assets/
+     * gbsystem.zip, built by CI from the SDK system image: the
+     * linker, servicemanager, toolbox, sh and their library
+     * closure) into the GB rootfs, once per rootfs (marker
+     * file), and recreate the toolbox applet symlinks the image
+     * carries (getprop/setprop). */
+    private fun installGBSystem(rootfs: File) {
+        val sysDir = File(rootfs, "system")
+        val marker = File(sysDir, ".gbsystem-v1")
+        if (!marker.exists()) {
+            try {
+                assets.open("gbsystem.zip").use { ins ->
+                    ZipInputStream(ins).use { zin ->
+                        var e = zin.nextEntry
+                        while (e != null) {
+                            val out = File(sysDir, e.name)
+                            out.parentFile?.mkdirs()
+                            if (!e.isDirectory) {
+                                out.outputStream().use { zin.copyTo(it) }
+                                out.setExecutable(true, false)
+                            }
+                            e = zin.nextEntry
+                        }
+                    }
+                }
+                marker.writeText("v1\n")
+                appendLog("[shell] gbsystem subset installed")
+            } catch (ex: Exception) {
+                appendLog("[shell] gbsystem extract failed: $ex")
+            }
+        }
+        for (link in listOf("getprop", "setprop")) {
+            val f = File(sysDir, "bin/$link")
+            if (!f.exists()) {
+                try {
+                    Os.symlink("toolbox", f.absolutePath)
+                } catch (ex: Exception) {
+                    appendLog("[shell] symlink $link failed: $ex")
+                }
+            }
+        }
     }
 
     /** Copy the whole log view to the clipboard, so a session's
@@ -388,6 +447,7 @@ class MainActivity : Activity() {
         guestLib: String,
         guestArgs: List<String>,
         bbLib: String? = null,
+        loaderLib: String? = null,
         gb: Boolean = false,
     ) {
         if (supervisor != null) return
@@ -405,6 +465,10 @@ class MainActivity : Activity() {
         if (bbLib != null) {
             cmd.add("--bb")
             cmd.add("$libDir/$bbLib")
+        }
+        if (loaderLib != null) {
+            cmd.add("--loader")
+            cmd.add("$libDir/$loaderLib")
         }
         cmd.add("--")
         cmd.addAll(guestArgs)

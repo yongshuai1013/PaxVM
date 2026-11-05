@@ -1412,10 +1412,160 @@ fn resolve_guest_target(rootfs: &str, abs: &str) -> (String, bool) {
 /// home: the rootfs lives in filesDir, where exec is forbidden.
 /// argv and envp are never touched (busybox dispatches on argv[0]).
 /// Returns (log description, regs were modified).
+/// Read the PT_INTERP string of an ELF file on the host, if it
+/// has one. Used to spot dynamic guest binaries: the host kernel
+/// cannot resolve their guest-absolute interpreter path, so the
+/// exec is rerouted to the manual loader instead (S4).
+fn elf_interp_of(host_path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(host_path).ok()?;
+    let mut hdr = [0u8; 64];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let is32 = hdr[4] == 1;
+    let (phoff, phentsize, phnum): (u64, u64, u64) = if is32 {
+        (
+            u32::from_le_bytes(hdr[28..32].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[42..44].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[44..46].try_into().ok()?) as u64,
+        )
+    } else {
+        (
+            u64::from_le_bytes(hdr[32..40].try_into().ok()?),
+            u16::from_le_bytes(hdr[54..56].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[56..58].try_into().ok()?) as u64,
+        )
+    };
+    if phnum == 0 || phnum > 128 || phentsize == 0 {
+        return None;
+    }
+    for i in 0..phnum {
+        let mut ph = [0u8; 56];
+        f.seek(SeekFrom::Start(phoff + i * phentsize)).ok()?;
+        let take = (phentsize as usize).min(56);
+        f.read_exact(&mut ph[..take]).ok()?;
+        let p_type = u32::from_le_bytes(ph[0..4].try_into().ok()?);
+        if p_type != 3 {
+            continue; // PT_INTERP
+        }
+        let (off, size): (u64, u64) = if is32 {
+            (
+                u32::from_le_bytes(ph[4..8].try_into().ok()?) as u64,
+                u32::from_le_bytes(ph[16..20].try_into().ok()?) as u64,
+            )
+        } else {
+            (
+                u64::from_le_bytes(ph[8..16].try_into().ok()?),
+                u64::from_le_bytes(ph[32..40].try_into().ok()?),
+            )
+        };
+        if size == 0 || size > 512 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        f.seek(SeekFrom::Start(off)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        return Some(String::from_utf8_lossy(&buf).into_owned());
+    }
+    None
+}
+
+/// Reroute an execve/execveat to the manual ELF loader: the
+/// filename becomes the loader (a host path in nativeLibraryDir),
+/// and a fresh argv is built in stack scratch space:
+/// [target guest path, orig argv[0], orig argv[1], ..., NULL].
+/// The loader's own argv[0] slot carries the target; the program
+/// argv follows. envp is untouched. Returns false when the guest
+/// argv is unreadable or too large for the scratch budget.
+fn rewrite_exec_to_loader(
+    pid: i32,
+    compat: bool,
+    path_arg: usize,
+    loader_path: &str,
+    target_guest: &str,
+    regs: &mut Regs,
+) -> bool {
+    let argv_ptr = regs.arg(path_arg + 1);
+    let ptr_size: u64 = if compat { 4 } else { 8 };
+    // Read the guest argv pointer array and strings.
+    let mut args: Vec<String> = Vec::new();
+    let mut total: usize = target_guest.len() + 1;
+    if argv_ptr != 0 {
+        for i in 0..64u64 {
+            let mut raw = [0u8; 8];
+            if read_mem(pid, argv_ptr + i * ptr_size, &mut raw[..ptr_size as usize]).is_err() {
+                return false;
+            }
+            let p = if compat {
+                u32::from_le_bytes(raw[..4].try_into().unwrap()) as u64
+            } else {
+                u64::from_le_bytes(raw)
+            };
+            if p == 0 {
+                break;
+            }
+            match read_path(pid, p) {
+                Some(s) => {
+                    total += s.len() + 1;
+                    args.push(s);
+                }
+                None => return false,
+            }
+        }
+    }
+    if total > 3000 {
+        return false;
+    }
+    // Scratch layout below sp: strings first (target, args,
+    // loader), then the pointer array.
+    let mut cursor = regs.sp().saturating_sub(4096);
+    let Some(target_addr) = scratch_write(pid, &mut cursor, target_guest) else {
+        return false;
+    };
+    let mut arg_addrs: Vec<u64> = Vec::new();
+    for a in &args {
+        match scratch_write(pid, &mut cursor, a) {
+            Some(x) => arg_addrs.push(x),
+            None => return false,
+        }
+    }
+    let Some(loader_addr) = scratch_write(pid, &mut cursor, loader_path) else {
+        return false;
+    };
+    let n_words = (arg_addrs.len() + 2) as u64; // target + args + NULL
+    cursor = cursor.saturating_sub(n_words * ptr_size) & !(ptr_size - 1);
+    let array_addr = cursor;
+    let mut words: Vec<u8> = Vec::new();
+    let mut push_word = |v: u64, words: &mut Vec<u8>| {
+        if compat {
+            words.extend_from_slice(&(v as u32).to_le_bytes());
+        } else {
+            words.extend_from_slice(&v.to_le_bytes());
+        }
+    };
+    push_word(target_addr, &mut words);
+    for a in &arg_addrs {
+        push_word(*a, &mut words);
+    }
+    push_word(0, &mut words);
+    if write_mem(pid, array_addr, &words).is_err() {
+        return false;
+    }
+    regs.set_arg(path_arg, loader_addr);
+    regs.set_arg(path_arg + 1, array_addr);
+    true
+}
+
 fn entry_exec(
     pid: i32,
     rootfs: &str,
     bb_native: &str,
+    loader_path: &str,
     vcwd: &str,
     compat: bool,
     nr: u64,
@@ -1464,9 +1614,27 @@ fn entry_exec(
         return (format!("exec '{gpath}' -> busybox (native)"), ok);
     }
     if exists {
+        let host = format!("{rootfs}{final_abs}");
+        // Dynamic ELF (S4): the host kernel cannot resolve the
+        // guest-absolute PT_INTERP, so hand the exec to the manual
+        // loader, which maps the target and its linker itself.
+        if !loader_path.is_empty() {
+            if let Some(interp) = elf_interp_of(&host) {
+                if rewrite_exec_to_loader(pid, compat, path_arg, loader_path, &abs, regs) {
+                    return (
+                        format!("exec '{gpath}' -> gbloader (dynamic, interp {interp})"),
+                        true,
+                    );
+                }
+                skip_syscall(pid, regs, pend, -EACCES);
+                return (
+                    format!("exec '{gpath}' BLOCKED (dynamic, loader argv rewrite failed) -> -EACCES"),
+                    true,
+                );
+            }
+        }
         // A real rootfs file that is not busybox: filesDir cannot be
         // exec'd, and M1 opens no other door. #! scripts land here.
-        let host = format!("{rootfs}{abs}");
         let mut note = "";
         if let Ok(mut f) = std::fs::File::open(&host) {
             use std::io::Read;
@@ -1570,6 +1738,13 @@ fn main() {
     let bb_path = match argv.iter().position(|a| a == "--bb") {
         Some(i) if i + 1 < argv.len() && argv[i + 1] != "--" => argv[i + 1].clone(),
         _ => guest_path.clone(),
+    };
+    // Optional "--loader <path>" (before "--"): the manual ELF
+    // loader that dynamic guest binaries are rerouted to (S4).
+    // Empty when the session has no loader payload.
+    let loader_path = match argv.iter().position(|a| a == "--loader") {
+        Some(i) if i + 1 < argv.len() && argv[i + 1] != "--" => argv[i + 1].clone(),
+        _ => String::new(),
     };
     // Guest argv: everything after an optional "--", argv[0] first.
     // Defaults to the M0 single-word argv when absent.
@@ -1805,6 +1980,7 @@ fn main() {
                         pid,
                         &rootfs,
                         &bb_path,
+                        &loader_path,
                         &proc.vcwd,
                         proc.compat,
                         nr,
