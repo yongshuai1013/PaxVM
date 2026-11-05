@@ -815,14 +815,23 @@ fn spawn_guest_reader(fd: i32) -> std::thread::JoinHandle<()> {
     })
 }
 
-fn read_first_line(path: &str) -> String {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let s = String::from_utf8_lossy(&bytes);
-            s.lines().next().unwrap_or("").trim().to_string()
-        }
-        Err(e) => format!("<unreadable: {e}>"),
+fn uts_field(field: &[libc::c_char]) -> String {
+    field
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| (c as u8) as char)
+        .collect()
+}
+
+/// Kernel identity for the self-check line. SELinux denies app
+/// processes read access to /proc/version on real devices, but
+/// uname(2) is a plain syscall and always available.
+fn kernel_release() -> String {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return format!("<uname failed: errno={}>", errno());
     }
+    format!("{} {}", uts_field(&uts.sysname), uts_field(&uts.release))
 }
 
 fn read_context() -> String {
@@ -852,7 +861,7 @@ fn main() {
     // Startup self-check lines: the evidence that separates
     // "device policy" from "our bug" on the first run.
     sup!("supervisor pid={}", std::process::id());
-    sup!("kernel: {}", read_first_line("/proc/version"));
+    sup!("kernel: {}", kernel_release());
     sup!("selinux: {}", read_context());
     sup!("rootfs={rootfs} guest={guest_path}");
 
