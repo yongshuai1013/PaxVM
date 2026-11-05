@@ -1134,6 +1134,49 @@ fn entry_mknod_dev(
     Some(format!("mknod(14) '{p}' faked (virtual device node)"))
 }
 
+/// Compat chmod(15), proxied by the supervisor itself. Same
+/// allowlist gap as rmdir: Android 12's bionic implements
+/// chmod() as a C wrapper around fchmodat, so the standalone
+/// chmod syscall has no stub, is absent from the app seccomp
+/// policy, and a passed-through call is trapped — Android
+/// 2.3.7's init died exactly there (import_kernel_cmdline's
+/// chmod("/proc/cmdline", 0440), init.c:460; device run
+/// 2026-11-06, SIGSYS at the call with the fake exit stop
+/// showing the path pointer as the "return value"). The
+/// supervisor performs the chmod on the translated host path;
+/// same filesystem, exact errno semantics.
+fn entry_chmod(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    let addr = regs.arg(0);
+    let mode = regs.arg(1) as u32;
+    let Some(p) = read_path(pid, addr) else {
+        skip_syscall(pid, regs, pend, -EFAULT);
+        return "chmod(15) path unreadable -> -EFAULT".to_string();
+    };
+    let target = guest_abs(vcwd, &p);
+    let host = format!("{rootfs}{target}");
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(
+        &host,
+        std::fs::Permissions::from_mode(mode),
+    ) {
+        Ok(()) => {
+            skip_syscall(pid, regs, pend, 0);
+            format!("chmod(15) '{p}' -> '{host}' proxied mode=0{mode:o}")
+        }
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(libc::EIO);
+            skip_syscall(pid, regs, pend, -(en as i64));
+            format!("chmod(15) '{p}' -> '{host}' proxied (errno {en})")
+        }
+    }
+}
+
 /// Compat rmdir(40), proxied by the supervisor itself. The
 /// 32-bit app seccomp allowlist does not contain rmdir at all
 /// (checked against bionic android12-release policy inputs:
@@ -1630,6 +1673,16 @@ fn main() {
                             ));
                         }
                     }
+                    dirty = true;
+                } else if proc.compat && nr == 15 {
+                    // Compat chmod: proxied (see entry_chmod).
+                    pend.desc = Some(entry_chmod(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        &mut regs,
+                        &mut pend,
+                    ));
                     dirty = true;
                 } else if proc.compat && nr == 40 {
                     // Compat rmdir: proxied (see entry_rmdir).

@@ -75,6 +75,7 @@ class MainActivity : Activity() {
         "    setprop pax.stage early-init",
         "",
         "on init",
+        "    loglevel 7",
         "    export PATH /sbin:/bin:/system/bin",
         "    export ANDROID_ROOT /system",
         "    export ANDROID_DATA /data",
