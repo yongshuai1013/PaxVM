@@ -148,7 +148,15 @@ class MainActivity : Activity() {
         // not yet registered (asked a moment too early, the
         // binary exits at once); once connected it stays
         // up for the whole session.
+        // The stock init.rc runs the animation as the
+        // graphics user, and that uid is load-bearing:
+        // createSurface skips its package-manager
+        // permission check only for AID_GRAPHICS callers,
+        // and there is no package service in this guest to
+        // answer the check.
         "service bootanimation /bin/sh /bootanim.sh",
+        "    user graphics",
+        "    group graphics",
         "",
     ).joinToString("\n")
 
