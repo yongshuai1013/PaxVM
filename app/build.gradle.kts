@@ -25,8 +25,8 @@ android {
         applicationId = "com.yongshuai.paxvm"
         minSdk = 26
         targetSdk = 34
-        versionCode = 80
-        versionName = "0.9.39"
+        versionCode = 81
+        versionName = "0.9.40"
         ndk {
             abiFilters += "arm64-v8a"
         }

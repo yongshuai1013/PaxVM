@@ -1438,8 +1438,121 @@ fn entry_fb_ioctl(
                             y1 = y1.max(y);
                         }
                     }
+                    // Shared-stack dump: the composition
+                    // clip mystery (gun 5) lives or dies by
+                    // what each surface's SharedBufferStack
+                    // actually contains -- SF latches the
+                    // posted dirty region from these exact
+                    // bytes (Layer::lockPageFlip ->
+                    // getDirtyRegion). Layout per GB's
+                    // SharedBufferStack.h: stack = head/
+                    // available/queued/status (5 x i32),
+                    // reallocMask, index[16], identity,
+                    // token, stats(16B), headBuf+reserved,
+                    // then 16 BufferData of 64B (FlatRegion
+                    // 52B + crop 8B + transform/reserved).
+                    // Scan plausible heaps for that
+                    // signature and print each stack's
+                    // slots 0..2 dirty rects.
+                    let stacks = (|| -> String {
+                        use std::os::unix::fs::FileExt;
+                        let mut out = String::new();
+                        let Ok(rd) =
+                            std::fs::read_dir(format!("{rootfs}/.ashmem"))
+                        else {
+                            return out;
+                        };
+                        let mut names: Vec<_> = rd.flatten().collect();
+                        names.sort_by_key(|e| e.file_name());
+                        let mut found = 0;
+                        for e in names.iter() {
+                            if found >= 4 {
+                                break;
+                            }
+                            let Ok(f) = std::fs::File::open(e.path())
+                            else {
+                                continue;
+                            };
+                            let len =
+                                f.metadata().map(|m| m.len()).unwrap_or(0);
+                            if !(2048..=70000).contains(&len) {
+                                continue;
+                            }
+                            let mut data = vec![0u8; len as usize];
+                            if f.read_exact_at(&mut data, 0).is_err() {
+                                continue;
+                            }
+                            let i32at = |o: usize| -> i32 {
+                                i32::from_le_bytes(
+                                    data[o..o + 4].try_into().unwrap(),
+                                )
+                            };
+                            let u32at = |o: usize| -> u32 {
+                                u32::from_le_bytes(
+                                    data[o..o + 4].try_into().unwrap(),
+                                )
+                            };
+                            let u16at = |o: usize| -> u16 {
+                                u16::from_le_bytes(
+                                    data[o..o + 2].try_into().unwrap(),
+                                )
+                            };
+                            let mut off = 0usize;
+                            while off + 1096 <= data.len() && found < 4 {
+                                let (head, avail, queued, status) = (
+                                    i32at(off),
+                                    i32at(off + 4),
+                                    i32at(off + 8),
+                                    i32at(off + 16),
+                                );
+                                let (ident, token) =
+                                    (i32at(off + 40), i32at(off + 44));
+                                let plausible = (0..=16).contains(&head)
+                                    && (0..=16).contains(&avail)
+                                    && (0..=16).contains(&queued)
+                                    && status == 0
+                                    && (1..=64).contains(&ident)
+                                    && (0..=31).contains(&token);
+                                if plausible {
+                                    let mut slots = String::new();
+                                    for b in 0..3usize {
+                                        let bo = off + 72 + b * 64;
+                                        let cnt = u32at(bo);
+                                        if cnt == 0 {
+                                            slots.push_str(" []");
+                                        } else if cnt <= 5 {
+                                            slots.push_str(&format!(
+                                                " [{}:{},{},{},{}]",
+                                                cnt,
+                                                u16at(bo + 4),
+                                                u16at(bo + 6),
+                                                u16at(bo + 8),
+                                                u16at(bo + 10)
+                                            ));
+                                        } else {
+                                            slots.push_str(" [?]");
+                                        }
+                                    }
+                                    out.push_str(&format!(
+                                        " stk[{}+{} id={} tok={} q={}{}]",
+                                        e.file_name().to_string_lossy(),
+                                        off,
+                                        ident,
+                                        token,
+                                        queued,
+                                        slots
+                                    ));
+                                    found += 1;
+                                    off += 1096;
+                                } else {
+                                    off += 4;
+                                }
+                            }
+                        }
+                        out
+                    })();
                     Some(format!(
-                        " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}"
+                        " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}{stacks}"
                     ))
                 })()
                 .unwrap_or_default()
