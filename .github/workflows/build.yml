@@ -421,6 +421,21 @@ jobs:
           for d in usr fonts etc; do
             debugfs -R "rdump /$d gbsys" armeabi-v7a/system.img 2>/dev/null
           done
+          # S7 gun 3: the whole /system/lib, wholesale.
+          # Zygote's JNI registration and class preload
+          # reach for helper libraries beyond the S6 list
+          # (media_jni and friends); enumerating them one
+          # failed device run at a time is waste. The
+          # explicit list above stays as the assert net;
+          # this overlay only adds files.
+          debugfs -R "rdump /lib gbsys" armeabi-v7a/system.img 2>/dev/null
+          test -s gbsys/lib/libmedia_jni.so || { echo "missing libmedia_jni.so" >&2; exit 1; }
+          # The overlay just overwrote lib/egl/egl.cfg with
+          # the image's own (emulator GL stack). Re-assert
+          # the software-renderer selection from the subset
+          # step above -- losing it breaks SF's EGL exactly
+          # as in S6's first field runs.
+          printf '0 0 android\n' > gbsys/lib/egl/egl.cfg
           test -s gbsys/usr/icu/icudt44l.dat || { echo "missing icudt44l.dat" >&2; exit 1; }
           test -s gbsys/fonts/DroidSans.ttf || { echo "missing DroidSans.ttf" >&2; exit 1; }
           test -s gbsys/etc/hosts || { echo "missing etc/hosts" >&2; exit 1; }

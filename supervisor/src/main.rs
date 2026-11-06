@@ -3424,6 +3424,18 @@ fn device_map(rootfs: &str, guest_abs_path: &str) -> Option<String> {
         "/dev/zero" => Some("/dev/zero".to_string()),
         "/dev/urandom" | "/dev/random" => Some("/dev/urandom".to_string()),
         "/dev/__kmsg__" => Some(format!("{rootfs}/.kmsg")),
+        // The guest's log devices (S7 gun 3): GB has no
+        // logd; every LOGE lands in /dev/log/*. Without a
+        // target, the runtime's own account of its
+        // failures (Dalvik aborts, uncaught exceptions)
+        // vanishes -- app_process died silently 13 times
+        // in 0.9.48's field run. Map the four channels to
+        // plain files; the shell folds a printable-strings
+        // extraction into the session log on save.
+        "/dev/log/main" => Some(format!("{rootfs}/.logs/log-main")),
+        "/dev/log/radio" => Some(format!("{rootfs}/.logs/log-radio")),
+        "/dev/log/events" => Some(format!("{rootfs}/.logs/log-events")),
+        "/dev/log/system" => Some(format!("{rootfs}/.logs/log-system")),
         // The virtual framebuffer (S6): a plain shared file
         // the shell creates per session; the guest maps it
         // and draws, the shell reads pages back and shows

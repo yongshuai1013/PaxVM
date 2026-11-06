@@ -549,6 +549,19 @@ class MainActivity : Activity() {
         // belt and braces).
         File(rootfs, ".binder").deleteRecursively()
         File(rootfs, ".ashmem").deleteRecursively()
+        // Guest log capture (S7 gun 3): the supervisor
+        // maps /dev/log/* into this directory; start each
+        // session empty so a saved log holds one session.
+        File(rootfs, ".logs").deleteRecursively()
+        File(rootfs, ".logs").mkdirs()
+        // cpuacct surface (S7 gun 3): on hardware /acct is
+        // a cgroup mount and zygote's startup touches
+        // /acct/uid/0/tasks, creating the uid dir itself
+        // when the open fails. Here the mount is a plain
+        // skeleton: the dirs plus an empty tasks file the
+        // guest can open and write pids into.
+        File(rootfs, "acct/uid/0").mkdirs()
+        writeFresh(File(rootfs, "acct/uid/0/tasks"), "")
         // Virtual framebuffer backing (S6): two 480x800x32
         // pages, zeroed per session, plus the visible-page
         // note the supervisor's fb ioctl handler maintains.
@@ -614,7 +627,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v16")
+        val marker = File(sysDir, ".gbsystem-v17")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->
@@ -692,6 +705,43 @@ class MainActivity : Activity() {
         } else {
             logView.text.toString()
         }
+        // Guest log channels (S7 gun 3): the supervisor
+        // maps /dev/log/* to plain files under .logs/;
+        // fold a printable-strings extraction of the main
+        // and system channels into the saved log, so the
+        // guest runtime's own error account (the thing
+        // that was invisible while app_process died
+        // silently) travels with every log download.
+        val guestLogs = StringBuilder()
+        for (ch in listOf("main", "system")) {
+            val f = File(rootfsGBDir, ".logs/log-$ch")
+            if (f.exists() && f.length() > 0) {
+                val bytes = try {
+                    f.readBytes()
+                } catch (e: Exception) {
+                    ByteArray(0)
+                }
+                val sb = StringBuilder()
+                var run = StringBuilder()
+                for (b in bytes) {
+                    val c = (b.toInt() and 0xFF).toChar()
+                    if (c in ' '..'~' || c == '\n' || c == '\t') {
+                        run.append(c)
+                    } else {
+                        if (run.length >= 6) sb.append(run).append('\n')
+                        run = StringBuilder()
+                    }
+                }
+                if (run.length >= 6) sb.append(run).append('\n')
+                val body = sb.toString().takeLast(24000)
+                if (body.isNotEmpty()) {
+                    guestLogs.append(
+                        "\n===== guest /dev/log/$ch (strings) =====\n",
+                    ).append(body)
+                }
+            }
+        }
+        val outText = text + guestLogs.toString()
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val name = "paxvm-log-$stamp.txt"
         try {
@@ -710,13 +760,13 @@ class MainActivity : Activity() {
                 ) ?: throw IOException("MediaStore insert returned null")
                 val out = contentResolver.openOutputStream(uri)
                     ?: throw IOException("openOutputStream returned null")
-                out.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+                out.use { it.write(outText.toByteArray(Charsets.UTF_8)) }
             } else {
                 val dir = Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS,
                 )
                 dir.mkdirs()
-                File(dir, name).writeText(text)
+                File(dir, name).writeText(outText)
             }
             appendLog(
                 if (fromPrevious) "[shell] 上一場日誌已存到 Download/$name"
