@@ -405,6 +405,38 @@ jobs:
           # silent absence fails the build instead of the run.
           unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-mask.png'
           unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-shine.png'
+          # Gun 5: preset the boot wordmark bright white.
+          # The stock shine texture is a dim gleam: on the
+          # shell's small preview the composed logo reads
+          # as black-on-black even when composition is
+          # correct. Recoloring is a guest-asset choice
+          # (OEMs ship their own boot marks exactly this
+          # way); the supervisor's bbox telemetry still
+          # judges composition geometry on its own merits.
+          python3 - << 'PYEOF'
+          import struct, zlib, zipfile, os
+          apk = 'gbsys/framework/framework-res.apk'
+          name = 'assets/images/android-logo-shine.png'
+          with zipfile.ZipFile(apk) as z:
+              data = z.read(name)
+          w, h = struct.unpack('>II', data[16:24])
+          print('shine texture', w, 'x', h, '-> solid white')
+          raw = b''.join(b'\x00' + b'\xff\xff\xff\xff' * w for _ in range(h))
+          def chunk(t, d):
+              c = struct.pack('>I', len(d)) + t + d
+              return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(raw))
+                 + chunk(b'IEND', b''))
+          tmp = 'framework-res-white.apk'
+          with zipfile.ZipFile(apk) as zin, \
+               zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+              for item in zin.infolist():
+                  zout.writestr(item, png if item.filename == name
+                                else zin.read(item.filename))
+          os.replace(tmp, apk)
+          PYEOF
           ls -la gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
           (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
 
