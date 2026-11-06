@@ -2785,6 +2785,24 @@ fn entry_open_ashmem(
         .write(true)
         .truncate(true)
         .open(&raw);
+    // JIT code lands in some regions (pixelflinger's
+    // mspace): the guest later mprotects the mapping
+    // PROT_EXEC, and on a file-backed VMA the host
+    // refuses that (EACCES) when the backing file
+    // itself carries no execute permission -- proven
+    // by the 0.9.27 device run, where the exact
+    // ensureMbaseExecutable call failed -13 five lines
+    // before the assembler died on its NULL base.
+    // Anonymous mappings and the guest's own libraries
+    // pass the same call, so give region files the
+    // execute bit and re-run the experiment.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &raw,
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
     let key = std::fs::canonicalize(&raw)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or(raw.clone());
