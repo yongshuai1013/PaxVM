@@ -144,7 +144,15 @@ class MainActivity : Activity() {
         "    setprop pax.stage boot",
         "    start servicemanager",
         "    start surfaceflinger",
-        "    start bootanimation",
+        // 0.9.43 gun-5 discriminator: bootanimation NOT
+        // started. gbprobe's stack is healthy and its
+        // buffers hold the circle, yet the composed page
+        // shows only the animation's content -- if the
+        // circle appears with the animation gone, gbprobe's
+        // layer was UNDER its opaque fullscreen surface
+        // (its setLayer never took); if still absent, the
+        // layer itself is invisible/misplaced.
+        "    # start bootanimation (off in 0.9.43)",
         "    start gbprobe",
         "    start paxprobe",
         "",
