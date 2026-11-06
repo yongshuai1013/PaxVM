@@ -2032,6 +2032,28 @@ fn binder_handle_txn(
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie)
     };
+    // Telemetry: decode the interface token so the log states
+    // who this transaction speaks to and whether it is one-way.
+    {
+        let tok = if data.len() >= 12 {
+            let n = u32_at(&data, 8) as usize;
+            if n <= 128 && data.len() >= 12 + (n + 1) * 2 {
+                (0..n)
+                    .map(|k| {
+                        u16::from_le_bytes([data[12 + k * 2], data[13 + k * 2]]) as u8 as char
+                    })
+                    .collect::<String>()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        sup!(
+            "binder: txn detail from pid={pid} code={code} flags=0x{flags:x} offs={}B token='{tok}'",
+            offs.len()
+        );
+    }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
     let tdata = binder_translate(st, arena, &owner, &data, &offs, wakes, &mut fd_fixups);
     let delivered = binder_deliver(
