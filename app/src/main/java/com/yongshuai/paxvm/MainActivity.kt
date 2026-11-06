@@ -242,11 +242,14 @@ class MainActivity : Activity() {
         "sleep 1",
         "/system/bin/lbprobe list",
         "/system/bin/lbprobe ping",
-        // S6a: the framebuffer probe draws an animated test
-        // pattern into the virtual fb0 for ~25 s; the shell's
-        // preview area shows it live. It runs in the
-        // background so the rest of the probe can finish.
-        "/system/bin/fbprobe &",
+        // S6a: the framebuffer probe drew an animated test
+        // pattern directly into the virtual fb0. Since gun 5
+        // (0.9.34) it stays OFF in this scene: the preview
+        // must show only what SurfaceFlinger composes, with
+        // no direct writer fighting it for the display --
+        // the 0.9.33 screenshot was fbprobe's test card, not
+        // a composition, and it briefly fooled us.
+        // "/system/bin/fbprobe &",
         // S6b/c late census: by now SurfaceFlinger has had
         // the whole probe run to come up and register; a
         // second list (LB2 prefix, so it cannot blur the
@@ -586,7 +589,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v10")
+        val marker = File(sysDir, ".gbsystem-v11")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

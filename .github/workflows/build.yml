@@ -363,8 +363,9 @@ jobs:
             "https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip"
           echo "b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df  sysimg10.zip" | sha256sum -c -
           unzip -o -q sysimg10.zip "armeabi-v7a/system.img"
-          mkdir -p gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media
+          mkdir -p gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
           for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
+                   framework/framework-res.apk \
                    lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
                    lib/liblog.so lib/libcutils.so lib/libbinder.so \
                    lib/libutils.so lib/libz.so lib/libETC1.so \
@@ -395,7 +396,16 @@ jobs:
           # SDK image may not carry one; bootanimation then
           # falls back to its built-in logo animation.
           debugfs -R "dump -p /media/bootanimation.zip gbsys/media/bootanimation.zip" armeabi-v7a/system.img 2>/dev/null || true
-          ls -la gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media
+          # Gun 5: bootanimation's built-in ANDROID animation
+          # loads its two logo textures from the default asset
+          # source, framework-res.apk. The guest rootfs lacked
+          # the file entirely (0.9.33 field run: bootanimation
+          # stat'd it, got ENOENT, and animated empty textures
+          # all run). Assert the logos are really inside, so a
+          # silent absence fails the build instead of the run.
+          unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-mask.png'
+          unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-shine.png'
+          ls -la gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
           (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
 
       # lbprobe (S5c): a real libbinder client/server. Built

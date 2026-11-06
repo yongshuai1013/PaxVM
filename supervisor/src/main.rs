@@ -1411,7 +1411,10 @@ fn entry_fb_ioctl(
                     format!(" ash[{}]", parts.join(","))
                 }
             })();
-            format!("fb PAN yoffset={yoff} (page {}) {fp}{ash}", yoff / FB_H)
+            format!(
+                "fb PAN yoffset={yoff} (page {}) by pid={pid} {fp}{ash}",
+                yoff / FB_H
+            )
         }
         _ => {
             // FBIO_WAITFORVSYNC and anything else in the
