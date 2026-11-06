@@ -1416,7 +1416,31 @@ fn entry_fb_ioctl(
                             10,
                         )?);
                     }
-                    Some(format!(" shape={rows}|{cols}"))
+                    // Exact census: nonzero pixel count and
+                    // bounding box. Deciles floor out sparse
+                    // content (a 64x64 square and thin text
+                    // strokes both read 0), so the 0.9.35 run
+                    // could not separate 'dim text composed
+                    // correctly' from 'content lost'. A bbox
+                    // can: the boot wordmark's box is centered
+                    // and wide; a displaced or ghosted image
+                    // lands somewhere else entirely.
+                    let w = FB_W as usize;
+                    let (mut px, mut x0, mut y0, mut x1, mut y1) =
+                        (0usize, w, FB_H as usize, 0usize, 0usize);
+                    for (i, p) in page.chunks_exact(4).enumerate() {
+                        if p.iter().any(|b| *b != 0) {
+                            px += 1;
+                            let (x, y) = (i % w, i / w);
+                            x0 = x0.min(x);
+                            x1 = x1.max(x);
+                            y0 = y0.min(y);
+                            y1 = y1.max(y);
+                        }
+                    }
+                    Some(format!(
+                        " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}"
+                    ))
                 })()
                 .unwrap_or_default()
             } else {
