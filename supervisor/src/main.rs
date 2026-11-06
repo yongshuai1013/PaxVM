@@ -1039,7 +1039,13 @@ fn entry_translate(
             None => parts.push(format!("path@{addr:#x} (unreadable)")),
         }
     }
-    let mut desc = format!("{}({}) {}", nr_name(compat, nr), nr, parts.join(", "));
+    let mut desc = format!(
+        "{}({}) pid={} {}",
+        nr_name(compat, nr),
+        nr,
+        pid,
+        parts.join(", ")
+    );
     if nr == nr_readlinkat(compat) {
         // readlinkat: the result buffer gets the real (prefixed)
         // path written back; accepted per M0 spec 2.4.

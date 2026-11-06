@@ -409,6 +409,21 @@ jobs:
           # driver -- so ship it under both names. SF died
           # in strlen(NULL) on this gap in 0.8.1's field run.
           cp gbsys/lib/egl/libGLES_android.so gbsys/lib/egl/libEGL_android.so
+          # S7 gun 2: the data directories the runtime
+          # stack reads at startup -- ICU data
+          # (usr/icu/icudt44l.dat), fonts, keylayouts and
+          # the stock /etc. app_process's first field run
+          # built its heap and JIT buffers, then aborted
+          # (Dalvik 0xdeadd00d) with these trees absent;
+          # ship them wholesale rather than guessing the
+          # one file. rdump preserves the layout under
+          # gbsys/<dir>.
+          for d in usr fonts etc; do
+            debugfs -R "rdump /$d gbsys" armeabi-v7a/system.img 2>/dev/null
+          done
+          test -s gbsys/usr/icu/icudt44l.dat || { echo "missing icudt44l.dat" >&2; exit 1; }
+          test -s gbsys/fonts/DroidSans.ttf || { echo "missing DroidSans.ttf" >&2; exit 1; }
+          test -s gbsys/etc/hosts || { echo "missing etc/hosts" >&2; exit 1; }
           # Optional: the stock boot animation archive. The
           # SDK image may not carry one; bootanimation then
           # falls back to its built-in logo animation.
