@@ -1361,9 +1361,46 @@ struct BinderProc {
     /// in every process and is never stored here)
     handles: HashMap<u32, usize>,
     next_handle: u32,
-    /// pending BR byte stream for this arena's readers
-    queue: Vec<u8>,
+    /// BR byte streams for this arena's readers, split the
+    /// way the real driver splits them: work addressed to
+    /// the process as a whole (inbound transactions, ref and
+    /// death notices) vs work addressed to one thread
+    /// (replies, and the completion/error words of a thread's
+    /// own in-flight call). A single shared queue misdelivers
+    /// as soon as a guest process uses two binder threads:
+    /// a reply meant for thread B can be drained by thread A
+    /// (bootanimation's worker starved exactly this way).
+    inbound: Vec<u8>,
+    queues: HashMap<i32, Vec<u8>>,
     loopers: HashSet<i32>,
+}
+
+impl BinderProc {
+    fn push_to(&mut self, pid: i32, bytes: &[u8]) {
+        self.queues.entry(pid).or_default().extend_from_slice(bytes);
+    }
+    /// Bytes this thread may read now: its own addressed
+    /// queue first, then (loopers only) the inbound stream.
+    fn readable_for(&self, pid: i32) -> usize {
+        let own = self.queues.get(&pid).map_or(0, |q| q.len());
+        if self.loopers.contains(&pid) {
+            own + self.inbound.len()
+        } else {
+            own
+        }
+    }
+    fn drain_for(&mut self, pid: i32, max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(q) = self.queues.get_mut(&pid) {
+            let n = q.len().min(max);
+            out.extend(q.drain(..n));
+        }
+        if out.len() < max && self.loopers.contains(&pid) {
+            let n = self.inbound.len().min(max - out.len());
+            out.extend(self.inbound.drain(..n));
+        }
+        out
+    }
 }
 
 struct BinderNode {
@@ -1553,13 +1590,13 @@ fn binder_notify_ref(
         return;
     }
     if let Some(bp) = st.procs.get_mut(&owner) {
-        bp.queue.extend_from_slice(&BR_INCREFS.to_le_bytes());
-        bp.queue.extend_from_slice(&nptr.to_le_bytes());
-        bp.queue.extend_from_slice(&ncookie.to_le_bytes());
+        bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+        bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
         if !weak {
-            bp.queue.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
-            bp.queue.extend_from_slice(&nptr.to_le_bytes());
-            bp.queue.extend_from_slice(&ncookie.to_le_bytes());
+            bp.inbound.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+            bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
         }
     }
     binder_maybe_wake(st, &owner, wakes);
@@ -1643,6 +1680,10 @@ fn binder_deliver(
     data: &[u8],
     offs: &[u8],
     fd_fixups: &[(usize, i32)],
+    // For BR_REPLY: the thread this reply belongs to. Its
+    // bytes must land in that thread's own queue, never in
+    // the shared inbound stream.
+    reply_to: Option<i32>,
 ) -> Result<(), &'static str> {
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
@@ -1680,33 +1721,43 @@ fn binder_deliver(
     put_u32(&mut txn, 28, offs.len() as u32);
     put_u32(&mut txn, 32, base + off);
     put_u32(&mut txn, 36, base + off + ((data.len() as u32 + 3) & !3));
-    bp.queue.extend_from_slice(&br_cmd.to_le_bytes());
-    bp.queue.extend_from_slice(&txn);
+    match (br_cmd, reply_to) {
+        (BR_REPLY, Some(pid)) => {
+            bp.push_to(pid, &br_cmd.to_le_bytes());
+            bp.push_to(pid, &txn);
+        }
+        _ => {
+            bp.inbound.extend_from_slice(&br_cmd.to_le_bytes());
+            bp.inbound.extend_from_slice(&txn);
+        }
+    }
     Ok(())
 }
 
 /// If the target arena has a parked reader, schedule its
 /// wake (the main loop performs it after the entry stop).
 fn binder_maybe_wake(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
-    if let Some(bp) = st.procs.get(arena) {
-        if bp.queue.is_empty() {
-            return;
+    let Some(bp) = st.procs.get(arena) else {
+        return;
+    };
+    if bp.inbound.is_empty() && bp.queues.values().all(|q| q.is_empty()) {
+        return;
+    }
+    // Wake exactly the parked threads that have bytes they
+    // may read: a thread with addressed bytes, or a looper
+    // while the inbound stream is non-empty. (The old code
+    // woke the first parked thread it found and handed it
+    // the whole shared queue, whatever the bytes were for.)
+    for (pid, park) in &st.parked {
+        if park.read_size == 0 || wakes.contains(pid) {
+            continue;
         }
-        for pid in &bp.loopers {
-            if st.parked.contains_key(pid) && !wakes.contains(pid) {
-                wakes.push(*pid);
-                return;
-            }
+        if st.thread_arena.get(pid).map(|a| a != arena).unwrap_or(true) {
+            continue;
         }
-        // A parked non-looper (a reply waiter) also receives.
-        for (pid, park) in &st.parked {
-            if st.thread_arena.get(pid).map(|a| a == arena).unwrap_or(false)
-                && park.read_size > 0
-                && !wakes.contains(pid)
-            {
-                wakes.push(*pid);
-                return;
-            }
+        let own = bp.queues.get(pid).map_or(0, |q| q.len());
+        if own > 0 || (!bp.inbound.is_empty() && bp.loopers.contains(pid)) {
+            wakes.push(*pid);
         }
     }
 }
@@ -1773,7 +1824,7 @@ fn binder_process_stream(
                 }
                 cur += 8;
                 if let Some(bp) = st.procs.get_mut(arena) {
-                    bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+                    bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
                 }
                 st.note("ATTEMPT_ACQUIRE answered DEAD_REPLY (v1)");
             }
@@ -1807,9 +1858,8 @@ fn binder_process_stream(
                     v.retain(|(a, c)| !(a == arena && *c == cookie));
                 }
                 if let Some(bp) = st.procs.get_mut(arena) {
-                    bp.queue
-                        .extend_from_slice(&BR_CLEAR_DEATH_NOTIFICATION_DONE.to_le_bytes());
-                    bp.queue.extend_from_slice(&cookie.to_le_bytes());
+                    bp.push_to(pid, &BR_CLEAR_DEATH_NOTIFICATION_DONE.to_le_bytes());
+                    bp.push_to(pid, &cookie.to_le_bytes());
                 }
             }
             BC_DEAD_BINDER_DONE => {
@@ -1891,11 +1941,12 @@ fn binder_handle_txn(
             &tdata,
             &offs,
             &fd_fixups,
+            Some(w.sender_pid),
         );
         if let Err(why) = delivered {
             notes.push(format!("REPLY delivery failed: {why}"));
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
-                bp.queue.extend_from_slice(&BR_FAILED_REPLY.to_le_bytes());
+                bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
         }
         binder_maybe_wake(st, &w.sender_arena, wakes);
@@ -1914,7 +1965,7 @@ fn binder_handle_txn(
     };
     let Some(node) = node else {
         if let Some(bp) = st.procs.get_mut(arena) {
-            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+            bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
         notes.push(format!("TRANSACTION to unknown handle {target} -> DEAD_REPLY"));
         return;
@@ -1923,7 +1974,7 @@ fn binder_handle_txn(
         // The service behind this handle is gone (S5c):
         // exactly what the real driver answers here.
         if let Some(bp) = st.procs.get_mut(arena) {
-            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+            bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
         notes.push(format!(
             "TRANSACTION to dead node (handle {target}) -> DEAD_REPLY"
@@ -1939,10 +1990,11 @@ fn binder_handle_txn(
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
         &fd_fixups,
+        None,
     );
     if let Err(why) = delivered {
         if let Some(bp) = st.procs.get_mut(arena) {
-            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+            bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
         notes.push(format!("TRANSACTION target cannot receive ({why}) -> DEAD_REPLY"));
         return;
@@ -1956,8 +2008,7 @@ fn binder_handle_txn(
         });
     }
     if let Some(bp) = st.procs.get_mut(arena) {
-        bp.queue
-            .extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
     }
     binder_maybe_wake(st, &owner, wakes);
     notes.push(format!("TRANSACTION code {code} -> node in {owner} ({}B)", tdata.len()));
@@ -2005,13 +2056,17 @@ fn binder_write_read(
         put_u32(&mut b, 20, rb);
         b
     };
-    let queue_len = st.procs.get(&arena).map(|p| p.queue.len()).unwrap_or(0);
+    let queue_len = st
+        .procs
+        .get(&arena)
+        .map(|p| p.readable_for(pid))
+        .unwrap_or(0);
     if rs > 0 && queue_len > 0 {
         let n = queue_len.min(rs as usize);
         let bytes: Vec<u8> = st
             .procs
             .get_mut(&arena)
-            .map(|bp| bp.queue.drain(..n).collect())
+            .map(|bp| bp.drain_for(pid, n))
             .unwrap_or_default();
         let _ = write_mem(pid, rb as u64, &bytes);
         let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
@@ -2218,8 +2273,8 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
         let Some(bp) = st.procs.get_mut(&arena) else {
             return;
         };
-        let n = bp.queue.len().min(park.read_size as usize);
-        bp.queue.drain(..n).collect()
+        let n = bp.readable_for(pid).min(park.read_size as usize);
+        bp.drain_for(pid, n)
     };
     if !bytes.is_empty() {
         sup!("binder: waking pid={pid} with {}B of queued work", bytes.len());
@@ -2282,7 +2337,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     if let Some(ws) = st.waiters.remove(arena) {
         for w in ws {
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
-                bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+                bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
             }
             binder_maybe_wake(st, &w.sender_arena, wakes);
         }
@@ -2302,8 +2357,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         if let Some(list) = st.watchers.remove(i) {
             for (watcher_arena, cookie) in list {
                 if let Some(bp) = st.procs.get_mut(&watcher_arena) {
-                    bp.queue.extend_from_slice(&BR_DEAD_BINDER.to_le_bytes());
-                    bp.queue.extend_from_slice(&cookie.to_le_bytes());
+                    bp.inbound.extend_from_slice(&BR_DEAD_BINDER.to_le_bytes());
+                    bp.inbound.extend_from_slice(&cookie.to_le_bytes());
                     notices += 1;
                 }
                 binder_maybe_wake(st, &watcher_arena, wakes);
@@ -2368,7 +2423,8 @@ fn entry_open_binder(
                 used: HashMap::new(),
                 handles: HashMap::new(),
                 next_handle: 1,
-                queue: Vec::new(),
+                inbound: Vec::new(),
+                queues: HashMap::new(),
                 loopers: HashSet::new(),
             });
         }
