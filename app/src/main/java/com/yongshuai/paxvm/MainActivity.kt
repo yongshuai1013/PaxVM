@@ -140,11 +140,18 @@ class MainActivity : Activity() {
         "/system/bin/setprop debug.fromprobe yes",
         "W=$(/system/bin/getprop debug.fromprobe)",
         "mkdir /data/FROMPROBE_IS_\$W",
-        // S5b: exercise the virtual binder driver end to end.
-        // serve registers "paxsvc" and parks in its looper;
-        // list enumerates the manager's registry; ping does a
-        // cross-process transaction and checks the reply. All
-        // evidence lands as /data markers + svc-list.txt.
+        // S5c: death processing end to end, then the S5b
+        // chain as regression. serveonce registers "paxsvc"
+        // and exits at once: the manager's death watch must
+        // fire, after which GET returns the null form
+        // (GONE_OK) while the name stays listed (LISTD_N_1 --
+        // stock 2.3 manager keeps the entry, pointer zeroed).
+        // Then a resident serve revives the name and the
+        // original S5b evidence must land again.
+        "/system/bin/paxsvc serveonce",
+        "sleep 1",
+        "/system/bin/paxsvc listd",
+        "/system/bin/paxsvc pinggone",
         "/system/bin/paxsvc serve &",
         "sleep 1",
         "/system/bin/paxsvc list",
@@ -355,6 +362,23 @@ class MainActivity : Activity() {
         // (the supervisor also recreates state per pid, this is
         // belt and braces).
         File(rootfs, ".binder").deleteRecursively()
+        // Evidence markers in /data persist across sessions
+        // by design (a re-run shows -EEXIST, which is itself
+        // readable evidence) -- but the S5c scenario reuses
+        // the same names for different stages (death, then
+        // revival), so its markers must start clean or the
+        // stages become indistinguishable.
+        File(rootfs, "data").listFiles()?.forEach { f ->
+            val n = f.name
+            if (n == "svc-list.txt" || n == "probe-ok.txt" ||
+                n.startsWith("SERVE") || n.startsWith("LIST") ||
+                n.startsWith("GET_H_") || n.startsWith("GONE_") ||
+                n.startsWith("PING_") || n.startsWith("STAGE_IS_") ||
+                n.startsWith("FROMPROBE_IS_")
+            ) {
+                f.deleteRecursively()
+            }
+        }
         writeFresh(File(rootfs, "init.rc"), gbInitRc)
         writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
         // init reads the kernel cmdline for androidboot.hardware
@@ -382,7 +406,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v2")
+        val marker = File(sysDir, ".gbsystem-v3")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

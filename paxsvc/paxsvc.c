@@ -373,7 +373,7 @@ static void send_reply(int fd, u32 buffer_to_free, struct parcel *reply, int sta
     binder_write_only(fd, &data, sizeof(data));
 }
 
-static int do_serve(void) {
+static int do_serve(int once) {
     int fd = binder_open_guest();
     struct parcel msg;
     struct rparcel reply;
@@ -398,7 +398,14 @@ static int do_serve(void) {
         marker("/data/SERVE_ADDFAIL");
         return 1;
     }
-    marker("/data/SERVE_READY");
+    marker(once ? "/data/SERVE1_READY" : "/data/SERVE_READY");
+    if (once) {
+        /* S5c death scenario: registration is complete --
+         * the manager has already linked its death watch
+         * (it does so before replying) -- so exiting now
+         * must fire BR_DEAD_BINDER at the manager. */
+        return 0;
+    }
     binder_write_only(fd, &enter, sizeof(enter));
     for (;;) {
         struct bwr b;
@@ -447,7 +454,7 @@ static int do_serve(void) {
 /* ---- list mode: LIST_SERVICES is paged in 2.3.7 -- one
  * name per call, indexed, until the manager answers with a
  * status-code reply ---- */
-static int do_list(void) {
+static int do_list(const char *mprefix) {
     int fd = binder_open_guest();
     static char text[2048];
     u32 tlen = 0, count = 0, n;
@@ -474,7 +481,37 @@ static int do_list(void) {
         count++;
     }
     write_file("/data/svc-list.txt", text, tlen);
-    marker_num("/data/LIST_N_", count);
+    marker_num(mprefix, count);
+    return 0;
+}
+
+/* ---- pinggone mode: GET must come back empty (S5c) ---- */
+/* After the owner dies, stock servicemanager keeps the
+ * name listed but zeroes its pointer, and do_find_service
+ * then yields nothing, so the handler answers with the
+ * null form (a lone uint32 0). A live ref (or a status
+ * error) is a failure of the death processing. */
+static int do_gone(void) {
+    int fd = binder_open_guest();
+    struct parcel msg;
+    struct rparcel reply;
+    u32 flags = 0, handle = 0;
+    if (fd < 0) return 1;
+    p_init(&msg);
+    p_svcmgr_header(&msg);
+    p_str16_x(&msg, "paxsvc");
+    if (binder_call(fd, 0, SVC_MGR_GET_SERVICE, &msg, &reply, &flags) < 0 ||
+        (flags & TF_STATUS_CODE)) {
+        marker("/data/GONE_FAIL");
+        return 1;
+    }
+    if (reply.len >= 16 && r_ref(&reply, &handle) == 0 && handle != 0) {
+        marker("/data/GONE_FAIL");
+        free_reply(fd, &reply);
+        return 1;
+    }
+    free_reply(fd, &reply);
+    marker("/data/GONE_OK");
     return 0;
 }
 
@@ -516,9 +553,12 @@ int guest_main(int argc, char **argv, char **envp) {
     int i, rc = 1;
     (void)envp;
     for (i = 1; i < argc; i++) {
-        if (xstreq(argv[i], "serve")) rc = do_serve();
-        else if (xstreq(argv[i], "list")) rc = do_list();
+        if (xstreq(argv[i], "serve")) rc = do_serve(0);
+        else if (xstreq(argv[i], "serveonce")) rc = do_serve(1);
+        else if (xstreq(argv[i], "list")) rc = do_list("/data/LIST_N_");
+        else if (xstreq(argv[i], "listd")) rc = do_list("/data/LISTD_N_");
         else if (xstreq(argv[i], "ping")) rc = do_ping();
+        else if (xstreq(argv[i], "pinggone")) rc = do_gone();
         else continue;
         break;
     }

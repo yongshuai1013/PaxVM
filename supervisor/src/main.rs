@@ -1203,6 +1203,9 @@ const BR_DEAD_REPLY: u32 = 0x7205;
 const BR_TRANSACTION_COMPLETE: u32 = 0x7206;
 const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = 0x8004_7210;
 const BR_FAILED_REPLY: u32 = 0x7211;
+const BR_DEAD_BINDER: u32 = 0x8004_720f;
+const BR_INCREFS: u32 = 0x8008_7207;
+const BR_ACQUIRE: u32 = 0x8008_7208;
 const BINDER_WRITE_READ: u32 = 0xC018_6201;
 const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
 const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
@@ -1267,6 +1270,10 @@ struct BinderNode {
     owner: String,
     ptr: u32,
     cookie: u32,
+    /// set when the owning arena's last thread exited:
+    /// outstanding handles to it dead-reply, and a fresh
+    /// registration creates a new node (S5c)
+    dead: bool,
 }
 
 struct ParkedIoctl {
@@ -1296,6 +1303,11 @@ struct BinderState {
     watchers: HashMap<usize, Vec<(String, u32)>>,
     thread_arena: HashMap<i32, String>,
     noted: HashSet<String>,
+    /// (node, receiver arena) pairs already sent a
+    /// BR_INCREFS(/BR_ACQUIRE) notice to the node's owner:
+    /// the real driver notifies once per new reference
+    /// holder, not once per parcel (S5c)
+    ref_notified: HashSet<(usize, String)>,
 }
 
 impl BinderState {
@@ -1305,17 +1317,16 @@ impl BinderState {
         }
     }
     fn node_for_local(&mut self, owner: &str, ptr: u32, cookie: u32) -> usize {
-        if let Some(i) = self
-            .nodes
-            .iter()
-            .position(|n| n.owner == owner && n.ptr == ptr && n.cookie == cookie)
-        {
+        if let Some(i) = self.nodes.iter().position(|n| {
+            !n.dead && n.owner == owner && n.ptr == ptr && n.cookie == cookie
+        }) {
             return i;
         }
         self.nodes.push(BinderNode {
             owner: owner.to_string(),
             ptr,
             cookie,
+            dead: false,
         });
         self.nodes.len() - 1
     }
@@ -1387,11 +1398,56 @@ fn binder_write_obj(st: &mut BinderState, to: &str, node: usize, weak: bool, out
     }
 }
 
+/// Tell a node's owner that a new arena now holds a
+/// reference to it, the way the real driver does when an
+/// object crosses into another process: BR_INCREFS always,
+/// BR_ACQUIRE as well for a strong object. Once per
+/// (node, receiver) pair. Guests whose parse skips these
+/// (stock binder.c) are unaffected; libbinder owners use
+/// them for local object lifetime tracking (S5c).
+fn binder_notify_ref(
+    st: &mut BinderState,
+    node: usize,
+    to: &str,
+    weak: bool,
+    wakes: &mut Vec<i32>,
+) {
+    let (owner, nptr, ncookie, dead) = {
+        let n = &st.nodes[node];
+        (n.owner.clone(), n.ptr, n.cookie, n.dead)
+    };
+    if dead || owner == to {
+        return;
+    }
+    if !st.ref_notified.insert((node, to.to_string())) {
+        return;
+    }
+    if let Some(bp) = st.procs.get_mut(&owner) {
+        bp.queue.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bp.queue.extend_from_slice(&nptr.to_le_bytes());
+        bp.queue.extend_from_slice(&ncookie.to_le_bytes());
+        if !weak {
+            bp.queue.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            bp.queue.extend_from_slice(&nptr.to_le_bytes());
+            bp.queue.extend_from_slice(&ncookie.to_le_bytes());
+        }
+    }
+    binder_maybe_wake(st, &owner, wakes);
+    st.note("ref notice queued to object owner");
+}
+
 /// The driver's parcel translation: local objects become
 /// nodes, handles resolve through the sender's table, and
 /// everything is re-expressed in the receiver's view. FD
 /// objects pass through untranslated (v1 boundary, noted).
-fn binder_translate(st: &mut BinderState, from: &str, to: &str, data: &[u8], offs: &[u8]) -> Vec<u8> {
+fn binder_translate(
+    st: &mut BinderState,
+    from: &str,
+    to: &str,
+    data: &[u8],
+    offs: &[u8],
+    wakes: &mut Vec<i32>,
+) -> Vec<u8> {
     let mut out = data.to_vec();
     let mut i = 0;
     while i + 4 <= offs.len() {
@@ -1407,6 +1463,7 @@ fn binder_translate(st: &mut BinderState, from: &str, to: &str, data: &[u8], off
             OBJ_BINDER | OBJ_WEAK_BINDER => {
                 let node = st.node_for_local(from, ptr, cookie);
                 binder_write_obj(st, to, node, ty == OBJ_WEAK_BINDER, &mut out, off);
+                binder_notify_ref(st, node, to, ty == OBJ_WEAK_BINDER, wakes);
             }
             OBJ_HANDLE | OBJ_WEAK_HANDLE => {
                 let node = if ptr == 0 {
@@ -1417,7 +1474,10 @@ fn binder_translate(st: &mut BinderState, from: &str, to: &str, data: &[u8], off
                         .and_then(|p| p.handles.get(&ptr).copied())
                 };
                 match node {
-                    Some(n) => binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off),
+                    Some(n) => {
+                        binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off);
+                        binder_notify_ref(st, n, to, ty == OBJ_WEAK_HANDLE, wakes);
+                    }
                     None => st.note("parcel carried an unknown handle; left untranslated"),
                 }
             }
@@ -1666,7 +1726,7 @@ fn binder_handle_txn(
             notes.push("BC_REPLY with no waiter; dropped".to_string());
             return;
         };
-        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs);
+        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, wakes);
         let delivered = binder_deliver(
             st,
             &w.sender_arena,
@@ -1702,11 +1762,22 @@ fn binder_handle_txn(
         notes.push(format!("TRANSACTION to unknown handle {target} -> DEAD_REPLY"));
         return;
     };
+    if st.nodes[node].dead {
+        // The service behind this handle is gone (S5c):
+        // exactly what the real driver answers here.
+        if let Some(bp) = st.procs.get_mut(arena) {
+            bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+        }
+        notes.push(format!(
+            "TRANSACTION to dead node (handle {target}) -> DEAD_REPLY"
+        ));
+        return;
+    }
     let (owner, nptr, ncookie) = {
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie)
     };
-    let tdata = binder_translate(st, arena, &owner, &data, &offs);
+    let tdata = binder_translate(st, arena, &owner, &data, &offs, wakes);
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
     );
@@ -1848,6 +1919,71 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
     // is rescued and consumes it. (No regs surgery here: the
     // exit stop applies the inject itself.)
     cont_syscall(pid, 0);
+}
+
+/// A tracee that held a binder arena exited (S5c). When it
+/// was the arena's last thread, the arena dies with it:
+/// synchronous callers still waiting for its replies get
+/// BR_DEAD_REPLY, its nodes are marked dead (outstanding
+/// handles to them dead-reply from now on), and every death
+/// watch on those nodes fires BR_DEAD_BINDER with the exact
+/// cookie the watcher registered -- stock servicemanager
+/// answers it by zeroing the service's entry, so a later
+/// GET returns the null form and a re-ADD revives the name.
+/// Caller has already removed the pid from thread_arena.
+fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) {
+    if st.thread_arena.values().any(|a| a == arena) {
+        return; // sibling threads still hold this arena
+    }
+    if st.mgr_arena.as_deref() == Some(arena) {
+        st.mgr_arena = None;
+        if let Some(mi) = st.mgr_node.take() {
+            if let Some(n) = st.nodes.get_mut(mi) {
+                n.dead = true;
+            }
+        }
+        sup!("binder: context manager arena died; manager slot cleared");
+    }
+    if let Some(ws) = st.waiters.remove(arena) {
+        for w in ws {
+            if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
+                bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
+            }
+            binder_maybe_wake(st, &w.sender_arena, wakes);
+        }
+    }
+    for v in st.waiters.values_mut() {
+        v.retain(|w| w.sender_arena != arena);
+    }
+    let mut dead_nodes: Vec<usize> = Vec::new();
+    for (i, n) in st.nodes.iter_mut().enumerate() {
+        if n.owner == arena && !n.dead {
+            n.dead = true;
+            dead_nodes.push(i);
+        }
+    }
+    let mut notices = 0usize;
+    for i in &dead_nodes {
+        if let Some(list) = st.watchers.remove(i) {
+            for (watcher_arena, cookie) in list {
+                if let Some(bp) = st.procs.get_mut(&watcher_arena) {
+                    bp.queue.extend_from_slice(&BR_DEAD_BINDER.to_le_bytes());
+                    bp.queue.extend_from_slice(&cookie.to_le_bytes());
+                    notices += 1;
+                }
+                binder_maybe_wake(st, &watcher_arena, wakes);
+            }
+        }
+    }
+    for v in st.watchers.values_mut() {
+        v.retain(|(a, _)| a != arena);
+    }
+    if !dead_nodes.is_empty() {
+        sup!(
+            "binder: arena {arena} died; {} node(s) dead, {notices} death notice(s) queued",
+            dead_nodes.len()
+        );
+    }
 }
 
 /// open("/dev/binder"): point the call at a fresh per-opener
@@ -2846,6 +2982,17 @@ fn main() {
             if let Some(a) = binder.thread_arena.remove(&pid) {
                 if let Some(bp) = binder.procs.get_mut(&a) {
                     bp.loopers.remove(&pid);
+                }
+                // S5c: if that was the arena's last thread,
+                // run the driver's death processing; it may
+                // wake parked tracees (death notices, dead
+                // replies), completed like any other wake.
+                let mut dwakes: Vec<i32> = Vec::new();
+                binder_on_proc_exit(&a, &mut binder, &mut dwakes);
+                for wpid in dwakes {
+                    if wpid != pid {
+                        complete_parked(wpid, &mut procs, &mut binder);
+                    }
                 }
             }
             binder.parked.remove(&pid);
