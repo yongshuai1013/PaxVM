@@ -134,6 +134,19 @@ class MainActivity : Activity() {
         "    export PATH /sbin:/bin:/system/bin",
         "    export ANDROID_ROOT /system",
         "    export ANDROID_DATA /data",
+        // S7 gun 4: the missing export that killed every
+        // zygote. Stock GB init.rc exports LD_LIBRARY_PATH
+        // /system/lib; Dalvik derives java.library.path --
+        // the System.loadLibrary search path for JNI libs
+        // -- from it. Without it the path is empty and
+        // preloadClasses died at android.media.AmrInputStream
+        // with 'UnsatisfiedLinkError: Library media_jni not
+        // found; tried [/libmedia_jni.so]' (the guest log's
+        // own words, 0.9.52 field run). The native linker
+        // never cared -- it has /system/lib built in --
+        // which is why every .so loaded fine and only the
+        // Java-side JNI loads starved.
+        "    export LD_LIBRARY_PATH /system/lib",
         // S7: the stock BOOTCLASSPATH (ramdisk init.rc:20);
         // app_process starts the VM with no boot classpath
         // at all when the variable is missing.
