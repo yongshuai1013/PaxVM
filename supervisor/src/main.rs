@@ -2130,6 +2130,13 @@ fn binder_handle_txn(
                 data,
                 offs,
             });
+            // Causal ledger (0.9.27): this line is printed
+            // at entry-processing time, unlike the call's
+            // desc, which can surface much later.
+            sup!(
+                "binder: queued mgr txn from pid={pid} code={code} (pending now {})",
+                st.mgr_pending.len()
+            );
             notes.push(
                 "TRANSACTION to manager before it registered -> queued".to_string(),
             );
@@ -2293,6 +2300,7 @@ fn binder_write_read(
             .get_mut(&arena)
             .map(|bp| bp.drain_for(pid, n).0)
             .unwrap_or_default();
+        dump_mgr_read(st, &arena, pid, &bytes);
         let _ = write_mem(pid, rb as u64, &bytes);
         let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
         skip_syscall(pid, regs, pend, 0);
@@ -2343,6 +2351,35 @@ fn binder_write_read(
         notes.push("no work".to_string());
     }
     format!("binder WRITE_READ pid={pid} [{}]", notes.join("; "))
+}
+
+/// Telemetry (0.9.27): when the context manager itself is
+/// handed read bytes, name the command words. GB
+/// servicemanager exits its loop (and the process) on
+/// specific BR codes -- a stray BR_REPLY, BR_DEAD_REPLY
+/// or a truncated stream would each explain the
+/// manager's clean exit(0) after serving flushed work in
+/// the 0.9.26 device run; this names which one it ate.
+fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
+    if st.mgr_arena.as_deref() != Some(arena) {
+        return;
+    }
+    let mut cmds: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() && cmds.len() < 8 {
+        let c = u32_at(bytes, off);
+        cmds.push(format!("{c:#010x}"));
+        off += match c {
+            BR_TRANSACTION | BR_REPLY => 44,
+            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
+            _ => 4,
+        };
+    }
+    sup!(
+        "binder: mgr read for pid={pid}: {}B cmds=[{}]",
+        bytes.len(),
+        cmds.join(", ")
+    );
 }
 
 /// Finish a parked binder ioctl now that its arena has bytes:
@@ -2550,6 +2587,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
             bytes.len(),
             from_inbound
         );
+        dump_mgr_read(st, &arena, pid, &bytes);
     }
     if bytes.is_empty() {
         st.parked.insert(pid, park);
@@ -2599,7 +2637,12 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     // Queued manager transactions from this arena's
     // senders die with it (0.9.24).
+    let before = st.mgr_pending.len();
     st.mgr_pending.retain(|q| q.sender_arena != arena);
+    let purged = before - st.mgr_pending.len();
+    if purged > 0 {
+        sup!("binder: purged {purged} queued mgr txn(s) from dead arena {arena}");
+    }
     if st.mgr_arena.as_deref() == Some(arena) {
         st.mgr_arena = None;
         if let Some(mi) = st.mgr_node.take() {
@@ -4292,7 +4335,15 @@ fn main() {
                                 let total = queued.len();
                                 let mut delivered = 0;
                                 for q in queued {
+                                    sup!(
+                                        "binder: flushing queued mgr txn from pid={} code={}",
+                                        q.sender_pid, q.code
+                                    );
                                     if !binder.procs.contains_key(&q.sender_arena) {
+                                        sup!(
+                                            "binder: queued mgr txn from pid={} dropped (sender arena gone)",
+                                            q.sender_pid
+                                        );
                                         continue;
                                     }
                                     let mut qnotes: Vec<String> = Vec::new();
