@@ -194,7 +194,16 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
 
     // Above bootanimation's 0x40000000: its opaque black
     // surface must not cover the test circle (gun 5).
+    // SurfaceControl::setLayer only ACCUMULATES the state
+    // into the client's batch (SurfaceComposerClient::
+    // setLayer -> lockLayerState); it reaches SF solely
+    // when closeTransaction() sends SET_STATE. Bare calls
+    // (as here through 0.9.43) never leave the process --
+    // that, not any binder fault, is why the layer stayed
+    // at the default z under the animation's opaque plane.
+    client->openTransaction();
     ctrl->setLayer(0x40000001);
+    client->closeTransaction();
     marker_sfx("/data/GB_LAYER", sfx);
 
     sp<Surface> surf = ctrl->getSurface();
