@@ -56,14 +56,39 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
     }
     marker_sfx("/data/GB_CLIENT", sfx);
 
-    sp<SurfaceControl> ctrl = client->createSurface(
-            getpid(), String8("gbprobe"), 0, 64, 64,
-            PIXEL_FORMAT_RGBA_8888, 0);
-    if (ctrl == NULL) {
-        marker_sfx("/data/GB_NOCTRL", sfx);
-        return 1;
+    // createSurface came back empty for us while the
+    // animation client's first attempt in a fresh flinger
+    // got a full reply. Bisect: retry the same parameters,
+    // then fall back to the animation's full-screen size.
+    sp<SurfaceControl> ctrl;
+    int tries_small = 0;
+    while (tries_small < 5) {
+        ctrl = client->createSurface(
+                getpid(), String8("gbprobe"), 0, 64, 64,
+                PIXEL_FORMAT_RGBA_8888, 0);
+        if (ctrl != NULL) break;
+        tries_small++;
+        sleep(1);
     }
-    marker_sfx("/data/GB_CTRL", sfx);
+    if (ctrl != NULL) {
+        marker_sfx(tries_small == 0 ? "/data/GB_CTRL" : "/data/GB_CTRL_RETRY", sfx);
+    } else {
+        marker_sfx("/data/GB_NOCTRL", sfx);
+        int tries_big = 0;
+        while (tries_big < 5) {
+            ctrl = client->createSurface(
+                    getpid(), String8("gbprobe"), 0, 480, 800,
+                    PIXEL_FORMAT_RGBA_8888, 0);
+            if (ctrl != NULL) break;
+            tries_big++;
+            sleep(1);
+        }
+        if (ctrl == NULL) {
+            marker_sfx("/data/GB_NOCTRL_BIG", sfx);
+            return 1;
+        }
+        marker_sfx("/data/GB_CTRL_BIG", sfx);
+    }
     ctrl->setLayer(100000);
 
     sp<Surface> surf = ctrl->getSurface();
