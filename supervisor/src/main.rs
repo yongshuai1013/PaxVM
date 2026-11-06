@@ -4161,6 +4161,18 @@ fn read_context() -> String {
 
 fn main() {
     sup!("supervisor ctx: [{}]", selinux_ctx(0));
+    // Yield the phone to its own interface: the funnel
+    // makes the supervisor burn a full core for the
+    // whole guest-boot stretch, and 0.9.54's field run
+    // showed the host UI (even our own stop button)
+    // starving despite batched logging. Nice ourselves
+    // to background priority; every guest inherits it
+    // across fork/exec, so the whole guest complex
+    // schedules behind the phone's foreground work.
+    // Boot takes a little longer; the phone stays
+    // usable while it happens.
+    let nrc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+    sup!("supervisor niced to +10 (rc={nrc}); guest tree inherits");
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
         sup!("usage: libsupervisor.so <rootfs_abs_path> <guest_abs_path> [-- guest_argv...]");

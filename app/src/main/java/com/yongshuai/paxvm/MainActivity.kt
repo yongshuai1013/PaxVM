@@ -1013,6 +1013,11 @@ class MainActivity : Activity() {
             val pageFile = File(rootfs, ".fb-page")
             val pageBytes = 480 * 800 * 4
             val buf = ByteArray(pageBytes)
+            // Reused across frames (0.9.55): allocating a
+            // fresh 384k IntArray per frame churned the
+            // app's own GC during exactly the boot stretch
+            // where the interface must stay responsive.
+            val ints = IntArray(480 * 800)
             // 0.9.54: the boot stretch is when the guest
             // floods the supervisor and the interface is
             // tightest; run the preview at 2 fps for the
@@ -1042,7 +1047,6 @@ class MainActivity : Activity() {
                     // 0.7.1 then swapped a second time inside
                     // the ints and landed on the same wrong
                     // picture. The int path needs no swap.)
-                    val ints = IntArray(480 * 800)
                     ByteBuffer.wrap(buf)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         .asIntBuffer()
