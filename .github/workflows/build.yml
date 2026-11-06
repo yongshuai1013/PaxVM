@@ -366,7 +366,7 @@ jobs:
           for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
                    lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
                    lib/liblog.so lib/libcutils.so lib/libbinder.so \
-                   lib/libutils.so lib/libz.so \
+                   lib/libutils.so lib/libz.so lib/libETC1.so \
                    bin/surfaceflinger bin/bootanimation \
                    lib/libsurfaceflinger.so lib/libsurfaceflinger_client.so \
                    lib/libui.so lib/libEGL.so lib/libGLESv1_CM.so \
@@ -382,6 +382,14 @@ jobs:
           # does not exist here). Point EGL at the stock
           # software renderer instead (S6 design note).
           printf '0 0 android\n' > gbsys/lib/egl/egl.cfg
+          # The image carries no libEGL_android.so, but the
+          # EGL loader insists on dlopening libEGL_<tag>.so
+          # for the EGL half. libGLES_android.so itself
+          # exports the full EGL entry set (39 egl* symbols,
+          # verified) -- it is the single-file software
+          # driver -- so ship it under both names. SF died
+          # in strlen(NULL) on this gap in 0.8.1's field run.
+          cp gbsys/lib/egl/libGLES_android.so gbsys/lib/egl/libEGL_android.so
           # Optional: the stock boot animation archive. The
           # SDK image may not carry one; bootanimation then
           # falls back to its built-in logo animation.
