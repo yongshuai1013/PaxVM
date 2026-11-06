@@ -3949,6 +3949,20 @@ fn main() {
                         "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
                     ));
                     dirty = true;
+                } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
+                    && fd_ashmem(pid, regs.arg(4) as i32).is_some()
+                {
+                    // Telemetry only: the call still passes
+                    // through untouched; the exit stop notes
+                    // that a virtual ashmem file was mapped.
+                    let key = fd_ashmem(pid, regs.arg(4) as i32).unwrap();
+                    let name = key.rsplit('/').next().unwrap_or("").to_string();
+                    pend.desc = Some(format!(
+                        "mmap({nr}) virtual ashmem {name} len={} prot={} flags=0x{:x} (passed through)",
+                        regs.arg(1),
+                        regs.arg(2),
+                        regs.arg(3)
+                    ));
                 } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
                     && matches!(
                         regs.arg(1) as u32,
