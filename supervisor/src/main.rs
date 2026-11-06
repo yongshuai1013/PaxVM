@@ -4245,16 +4245,34 @@ fn main() {
                 } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
                     && fd_ashmem(pid, regs.arg(4) as i32).is_some()
                 {
-                    // Telemetry only: the call still passes
-                    // through untouched; the exit stop notes
-                    // that a virtual ashmem file was mapped.
                     let key = fd_ashmem(pid, regs.arg(4) as i32).unwrap();
                     let name = key.rsplit('/').next().unwrap_or("").to_string();
+                    // Born-exec for PRIVATE region mappings
+                    // (0.9.29): the host denies adding
+                    // PROT_EXEC to an already-live file VMA
+                    // (the mprotect comes back -13 and
+                    // pixelflinger's assembler dies on the
+                    // NULLed base), while mappings BORN with
+                    // exec -- every guest library -- take the
+                    // same mprotect without complaint. A
+                    // private region's contents never leave
+                    // this process (the mspace JIT cache is
+                    // the case that matters), so let the
+                    // mapping be born RWX and the later
+                    // mprotect becomes a no-transition. SHARED
+                    // regions (surface heaps) keep the
+                    // guest's prot exactly.
+                    let upgraded = regs.arg(3) & 1 == 0 && regs.arg(2) & 4 == 0;
+                    if upgraded {
+                        regs.set_arg(2, regs.arg(2) | 4);
+                        dirty = true;
+                    }
                     pend.desc = Some(format!(
-                        "mmap({nr}) pid={pid} virtual ashmem {name} len={} prot={} flags=0x{:x} (passed through)",
+                        "mmap({nr}) pid={pid} virtual ashmem {name} len={} prot={} flags=0x{:x} (passed through{})",
                         regs.arg(1),
                         regs.arg(2),
-                        regs.arg(3)
+                        regs.arg(3),
+                        if upgraded { "; prot upgraded +EXEC" } else { "" }
                     ));
                 } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
                     && matches!(
