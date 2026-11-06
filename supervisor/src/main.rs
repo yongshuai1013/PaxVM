@@ -1320,7 +1320,13 @@ impl BinderState {
         self.nodes.len() - 1
     }
     fn handle_for(&mut self, arena: &str, node: usize) -> u32 {
-        let bp = self.procs.get_mut(arena).expect("arena exists");
+        // Never panic: the supervisor dying takes the whole
+        // session with it. A missing arena degrades the object
+        // to handle 0 with a note, not a crash.
+        let Some(bp) = self.procs.get_mut(arena) else {
+            self.note("handle_for: arena state missing; object degraded to handle 0");
+            return 0;
+        };
         if let Some((h, _)) = bp.handles.iter().find(|(_, n)| **n == node) {
             return *h;
         }
@@ -1853,8 +1859,24 @@ fn entry_open_binder(
     } else {
         0
     };
-    let arena = format!("{rootfs}/.binder/{pid}");
+    let arena_raw = format!("{rootfs}/.binder/{pid}");
     let _ = std::fs::create_dir_all(format!("{rootfs}/.binder"));
+    // The arena's identity key must be the canonical path:
+    // later ioctls/mmaps find the arena through /proc/<pid>/fd
+    // readlinks, which report the symlink-resolved path
+    // (rootfs lives under /data/user/0, a symlink to
+    // /data/data). Keying state by the unresolved string made
+    // every fd-based lookup miss -- invisible while nothing
+    // transacted, fatal at the first parcel translation
+    // (0.6.3 device run: handle_for panicked, whole session
+    // died). The guest still opens the raw path; same file.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&arena_raw);
+    let arena = std::fs::canonicalize(&arena_raw)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(arena_raw.clone());
     match std::fs::OpenOptions::new().create(true).write(true).open(&arena) {
         Ok(f) => {
             if f.metadata().map(|m| m.len()).unwrap_or(0) < BINDER_ARENA_CAP as u64 {
@@ -1877,7 +1899,7 @@ fn entry_open_binder(
     }
     st.thread_arena.insert(pid, arena.clone());
     let mut cursor = regs.sp().saturating_sub(256);
-    match scratch_write(pid, &mut cursor, &arena) {
+    match scratch_write(pid, &mut cursor, &arena_raw) {
         Some(addr) => {
             regs.set_arg(path_arg, addr);
             "open '/dev/binder' -> binder arena (virtual driver)".to_string()
