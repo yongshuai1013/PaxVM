@@ -4083,6 +4083,24 @@ fn main() {
                         &mut proc.sigmask,
                     ));
                     dirty = true;
+                } else if proc.compat && nr == 125 && (regs.arg(2) & 0x4) != 0 {
+                    // Telemetry only (0.9.26): an mprotect
+                    // that adds PROT_EXEC passes through
+                    // untouched, but the desc makes the exit
+                    // stop print the host's verdict.
+                    // Pixelflinger's Assembly frees its code
+                    // buffer and NULLs the base when this
+                    // call fails (ensureMbaseExecutable),
+                    // and the assembler then emits into
+                    // address 0 -- the SurfaceFlinger
+                    // +0xec0a crash signature (mPC=0,
+                    // prologue word in hand).
+                    pend.desc = Some(format!(
+                        "mprotect EXEC addr=0x{:x} len={} prot={:#x}",
+                        regs.arg(0),
+                        regs.arg(1),
+                        regs.arg(2)
+                    ));
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
                     || is_t_symlinkat(proc.compat, nr)
@@ -4417,6 +4435,14 @@ fn main() {
                         }
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
+                        }
+                        if proc.compat && pend.nr == 125 && ret < 0 {
+                            // Telemetry (0.9.26): any failing
+                            // compat mprotect, exec or not --
+                            // the mspace growth path also
+                            // mprotects, and its failure
+                            // NULLs allocations the same way.
+                            sup!("mprotect FAILED pid={pid} ret={ret}");
                         }
                         if let Some((optval, optlen)) = pend.peercred {
                             if ret == 0 {
