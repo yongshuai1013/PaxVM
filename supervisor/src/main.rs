@@ -4365,7 +4365,16 @@ fn main() {
                                         prot,
                                         &mut regs,
                                     );
-                                    if r == page_start as i64
+                                    // The ride's result is a
+                                    // 32-bit address in a
+                                    // 64-bit register read as
+                                    // signed: compare in u32,
+                                    // or every success looks
+                                    // like a huge negative
+                                    // (0.9.32's bug -- the mmap
+                                    // landed and the contents
+                                    // restore was skipped).
+                                    if (r as u32) == (page_start as u32)
                                         && write_mem(pid, page_start, &contents)
                                             .is_ok()
                                     {
