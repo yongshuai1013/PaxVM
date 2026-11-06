@@ -1542,14 +1542,26 @@ fn entry_fb_ioctl(
                     let bright = {
                         let mut n = 0usize;
                         let mut mx = 0u8;
+                        let mut a0 = 0usize;
                         for p in page.chunks_exact(4) {
                             let m = p.iter().copied().max().unwrap_or(0);
                             if m >= 0x80 {
                                 n += 1;
                             }
                             mx = mx.max(m);
+                            // Lit RGB with a zero alpha byte:
+                            // the exact signature that made
+                            // the shell preview render black
+                            // (0.9.46 forces opacity there).
+                            if p[3] == 0
+                                && (p[0] >= 0x80
+                                    || p[1] >= 0x80
+                                    || p[2] >= 0x80)
+                            {
+                                a0 += 1;
+                            }
                         }
-                        format!(" bright={n} maxv={mx}")
+                        format!(" bright={n} maxv={mx} a0={a0}")
                     };
                     Some(format!(
                         " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}{bright}{stacks}"

@@ -835,6 +835,21 @@ class MainActivity : Activity() {
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         .asIntBuffer()
                         .get(ints)
+                    // The guest framebuffer is an opaque
+                    // display: its alpha byte carries no
+                    // meaning, and the compositor's writes
+                    // leave it at 0 (the file starts zeroed
+                    // and nothing sets it). Android treats
+                    // alpha 0 as invisible, which made the
+                    // preview render solid black over pages
+                    // the supervisor's census could read
+                    // perfectly (gun 5's 'always black'
+                    // previews). Force full opacity here --
+                    // fbprobe's own writes carried 0xFF,
+                    // which is why its card showed in S6a.
+                    for (i in ints.indices) {
+                        ints[i] = ints[i] or -0x1000000
+                    }
                     bmp.setPixels(ints, 0, 480, 0, 0, 480, 800)
                     runOnUiThread { fbView.setImageBitmap(bmp) }
                 } catch (_: Exception) {
