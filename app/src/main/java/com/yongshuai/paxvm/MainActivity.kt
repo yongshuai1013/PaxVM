@@ -156,6 +156,16 @@ class MainActivity : Activity() {
         "sleep 1",
         "/system/bin/paxsvc list",
         "/system/bin/paxsvc ping",
+        // S5c (cont.): the same registry through the guest's
+        // real C++ binder stack (libbinder/libutils): serve
+        // publishes "lbpax" via addService and joins the
+        // thread pool; list counts via listServices; ping
+        // does getService + a raw transact and checks the
+        // reply. Evidence markers carry the LB_ prefix.
+        "/system/bin/lbprobe serve &",
+        "sleep 1",
+        "/system/bin/lbprobe list",
+        "/system/bin/lbprobe ping",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
@@ -374,7 +384,7 @@ class MainActivity : Activity() {
                 n.startsWith("SERVE") || n.startsWith("LIST") ||
                 n.startsWith("GET_H_") || n.startsWith("GONE_") ||
                 n.startsWith("PING_") || n.startsWith("STAGE_IS_") ||
-                n.startsWith("FROMPROBE_IS_")
+                n.startsWith("FROMPROBE_IS_") || n.startsWith("LB")
             ) {
                 f.deleteRecursively()
             }
@@ -406,7 +416,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v3")
+        val marker = File(sysDir, ".gbsystem-v4")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

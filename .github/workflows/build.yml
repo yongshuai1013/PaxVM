@@ -337,12 +337,31 @@ jobs:
           mkdir -p gbsys/bin gbsys/lib
           for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
                    lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
-                   lib/liblog.so lib/libcutils.so; do
+                   lib/liblog.so lib/libcutils.so lib/libbinder.so \
+                   lib/libutils.so lib/libz.so; do
             debugfs -R "dump -p /$p gbsys/$p" armeabi-v7a/system.img 2>/dev/null
             test -s "gbsys/$p" || { echo "missing from system.img: $p" >&2; exit 1; }
           done
           ls -la gbsys/bin gbsys/lib
           (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
+
+      # lbprobe (S5c): a real libbinder client/server. Built
+      # after the subset fetch because its symbol stubs are
+      # generated from the extracted real libraries; the zip
+      # step below therefore runs after it too.
+      - name: Build lbprobe (guest libbinder client/server)
+        run: |
+          set -euo pipefail
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          python3 lbprobe/build_lbprobe.py "$TC" gbsys/lib gbsys/bin/lbprobe
+          "$TC/llvm-readelf" -h gbsys/bin/lbprobe | grep -q 'Class:.*ELF32'
+          "$TC/llvm-readelf" -h gbsys/bin/lbprobe | grep -q 'Type:.*EXEC'
+          "$TC/llvm-readelf" -d gbsys/bin/lbprobe | grep -q 'NEEDED.*libbinder.so'
+          ! "$TC/llvm-readelf" -r gbsys/bin/lbprobe | grep -q IRELATIVE
+
+      - name: Zip gbsystem subset
+        run: |
+          set -euo pipefail
           mkdir -p app/src/main/assets
           python3 - <<'PYEOF'
           import os, zipfile
