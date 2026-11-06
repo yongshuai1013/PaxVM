@@ -406,6 +406,12 @@ impl Regs {
             Regs::A32(r) => r.uregs[15] as u64,
         }
     }
+    fn set_pc(&mut self, v: u64) {
+        match self {
+            Regs::A64(r) => r.pc = v,
+            Regs::A32(r) => r.uregs[15] = v as u32,
+        }
+    }
     /// Return value as the guest reads it: x0 sign-extended from
     /// 64 bits, r0 sign-extended from 32 (a -errno in r0 is a small
     /// u32; reading it as u64 would hide the sign).
@@ -1217,6 +1223,7 @@ const BINDER_SET_CONTEXT_MGR: u32 = 0x4004_6207;
 const BINDER_THREAD_EXIT: u32 = 0x4004_6208;
 const BINDER_VERSION: u32 = 0xC004_6209;
 const OBJ_BINDER: u32 = 0x7362_2A85;
+const OBJ_FD: u32 = 0x6664_2A85;
 const OBJ_WEAK_BINDER: u32 = 0x7762_2A85;
 const OBJ_HANDLE: u32 = 0x7368_2A85;
 const OBJ_WEAK_HANDLE: u32 = 0x7768_2A85;
@@ -1409,12 +1416,28 @@ struct BinderState {
     /// file per open, ioctls answered from this table.
     ashmem: HashMap<String, AshmemRec>,
     ashmem_seq: u64,
+    /// FD translation (S6 gun 4): parcels already delivered
+    /// into an arena whose flat FD objects still carry the
+    /// *sender's* fd numbers. A fixup names the arena-file
+    /// offset of the fd word plus the sender (host pid and
+    /// its fd); at wake time the receiver is made to open
+    /// /proc/<sender>/fd/<n> itself (remote syscall
+    /// injection, resolve_fd_fixups) and the word is patched
+    /// with the receiver-side number.
+    fd_pending: HashMap<String, Vec<FdFixup>>,
+    fd_cache: HashMap<(String, i32, i32), i32>,
 }
 
 struct AshmemRec {
     size: u64,
     name: String,
     prot: u64,
+}
+
+struct FdFixup {
+    file_off: u64,
+    sender_pid: i32,
+    sender_fd: i32,
 }
 
 impl BinderState {
@@ -1546,7 +1569,10 @@ fn binder_notify_ref(
 /// The driver's parcel translation: local objects become
 /// nodes, handles resolve through the sender's table, and
 /// everything is re-expressed in the receiver's view. FD
-/// objects pass through untranslated (v1 boundary, noted).
+/// objects cannot be resolved here (the receiver-side fd
+/// only exists at wake time); their locations are collected
+/// into `fd_fixups` as (offset of the fd word in the output
+/// data, sender's fd number) for the delivery to register.
 fn binder_translate(
     st: &mut BinderState,
     from: &str,
@@ -1554,6 +1580,7 @@ fn binder_translate(
     data: &[u8],
     offs: &[u8],
     wakes: &mut Vec<i32>,
+    fd_fixups: &mut Vec<(usize, i32)>,
 ) -> Vec<u8> {
     let mut out = data.to_vec();
     let mut i = 0;
@@ -1588,7 +1615,12 @@ fn binder_translate(
                     None => st.note("parcel carried an unknown handle; left untranslated"),
                 }
             }
-            _ => st.note("parcel object of untranslated type passed through"),
+            OBJ_FD => {
+                fd_fixups.push((off + 8, ptr as i32));
+            }
+            _ => {
+                sup!("binder: untranslated parcel object type=0x{ty:08x} ptr=0x{ptr:x} (passed through)");
+            }
         }
     }
     out
@@ -1610,11 +1642,22 @@ fn binder_deliver(
     sender_euid: u32,
     data: &[u8],
     offs: &[u8],
+    fd_fixups: &[(usize, i32)],
 ) -> Result<(), &'static str> {
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
         return Err("alloc failed (no such arena state, or out of mapped space)");
     };
+    for (rel, sfd) in fd_fixups {
+        st.fd_pending
+            .entry(target.to_string())
+            .or_default()
+            .push(FdFixup {
+                file_off: off as u64 + *rel as u64,
+                sender_pid,
+                sender_fd: *sfd,
+            });
+    }
     let Some(bp) = st.procs.get_mut(target) else {
         return Err("arena state vanished after alloc");
     };
@@ -1833,7 +1876,8 @@ fn binder_handle_txn(
             notes.push("BC_REPLY with no waiter; dropped".to_string());
             return;
         };
-        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, wakes);
+        let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
+        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, wakes, &mut fd_fixups);
         let delivered = binder_deliver(
             st,
             &w.sender_arena,
@@ -1846,6 +1890,7 @@ fn binder_handle_txn(
             veuid,
             &tdata,
             &offs,
+            &fd_fixups,
         );
         if let Err(why) = delivered {
             notes.push(format!("REPLY delivery failed: {why}"));
@@ -1884,9 +1929,11 @@ fn binder_handle_txn(
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie)
     };
-    let tdata = binder_translate(st, arena, &owner, &data, &offs, wakes);
+    let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
+    let tdata = binder_translate(st, arena, &owner, &data, &offs, wakes, &mut fd_fixups);
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
+        &fd_fixups,
     );
     if let Err(why) = delivered {
         if let Some(bp) = st.procs.get_mut(arena) {
@@ -1991,6 +2038,170 @@ fn binder_write_read(
 /// Finish a parked binder ioctl now that its arena has bytes:
 /// fill the read buffer, settle the bwr consumed fields, make
 /// the exit stop report 0, and continue the tracee into it.
+/// Wait (privately, targeted waitpid: no other tracee's
+/// events are consumed) for the tracee's next syscall stop,
+/// suppressing any signal stops on the way. Event stops
+/// abort: they belong to the main loop's bookkeeping and
+/// must not be silently swallowed.
+fn wait_one_syscall_stop(pid: i32) -> Option<()> {
+    for _ in 0..32 {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, WALL) };
+        if r <= 0 {
+            return None;
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            sup!("binder: fd injection lost pid={pid} (exited during injection)");
+            return None;
+        }
+        if libc::WIFSTOPPED(status) {
+            let sig = libc::WSTOPSIG(status);
+            let event = (status >> 16) & 0xffff;
+            if sig == (libc::SIGTRAP | 0x80) && event == 0 {
+                return Some(());
+            }
+            if event != 0 {
+                sup!("binder: fd injection hit an event stop pid={pid} event={event}; aborting");
+                return None;
+            }
+            // Signal stop: suppress and keep waiting. (A late
+            // SIGSYS belonging to the parked call is harmless
+            // to suppress here; its rescue record still stands
+            // and its value was already fabricated.)
+            cont_syscall(pid, 0);
+        }
+    }
+    None
+}
+
+/// Run one openat("/proc/<sender>/fd/<n>") inside a tracee
+/// stopped at a syscall stop and return the new fd (or a
+/// negative value). The first ride uses the stop we are
+/// already sitting on; later rides rewind the PC to the svc
+/// instruction and drive entry+exit privately. On return
+/// `regs` holds the exit-stop registers of the injected
+/// call.
+fn inject_openat(
+    pid: i32,
+    compat: bool,
+    path_addr: u64,
+    entry_pc: u64,
+    rewind: bool,
+    regs: &mut Regs,
+) -> i64 {
+    if rewind {
+        regs.set_pc(entry_pc);
+    }
+    let nr_openat: u64 = if compat { 322 } else { 56 };
+    regs.set_nr(nr_openat);
+    regs.set_arg(0, (-100i32) as i64 as u64); // AT_FDCWD
+    regs.set_arg(1, path_addr);
+    regs.set_arg(2, 2); // O_RDWR
+    regs.set_arg(3, 0);
+    if !set_regs(pid, regs) {
+        return -1;
+    }
+    if !set_syscallno(pid, nr_openat as i32) {
+        sup!("binder: fd injection NT_ARM_SYSTEM_CALL failed pid={pid}");
+        return -1;
+    }
+    cont_syscall(pid, 0);
+    let mut stops_needed = if rewind { 2 } else { 1 };
+    loop {
+        match wait_one_syscall_stop(pid) {
+            Some(()) => {
+                stops_needed -= 1;
+                if stops_needed == 0 {
+                    match get_regs(pid, compat) {
+                        Some(r) => {
+                            *regs = r;
+                            return r.retval();
+                        }
+                        None => return -1,
+                    }
+                }
+                cont_syscall(pid, 0);
+            }
+            None => return -1,
+        }
+    }
+}
+
+/// Resolve one wake's FD fixups: make the receiver open
+/// each sender fd itself, patch the parcel words in its
+/// arena file, then settle its parked call. The rides
+/// consume the parked entry->exit transition, so the
+/// recorded inject is applied here exactly as the exit-stop
+/// branch would (value set, record marked applied and left
+/// standing for the late-SIGSYS rescue). When every fixup
+/// is a cache hit nothing is ridden and the ordinary flow
+/// is left untouched.
+fn resolve_fd_fixups(
+    pid: i32,
+    procs: &mut HashMap<i32, ProcState>,
+    st: &mut BinderState,
+    arena: &str,
+    fixups: &[FdFixup],
+) {
+    let Some(proc0) = procs.get(&pid) else {
+        return;
+    };
+    let compat = proc0.compat;
+    let Some(mut regs) = get_regs(pid, compat) else {
+        return;
+    };
+    let entry_pc = regs.pc();
+    let mut cursor = regs.sp().saturating_sub(256);
+    let mut rides = 0;
+    for fx in fixups {
+        let cache_key = (arena.to_string(), fx.sender_pid, fx.sender_fd);
+        let newfd: i64 = if let Some(fd) = st.fd_cache.get(&cache_key) {
+            *fd as i64
+        } else {
+            let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
+            let fd = match scratch_write(pid, &mut cursor, &path) {
+                Some(addr) => inject_openat(pid, compat, addr, entry_pc, rides > 0, &mut regs),
+                None => -1,
+            };
+            rides += 1;
+            if fd >= 0 {
+                st.fd_cache.insert(cache_key, fd as i32);
+            }
+            fd
+        };
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(arena) {
+            use std::os::unix::fs::FileExt;
+            let _ = f.write_all_at(&(newfd as u32).to_le_bytes(), fx.file_off);
+        }
+        sup!(
+            "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup)",
+            fx.sender_fd,
+            fx.sender_pid,
+            newfd,
+            pid
+        );
+    }
+    if rides == 0 {
+        return;
+    }
+    if let Some(proc) = procs.get_mut(&pid) {
+        if let Some(pend) = proc.pending.as_mut() {
+            if let Some(v) = pend.inject {
+                if !pend.rescue_only {
+                    regs.set_retval(v);
+                    if set_regs(pid, &regs) {
+                        pend.applied = true;
+                    }
+                    if let Some(d) = &pend.desc {
+                        sys!("{d} => {v}");
+                    }
+                }
+            }
+        }
+        proc.expect_exit = false;
+    }
+}
+
 fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut BinderState) {
     let Some(park) = st.parked.remove(&pid) else {
         return;
@@ -2025,6 +2236,15 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
     // applies the 0 and retains the record, the late SIGSYS
     // is rescued and consumes it. (No regs surgery here: the
     // exit stop applies the inject itself.)
+    // FD fixups, if this delivery carried any, resolve while
+    // the receiver is still parked: it opens the senders'
+    // fds itself under supervisor control, and its parked
+    // call is settled by the resolver (see resolve_fd_fixups).
+    if let Some(fixups) = st.fd_pending.remove(&arena) {
+        if !fixups.is_empty() {
+            resolve_fd_fixups(pid, procs, st, &arena, &fixups);
+        }
+    }
     cont_syscall(pid, 0);
 }
 
