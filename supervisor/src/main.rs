@@ -867,6 +867,10 @@ struct Pending {
     /// length). At the exit stop the returned address becomes
     /// the arena base for this thread.
     mmap_binder: Option<(String, u32)>,
+    /// A compat mprotect in flight: (addr, prot). The exit
+    /// stop names the target VMA when the host refuses the
+    /// call (0.9.31 telemetry).
+    mprot: Option<(u64, u64)>,
 }
 
 struct ProcState {
@@ -2411,6 +2415,50 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
     off
 }
 
+/// One-shot latch for the success-side VMA sample.
+static MPROT_OK_SAMPLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Name the VMA containing `addr` in tracee `pid`:
+/// its perms and backing path from /proc/<pid>/maps.
+/// Telemetry for the mprotect refusals (0.9.31): the
+/// host keeps denying PROT_EXEC on the pixelflinger
+/// mspace VMA even when the mapping is born RWX, while
+/// other file VMAs in the same process take the same
+/// call -- this names what the denied VMA actually is.
+fn vma_desc(pid: i32, addr: u64) -> String {
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return "<maps unreadable>".to_string();
+    };
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let Some(range) = it.next() else { continue };
+        let Some((lo, hi)) = range.split_once('-') else { continue };
+        let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+        let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+        if addr >= lo && addr < hi {
+            let perms = it.next().unwrap_or("????");
+            let path = it.nth(3).unwrap_or("");
+            return format!("{perms} {}", if path.is_empty() { "[anon]" } else { path });
+        }
+    }
+    "<no vma>".to_string()
+}
+
+/// The SELinux context of a process (self when
+/// pid <= 0), for the same telemetry: if the denied
+/// files' creator runs in another domain, it shows.
+fn selinux_ctx(pid: i32) -> String {
+    let p = if pid <= 0 {
+        "/proc/self/attr/current".to_string()
+    } else {
+        format!("/proc/{pid}/attr/current")
+    };
+    std::fs::read_to_string(p)
+        .map(|s| s.trim_end_matches(['\0', '\n']).to_string())
+        .unwrap_or_else(|_| "<ctx unreadable>".to_string())
+}
+
 /// Telemetry (0.9.27): when the context manager itself is
 /// handed read bytes, name the command words. GB
 /// servicemanager exits its loop (and the process) on
@@ -3800,6 +3848,7 @@ fn read_context() -> String {
 }
 
 fn main() {
+    sup!("supervisor ctx: [{}]", selinux_ctx(0));
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 {
         sup!("usage: libsupervisor.so <rootfs_abs_path> <guest_abs_path> [-- guest_argv...]");
@@ -4074,7 +4123,11 @@ fn main() {
                     peercred: None,
                     binder_parked: false,
                     mmap_binder: None,
+                    mprot: None,
                 };
+                if proc.compat && nr == 125 {
+                    pend.mprot = Some((regs.arg(0), regs.arg(2)));
+                }
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
                     && pid == root_pid
@@ -4591,7 +4644,35 @@ fn main() {
                             // the mspace growth path also
                             // mprotects, and its failure
                             // NULLs allocations the same way.
-                            sup!("mprotect FAILED pid={pid} ret={ret}");
+                            // 0.9.31: name the denied VMA and
+                            // the caller's context.
+                            let (addr, prot) = pend.mprot.unwrap_or((0, 0));
+                            sup!(
+                                "mprotect FAILED pid={pid} ret={ret} addr={addr:#x} prot={prot:#x} vma=[{}] ctx=[{}]",
+                                vma_desc(pid, addr),
+                                selinux_ctx(pid)
+                            );
+                        }
+                        if proc.compat
+                            && pend.nr == 125
+                            && ret == 0
+                            && pend.mprot.is_some_and(|(_, p)| p & 7 == 7)
+                            && !MPROT_OK_SAMPLED.swap(
+                                true,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                        {
+                            // Success-side sample (0.9.31):
+                            // the first RWX mprotect the host
+                            // ACCEPTS, with its VMA named --
+                            // the contrast case for the
+                            // denials above.
+                            let (addr, _) = pend.mprot.unwrap();
+                            sup!(
+                                "mprotect RWX ok sample pid={pid} addr={addr:#x} vma=[{}] ctx=[{}]",
+                                vma_desc(pid, addr),
+                                selinux_ctx(pid)
+                            );
                         }
                         if let Some((optval, optlen)) = pend.peercred {
                             if ret == 0 {
