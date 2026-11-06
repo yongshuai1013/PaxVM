@@ -123,6 +123,7 @@ class MainActivity : Activity() {
         "    start servicemanager",
         "    start surfaceflinger",
         "    start bootanimation",
+        "    start gbprobe",
         "    start paxprobe",
         "",
         "service paxprobe /bin/sh /probe.sh",
@@ -157,6 +158,20 @@ class MainActivity : Activity() {
         "service bootanimation /bin/sh /bootanim.sh",
         "    user graphics",
         "    group graphics",
+        "",
+        // S6 gun 4 (0.9.21): the graphics probe as its own
+        // init service under the graphics identity, for the
+        // same load-bearing reason as bootanimation above:
+        // run from the root probe script, createSurface's
+        // permission check parks SurfaceFlinger's thread in
+        // libbinder's getService("permission") wait loop
+        // forever -- that service never registers here.
+        // The probe waits for SurfaceFlinger itself, so it
+        // can start with the rest.
+        "service gbprobe /system/bin/gbprobe gprobe r1",
+        "    user graphics",
+        "    group graphics",
+        "    oneshot",
         "",
     ).joinToString("\n")
 
@@ -216,11 +231,10 @@ class MainActivity : Activity() {
         // S5c-era count) should see it.
         "sleep 5",
         "/system/bin/lbprobe list2",
-        // S6 gun 4 white-box: walk the real graphics client
-        // stack step by step (GB_ markers), the same road
-        // bootanimation dies on, with the lights on.
-        "/system/bin/paxsvc waitmgr",
-        "/system/bin/gbprobe gprobe r1",
+        // S6 gun 4 white-box: gbprobe walks the real
+        // graphics client stack step by step (GB_ markers)
+        // as its own init service (see gbInitRc) under the
+        // graphics identity, so nothing runs it from here.
         // S6 gun 4: the boot animation is SurfaceFlinger's
         // first real client; its gralloc buffers reach SF
         // inside binder parcels -- the FD-passing path
