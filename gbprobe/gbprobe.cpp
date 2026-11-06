@@ -245,20 +245,20 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         return 1;
     }
 
-    // Gun 5: behave like a real application -- keep
-    // posting. The 0.9.38 field run showed the posted
-    // circle composited ONLY inside the boot
-    // animation's 240x34 swap-rect band (bbox
-    // 120,383-359,416, 3.6k px of the expected 45k):
-    // SurfaceFlinger's partial-update repaint set
-    // contained no other dirty region, so a client
-    // that posts twice and goes quiet ages out of the
-    // repaint set entirely. A client that reposts --
-    // every real app -- re-dirties its bounds each
-    // cycle. If the circle now fills in and stays,
-    // the composition stack is faithful and the band
-    // was that aging artifact.
-    for (int i = 0; i < 300; i++) {
+    // Gun 5, closing form: the two proof rounds above
+    // are the verdict (GB_OK below); this loop only
+    // keeps the picture on screen until the scene is
+    // stopped, so it can be looked at in the shell
+    // preview at leisure. (History: the 'band' of the
+    // 0.9.38 run was the boot animation's own wordmark,
+    // not a clipped circle; the circle was absent
+    // because this layer sat under the animation's
+    // opaque plane -- its setLayer had never been
+    // wrapped in a transaction. 0.9.44 field run:
+    // circle + wordmark composited together, 45237 px,
+    // 16 consecutive censuses.)
+    marker_sfx("/data/GB_OK", sfx);
+    for (;;) {
         Surface::SurfaceInfo inf;
         st = surf->lock(&inf);
         if (st != NO_ERROR || inf.bits == NULL) break;
@@ -266,7 +266,5 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         if (surf->unlockAndPost() != NO_ERROR) break;
         usleep(100 * 1000);
     }
-
-    marker_sfx("/data/GB_OK", sfx);
     return 0;
 }
