@@ -1899,6 +1899,11 @@ fn binder_handle_txn(
             }
         }
         binder_maybe_wake(st, &w.sender_arena, wakes);
+        sup!(
+            "binder: reply ({}B) delivered for waiter pid {}",
+            tdata.len(),
+            w.sender_pid
+        );
         notes.push(format!("REPLY -> pid {} ({}B)", w.sender_pid, tdata.len()));
         return;
     }
@@ -2032,7 +2037,7 @@ fn binder_write_read(
     if notes.is_empty() {
         notes.push("no work".to_string());
     }
-    format!("binder WRITE_READ [{}]", notes.join("; "))
+    format!("binder WRITE_READ pid={pid} [{}]", notes.join("; "))
 }
 
 /// Finish a parked binder ioctl now that its arena has bytes:
@@ -2216,6 +2221,9 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
         let n = bp.queue.len().min(park.read_size as usize);
         bp.queue.drain(..n).collect()
     };
+    if !bytes.is_empty() {
+        sup!("binder: waking pid={pid} with {}B of queued work", bytes.len());
+    }
     if bytes.is_empty() {
         st.parked.insert(pid, park);
         return;
