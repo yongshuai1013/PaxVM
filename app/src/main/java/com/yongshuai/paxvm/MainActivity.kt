@@ -200,13 +200,17 @@ class MainActivity : Activity() {
         "/system/bin/lbprobe list2",
         // S6 gun 4: the boot animation as SurfaceFlinger's
         // first real client. Its gralloc buffers reach SF
-        // inside binder parcels -- the FD-passing path. It
-        // starts only after fbprobe's ~25 s are done, so the
-        // two never fight over the framebuffer; the SDK
-        // image carries no bootanimation.zip, so the stock
-        // built-in ANDROID wordmark animation plays.
-        "sleep 21",
-        "/system/bin/bootanimation &",
+        // inside binder parcels -- the FD-passing path
+        // (field-proven 0.9.1: SF's reply fd 9 became the
+        // client's fd 4). It starts as soon as fbprobe's
+        // ~25 s are done; the retry loop covers the case of
+        // it asking the manager for SurfaceFlinger a moment
+        // before SF registered (it exits at once then, and
+        // the loop relaunches it -- once connected it never
+        // exits on its own). The SDK image carries no
+        // bootanimation.zip, so the built-in ANDROID
+        // wordmark animation plays.
+        "while true; do /system/bin/bootanimation; sleep 1; done &",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
