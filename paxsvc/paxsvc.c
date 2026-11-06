@@ -30,6 +30,11 @@ void *mmap(void *addr, unsigned length, int prot, int flags, int fd, int offset)
 int munmap(void *addr, unsigned length);
 int mkdir(const char *path, int mode);
 void _exit(int status);
+struct pax_timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+int nanosleep(const struct pax_timespec *req, struct pax_timespec *rem);
 
 /* ---- memory/string helpers (also satisfy compiler-emitted
  * calls; the __aeabi_ aliases are the ARM EABI spellings) ---- */
@@ -485,6 +490,72 @@ static int do_list(const char *mprefix) {
     return 0;
 }
 
+static int text_contains(const char *text, u32 tlen, const char *needle) {
+    u32 nlen = 0, i, j;
+    while (needle[nlen]) nlen++;
+    if (nlen == 0 || tlen < nlen) return 0;
+    for (i = 0; i + nlen <= tlen; i++) {
+        for (j = 0; j < nlen; j++) {
+            if (text[i + j] != needle[j]) break;
+        }
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+/* waitmgr: poll the manager's service list until
+ * "SurfaceFlinger" is registered, then return 0. Clients
+ * launched in parallel with the manager at boot (the
+ * bootanimation service) must not speak to handle 0 before
+ * the manager is up: the driver answers DEAD_REPLY, and
+ * the stock bootanimation wedges on it instead of
+ * retrying (0.9.3 device run -- SurfaceFlinger and paxsvc
+ * both recover on their own, bootanimation does not).
+ * Silent: writes no files and no markers. */
+static int do_waitmgr(void) {
+    int attempt;
+    for (attempt = 0; attempt < 900; attempt++) {
+        int fd = binder_open_guest();
+        if (fd >= 0) {
+            static char text[2048];
+            u32 tlen = 0, n;
+            int complete = 1;
+            for (n = 0; n < 64; n++) {
+                struct parcel msg;
+                struct rparcel reply;
+                u32 flags = 0, slen = 0, i;
+                const u16 *s;
+                p_init(&msg);
+                p_svcmgr_header(&msg);
+                p_u32(&msg, n);
+                if (binder_call(fd, 0, SVC_MGR_LIST_SERVICES, &msg, &reply, &flags) < 0) {
+                    complete = 0;
+                    break;
+                }
+                if (flags & TF_STATUS_CODE) {
+                    free_reply(fd, &reply);
+                    break;
+                }
+                s = r_str16(&reply, &slen);
+                for (i = 0; i < slen && tlen + 1 < sizeof(text); i++)
+                    text[tlen++] = (char)(s[i] & 0x7f);
+                if (tlen + 1 < sizeof(text)) text[tlen++] = '\n';
+                free_reply(fd, &reply);
+            }
+            close(fd);
+            if (complete && text_contains(text, tlen, "SurfaceFlinger"))
+                return 0;
+        }
+        {
+            struct pax_timespec ts;
+            ts.tv_sec = 1;
+            ts.tv_nsec = 0;
+            nanosleep(&ts, (struct pax_timespec *)0);
+        }
+    }
+    return 1;
+}
+
 /* ---- pinggone mode: GET must come back empty (S5c) ---- */
 /* After the owner dies, stock servicemanager keeps the
  * name listed but zeroes its pointer, and do_find_service
@@ -557,6 +628,7 @@ int guest_main(int argc, char **argv, char **envp) {
         else if (xstreq(argv[i], "serveonce")) rc = do_serve(1);
         else if (xstreq(argv[i], "list")) rc = do_list("/data/LIST_N_");
         else if (xstreq(argv[i], "listd")) rc = do_list("/data/LISTD_N_");
+        else if (xstreq(argv[i], "waitmgr")) rc = do_waitmgr();
         else if (xstreq(argv[i], "ping")) rc = do_ping();
         else if (xstreq(argv[i], "pinggone")) rc = do_gone();
         else continue;

@@ -310,6 +310,7 @@ jobs:
           int open(void){return 0;} int close(void){return 0;} int read(void){return 0;}
           int write(void){return 0;} int ioctl(void){return 0;} void *mmap(void){return 0;}
           int munmap(void){return 0;} int mkdir(void){return 0;} void _exit(int x){(void)x;}
+          int nanosleep(void){return 0;}
           void __libc_init(void){}
           CEOF
           "$TC/clang" --target=armv7a-linux-androideabi -nostdlib -shared \

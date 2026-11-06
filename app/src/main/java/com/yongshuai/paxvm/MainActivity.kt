@@ -465,12 +465,18 @@ class MainActivity : Activity() {
         }
         writeFresh(File(rootfs, "init.rc"), gbInitRc)
         writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
-        // The bootanimation init service's wrapper: retry
-        // until SurfaceFlinger is registered, then the
-        // animation runs for the rest of the session.
+        // The bootanimation init service's wrapper: first
+        // wait until the service manager answers and
+        // SurfaceFlinger is registered (paxsvc waitmgr --
+        // asked earlier, the manager's seat is still empty,
+        // the driver answers DEAD_REPLY, and the stock
+        // bootanimation wedges on that instead of retrying;
+        // 0.9.3 device run), then run the animation with a
+        // relaunch loop as a second belt.
         writeFresh(
             File(rootfs, "bootanim.sh"),
-            "while true; do /system/bin/bootanimation; sleep 1; done\n"
+            "/system/bin/paxsvc waitmgr\n" +
+                "while true; do /system/bin/bootanimation; sleep 1; done\n"
         )
         // init reads the kernel cmdline for androidboot.hardware
         // (and looks for /init.<hardware>.rc, absent on purpose).
