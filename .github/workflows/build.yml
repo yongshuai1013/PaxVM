@@ -428,7 +428,14 @@ jobs:
           # failed device run at a time is waste. The
           # explicit list above stays as the assert net;
           # this overlay only adds files.
-          debugfs -R "rdump /lib gbsys" armeabi-v7a/system.img 2>/dev/null
+          # rdump refuses a target directory that already
+          # exists ("File exists while making directory")
+          # and the refusal was invisible behind 2>/dev/null
+          # in run #98 -- only the assert below caught it.
+          # Stage into a scratch dir and merge instead.
+          rm -rf /tmp/gblib && mkdir -p /tmp/gblib
+          debugfs -R "rdump /lib /tmp/gblib" armeabi-v7a/system.img 2>/dev/null
+          cp -a /tmp/gblib/lib/. gbsys/lib/
           test -s gbsys/lib/libmedia_jni.so || { echo "missing libmedia_jni.so" >&2; exit 1; }
           # The overlay just overwrote lib/egl/egl.cfg with
           # the image's own (emulator GL stack). Re-assert
