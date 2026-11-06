@@ -2445,6 +2445,66 @@ fn vma_desc(pid: i32, addr: u64) -> String {
     "<no vma>".to_string()
 }
 
+/// The VMA containing `addr` in tracee `pid` as
+/// (lo, hi, perms, path); None when unmapped.
+fn vma_range(pid: i32, addr: u64) -> Option<(u64, u64, String, String)> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let range = it.next()?;
+        let (lo, hi) = range.split_once('-')?;
+        let lo = u64::from_str_radix(lo, 16).ok()?;
+        let hi = u64::from_str_radix(hi, 16).ok()?;
+        if addr >= lo && addr < hi {
+            let perms = it.next()?.to_string();
+            let path = it.nth(3).unwrap_or("").to_string();
+            return Some((lo, hi, perms, path));
+        }
+    }
+    None
+}
+
+/// Ride an anonymous MAP_FIXED mmap over [addr,
+/// addr+len) in the stopped tracee, in the style of
+/// inject_openat: overwrite the current syscall's
+/// registers, run it to its exit stop, report the
+/// result. Consumes the caller's entry->exit
+/// transition exactly like a fixup ride.
+fn inject_mmap(
+    pid: i32,
+    compat: bool,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    regs: &mut Regs,
+) -> i64 {
+    let nr_mmap: u64 = if compat { 192 } else { 222 };
+    regs.set_nr(nr_mmap);
+    regs.set_arg(0, addr);
+    regs.set_arg(1, len);
+    regs.set_arg(2, prot);
+    regs.set_arg(3, 0x32); // MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
+    regs.set_arg(4, (-1i32) as i64 as u64);
+    regs.set_arg(5, 0);
+    if !set_regs(pid, regs) {
+        return -1;
+    }
+    if !set_syscallno(pid, nr_mmap as i32) {
+        return -1;
+    }
+    cont_syscall(pid, 0);
+    match wait_one_syscall_stop(pid) {
+        Some(()) => match get_regs(pid, compat) {
+            Some(r) => {
+                *regs = r;
+                r.retval()
+            }
+            None => -1,
+        },
+        None => -1,
+    }
+}
+
 /// The SELinux context of a process (self when
 /// pid <= 0), for the same telemetry: if the denied
 /// files' creator runs in another domain, it shows.
@@ -4260,22 +4320,81 @@ fn main() {
                     ));
                     dirty = true;
                 } else if proc.compat && nr == 125 && (regs.arg(2) & 0x4) != 0 {
-                    // Telemetry only (0.9.26): an mprotect
-                    // that adds PROT_EXEC passes through
-                    // untouched, but the desc makes the exit
-                    // stop print the host's verdict.
-                    // Pixelflinger's Assembly frees its code
-                    // buffer and NULLs the base when this
-                    // call fails (ensureMbaseExecutable),
-                    // and the assembler then emits into
-                    // address 0 -- the SurfaceFlinger
-                    // +0xec0a crash signature (mPC=0,
-                    // prologue word in hand).
+                    // An mprotect that adds PROT_EXEC.
+                    // On a virtual-ashmem VMA the host
+                    // refuses it outright (-13), no matter
+                    // the mapping's current perms -- the
+                    // 0.9.31 maps evidence shows the denied
+                    // VMA rw-p over our region file while a
+                    // libc VMA in the same process sits
+                    // rwxp and passes. The mspace is
+                    // MAP_PRIVATE, so its pages are
+                    // process-local: satisfy the call by
+                    // remapping the range anonymous with
+                    // its contents preserved (0.9.32).
+                    // Anonymous exec transitions ride on
+                    // the app domain's execmem grant, the
+                    // same reason ART's JIT works.
+                    let addr = regs.arg(0);
+                    let len = regs.arg(1);
+                    let prot = regs.arg(2);
+                    let page_start = addr & !0xfff;
+                    let page_end = (addr + len + 0xfff) & !0xfff;
+                    let mut handled = false;
+                    if page_end > page_start
+                        && page_end - page_start <= (8 << 20)
+                    {
+                        if let Some((vlo, vhi, _p, path)) =
+                            vma_range(pid, addr)
+                        {
+                            if path.contains("/.ashmem/")
+                                && page_start >= vlo
+                                && page_end <= vhi
+                            {
+                                if let Some(contents) = read_mem_vec(
+                                    pid,
+                                    page_start,
+                                    (page_end - page_start) as usize,
+                                ) {
+                                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                                    let r = inject_mmap(
+                                        pid,
+                                        proc.compat,
+                                        page_start,
+                                        page_end - page_start,
+                                        prot,
+                                        &mut regs,
+                                    );
+                                    if r == page_start as i64
+                                        && write_mem(pid, page_start, &contents)
+                                            .is_ok()
+                                    {
+                                        regs.set_retval(0);
+                                        if set_regs(pid, &regs) {
+                                            pend.applied = true;
+                                        }
+                                        sup!(
+                                            "mprotect: ashmem range {page_start:#x}..{page_end:#x} of pid={pid} converted to anonymous ({} bytes preserved)",
+                                            contents.len()
+                                        );
+                                    } else {
+                                        pend.inject = Some(-13);
+                                        regs.set_retval(-13);
+                                        if set_regs(pid, &regs) {
+                                            pend.applied = true;
+                                        }
+                                        sup!(
+                                            "mprotect: anonymous conversion FAILED for pid={pid} at {page_start:#x} (ride={r}); guest gets -13 as before"
+                                        );
+                                    }
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
                     pend.desc = Some(format!(
-                        "mprotect EXEC addr=0x{:x} len={} prot={:#x}",
-                        regs.arg(0),
-                        regs.arg(1),
-                        regs.arg(2)
+                        "mprotect EXEC addr=0x{addr:x} len={len} prot={prot:#x}{}",
+                        if handled { " (ashmem conversion attempted)" } else { "" }
                     ));
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
