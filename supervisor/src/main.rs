@@ -1389,17 +1389,21 @@ impl BinderProc {
             own
         }
     }
-    fn drain_for(&mut self, pid: i32, max: usize) -> Vec<u8> {
+    /// Drains up to `max` bytes for this thread; returns the
+    /// bytes plus how many came from the inbound stream.
+    fn drain_for(&mut self, pid: i32, max: usize) -> (Vec<u8>, usize) {
         let mut out = Vec::new();
         if let Some(q) = self.queues.get_mut(&pid) {
             let n = q.len().min(max);
             out.extend(q.drain(..n));
         }
+        let mut from_inbound = 0;
         if out.len() < max && self.loopers.contains(&pid) {
             let n = self.inbound.len().min(max - out.len());
+            from_inbound = n;
             out.extend(self.inbound.drain(..n));
         }
-        out
+        (out, from_inbound)
     }
 }
 
@@ -1727,8 +1731,35 @@ fn binder_deliver(
             bp.push_to(pid, &txn);
         }
         _ => {
-            bp.inbound.extend_from_slice(&br_cmd.to_le_bytes());
-            bp.inbound.extend_from_slice(&txn);
+            // An inbound transaction goes straight into a
+            // parked looper's personal queue when one is
+            // waiting; the shared inbound stream is only the
+            // fallback for "nobody home". Leaving it in the
+            // stream whenever possible starved once already:
+            // the looper kept waking for its own replies and
+            // its drain never reached the pooled transaction.
+            let parked_looper = st
+                .parked
+                .keys()
+                .find(|p| {
+                    bp.loopers.contains(p)
+                        && st
+                            .thread_arena
+                            .get(p)
+                            .map(|a| a == target)
+                            .unwrap_or(false)
+                })
+                .copied();
+            match parked_looper {
+                Some(p) => {
+                    bp.push_to(p, &br_cmd.to_le_bytes());
+                    bp.push_to(p, &txn);
+                }
+                None => {
+                    bp.inbound.extend_from_slice(&br_cmd.to_le_bytes());
+                    bp.inbound.extend_from_slice(&txn);
+                }
+            }
         }
     }
     Ok(())
@@ -2066,7 +2097,7 @@ fn binder_write_read(
         let bytes: Vec<u8> = st
             .procs
             .get_mut(&arena)
-            .map(|bp| bp.drain_for(pid, n))
+            .map(|bp| bp.drain_for(pid, n).0)
             .unwrap_or_default();
         let _ = write_mem(pid, rb as u64, &bytes);
         let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
@@ -2269,7 +2300,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
     let Some(arena) = st.thread_arena.get(&pid).cloned() else {
         return;
     };
-    let bytes: Vec<u8> = {
+    let (bytes, from_inbound) = {
         let Some(bp) = st.procs.get_mut(&arena) else {
             return;
         };
@@ -2277,7 +2308,11 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
         bp.drain_for(pid, n)
     };
     if !bytes.is_empty() {
-        sup!("binder: waking pid={pid} with {}B of queued work", bytes.len());
+        sup!(
+            "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
+            bytes.len(),
+            from_inbound
+        );
     }
     if bytes.is_empty() {
         st.parked.insert(pid, park);
