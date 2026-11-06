@@ -1461,6 +1461,22 @@ impl BinderProc {
             own
         }
     }
+    /// Copies up to `max` bytes of this thread's readable
+    /// stream (own queue first, then the inbound stream
+    /// for loopers) without draining -- the same order
+    /// drain_for serves.
+    fn peek_for(&self, pid: i32, max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(q) = self.queues.get(&pid) {
+            let n = q.len().min(max);
+            out.extend_from_slice(&q[..n]);
+        }
+        if out.len() < max && self.loopers.contains(&pid) {
+            let n = self.inbound.len().min(max - out.len());
+            out.extend_from_slice(&self.inbound[..n]);
+        }
+        out
+    }
     /// Drains up to `max` bytes for this thread; returns the
     /// bytes plus how many came from the inbound stream.
     fn drain_for(&mut self, pid: i32, max: usize) -> (Vec<u8>, usize) {
@@ -2293,12 +2309,25 @@ fn binder_write_read(
         .get(&arena)
         .map(|p| p.readable_for(pid))
         .unwrap_or(0);
-    if rs > 0 && queue_len > 0 {
-        let n = queue_len.min(rs as usize);
+    // Never split a BR command across reads (see
+    // br_prefix_len): fill only up to a command
+    // boundary inside the reader's buffer; the rest
+    // stays queued for its next read.
+    let fill_n = if rs > 0 && queue_len > 0 {
+        let peek = st
+            .procs
+            .get(&arena)
+            .map(|p| p.peek_for(pid, rs as usize))
+            .unwrap_or_default();
+        br_prefix_len(&peek, rs as usize)
+    } else {
+        0
+    };
+    if fill_n > 0 {
         let bytes: Vec<u8> = st
             .procs
             .get_mut(&arena)
-            .map(|bp| bp.drain_for(pid, n).0)
+            .map(|bp| bp.drain_for(pid, fill_n).0)
             .unwrap_or_default();
         dump_mgr_read(st, &arena, pid, &bytes);
         let _ = write_mem(pid, rb as u64, &bytes);
@@ -2351,6 +2380,35 @@ fn binder_write_read(
         notes.push("no work".to_string());
     }
     format!("binder WRITE_READ pid={pid} [{}]", notes.join("; "))
+}
+
+/// Length of the longest prefix of a BR command stream
+/// that ends on a command boundary and fits in `cap`.
+/// A real binder driver never splits a command across
+/// reads; our byte-granular drains did, and GB
+/// servicemanager's 128-byte read buffer made the flaw
+/// fatal: three flushed transactions (132B) arrived in
+/// one read, the third was cut 4 bytes short, and its
+/// binder_parse returned "txn too small" -- the
+/// manager's clean exit(0) after serving flushed work
+/// (0.9.26/0.9.29 device runs). Deliveries must be
+/// cut only between commands.
+fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        let len = match cmd {
+            BR_TRANSACTION | BR_REPLY => 44,
+            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
+            BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => 8,
+            _ => 4,
+        };
+        if off + len > cap || off + len > bytes.len() {
+            break;
+        }
+        off += len;
+    }
+    off
 }
 
 /// Telemetry (0.9.27): when the context manager itself is
@@ -2578,7 +2636,11 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
         let Some(bp) = st.procs.get_mut(&arena) else {
             return;
         };
-        let n = bp.readable_for(pid).min(park.read_size as usize);
+        // Command-boundary cut, same rule as the inline
+        // fill (br_prefix_len): a parked reader woken
+        // with a split command is the same poison.
+        let peek = bp.peek_for(pid, park.read_size as usize);
+        let n = br_prefix_len(&peek, park.read_size as usize);
         bp.drain_for(pid, n)
     };
     if !bytes.is_empty() {
