@@ -1361,7 +1361,48 @@ fn entry_fb_ioctl(
                 Some(format!("nz={}/{}", nz(&head), nz(&tail)))
             })()
             .unwrap_or_else(|| "nz=?".to_string());
-            format!("fb PAN yoffset={yoff} (page {}) {fp}", yoff / FB_H)
+            // Alongside the framebuffer page, fingerprint
+            // every virtual ashmem file the same way, so
+            // the log shows whether animation pixels ever
+            // land in the shared buffers at all.
+            let ash = (|| -> String {
+                use std::os::unix::fs::FileExt;
+                let mut parts: Vec<String> = Vec::new();
+                let Ok(rd) = std::fs::read_dir(format!("{rootfs}/.ashmem")) else {
+                    return String::new();
+                };
+                let mut names: Vec<_> = rd.flatten().collect();
+                names.sort_by_key(|e| e.file_name());
+                for e in names.iter().take(6) {
+                    let Ok(f) = std::fs::File::open(e.path()) else {
+                        continue;
+                    };
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    if len < 2048 {
+                        continue;
+                    }
+                    let mut h = [0u8; 1024];
+                    let mut m = [0u8; 1024];
+                    if f.read_exact_at(&mut h, 0).is_err()
+                        || f.read_exact_at(&mut m, len / 2).is_err()
+                    {
+                        continue;
+                    }
+                    let nz = |b: &[u8]| b.iter().filter(|x| **x != 0).count();
+                    parts.push(format!(
+                        "{}:{}/{}",
+                        e.file_name().to_string_lossy(),
+                        nz(&h),
+                        nz(&m)
+                    ));
+                }
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ash[{}]", parts.join(","))
+                }
+            })();
+            format!("fb PAN yoffset={yoff} (page {}) {fp}{ash}", yoff / FB_H)
         }
         _ => {
             // FBIO_WAITFORVSYNC and anything else in the
