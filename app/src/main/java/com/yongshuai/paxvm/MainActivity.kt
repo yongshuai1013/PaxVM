@@ -554,6 +554,15 @@ class MainActivity : Activity() {
         // session empty so a saved log holds one session.
         File(rootfs, ".logs").deleteRecursively()
         File(rootfs, ".logs").mkdirs()
+        // The four channel files must PRE-EXIST: the
+        // guest opens its log devices O_WRONLY without
+        // O_CREAT (device nodes simply exist on
+        // hardware), and 0.9.50's field run showed every
+        // /dev/log open failing -2 on the missing files
+        // despite the supervisor mapping being right.
+        for (ch in listOf("main", "radio", "events", "system")) {
+            writeFresh(File(rootfs, ".logs/log-$ch"), "")
+        }
         // cpuacct surface (S7 gun 3): on hardware /acct is
         // a cgroup mount and zygote's startup touches
         // /acct/uid/0/tasks, creating the uid dir itself
