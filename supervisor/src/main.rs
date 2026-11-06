@@ -875,6 +875,10 @@ struct ProcState {
     /// Virtual cwd in guest path space; "/" at birth, inherited
     /// across fork/vfork/clone, unchanged by exec.
     vcwd: String,
+    /// Virtual signal mask for the compat sigprocmask
+    /// proxy (0.9.25): bookkeeping only -- delivery is not
+    /// filtered by it. See entry_sigprocmask.
+    sigmask: u32,
     /// True once we have set ptrace options at the initial stop.
     options_set: bool,
     /// True once the initial stop has been consumed and the process
@@ -907,6 +911,7 @@ impl ProcState {
             syscall_seen: false,
             is_root,
             compat,
+            sigmask: 0,
         }
     }
 }
@@ -3279,6 +3284,56 @@ fn entry_accept(pid: i32, regs: &mut Regs, pend: &mut Pending) -> String {
     "accept(285) -> accept4(366) rewritten (rescue armed: -EAGAIN if trapped)".to_string()
 }
 
+/// Compat sigprocmask(126), proxied onto a per-process
+/// virtual mask (0.9.25). The call normally passes its
+/// entry stop and runs on the host -- but from some
+/// libc stubs this device's seccomp filter traps it
+/// with SIGSYS anyway, and with no pending record the
+/// rescue cannot fire: in the 0.9.23 device run gbprobe
+/// died of SIGSYS inside the dynamic linker's signal
+/// masking while loading libGLESv1_CM.so, right after
+/// its surface flow had completed. Cancelling at entry
+/// and answering from a virtual mask takes the host out
+/// of the loop. The mask is bookkeeping only: signal
+/// delivery is NOT filtered by it (the tracee's real
+/// host-side mask belongs to the app process and must
+/// not be bent per-guest). Callers such as abort() --
+/// unmask, then raise -- still get their intended
+/// outcome, because the raise itself is delivered
+/// through the normal fatal-signal path.
+fn entry_sigprocmask(
+    pid: i32,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    mask: &mut u32,
+) -> String {
+    let how = regs.arg(0);
+    let setp = regs.arg(1);
+    let oldp = regs.arg(2);
+    if oldp != 0 && write_mem(pid, oldp, &mask.to_ne_bytes()).is_err() {
+        skip_syscall(pid, regs, pend, -14);
+        return "sigprocmask(126) oldset write failed -> -EFAULT".to_string();
+    }
+    if setp != 0 {
+        let Some(b) = read_mem_vec(pid, setp, 4) else {
+            skip_syscall(pid, regs, pend, -14);
+            return "sigprocmask(126) set unreadable -> -EFAULT".to_string();
+        };
+        let new = u32::from_ne_bytes(b[..4].try_into().unwrap());
+        match how {
+            0 => *mask |= new,
+            1 => *mask &= !new,
+            2 => *mask = new,
+            _ => {
+                skip_syscall(pid, regs, pend, -22);
+                return format!("sigprocmask(126) bad how={how} -> -EINVAL");
+            }
+        }
+    }
+    skip_syscall(pid, regs, pend, 0);
+    format!("sigprocmask(126) proxied (virtual mask now 0x{mask:08x})")
+}
+
 /// Resolve a canonical guest path through one symlink level inside
 /// the rootfs. Returns (final guest path, entity exists there).
 fn resolve_guest_target(rootfs: &str, abs: &str) -> (String, bool) {
@@ -4017,6 +4072,16 @@ fn main() {
                     // Compat accept: rewritten to accept4 (see
                     // entry_accept).
                     pend.desc = Some(entry_accept(pid, &mut regs, &mut pend));
+                    dirty = true;
+                } else if proc.compat && nr == 126 {
+                    // Compat sigprocmask: proxied onto a
+                    // virtual mask (see entry_sigprocmask).
+                    pend.desc = Some(entry_sigprocmask(
+                        pid,
+                        &mut regs,
+                        &mut pend,
+                        &mut proc.sigmask,
+                    ));
                     dirty = true;
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
