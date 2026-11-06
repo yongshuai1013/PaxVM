@@ -730,22 +730,80 @@ class MainActivity : Activity() {
                 } catch (e: Exception) {
                     ByteArray(0)
                 }
-                val sb = StringBuilder()
-                var run = StringBuilder()
-                for (b in bytes) {
-                    val c = (b.toInt() and 0xFF).toChar()
-                    if (c in ' '..'~' || c == '\n' || c == '\t') {
-                        run.append(c)
-                    } else {
-                        if (run.length >= 6) sb.append(run).append('\n')
-                        run = StringBuilder()
+                // Parse the GB logger_entry stream properly
+                // (20-byte header: u16 len, u16 pad, pid,
+                // tid, sec, nsec; payload = priority byte,
+                // NUL-terminated tag, message). The 0.9.51
+                // strings extraction drowned the signal:
+                // SurfaceFlinger's pixelflinger tag floods
+                // the channel, so its entries are dropped
+                // here and the runtime's own lines (Zygote,
+                // AndroidRuntime) survive to the saved log.
+                val entries = ArrayList<String>()
+                var off = 0
+                fun u16le(o: Int) =
+                    (bytes[o].toInt() and 0xFF) or
+                        ((bytes[o + 1].toInt() and 0xFF) shl 8)
+                fun i32le(o: Int) =
+                    (bytes[o].toInt() and 0xFF) or
+                        ((bytes[o + 1].toInt() and 0xFF) shl 8) or
+                        ((bytes[o + 2].toInt() and 0xFF) shl 16) or
+                        ((bytes[o + 3].toInt() and 0xFF) shl 24)
+                while (off + 20 <= bytes.size) {
+                    val len = u16le(off)
+                    if (len < 2 || len > 8192 ||
+                        off + 20 + len > bytes.size
+                    ) {
+                        off++
+                        continue
                     }
+                    val pid = i32le(off + 4)
+                    val prio = bytes[off + 20].toInt() and 0xFF
+                    var p = off + 21
+                    val tagStart = p
+                    while (p < off + 20 + len && bytes[p] != 0.toByte()) p++
+                    if (p >= off + 20 + len) {
+                        off++
+                        continue
+                    }
+                    val tag = String(bytes, tagStart, p - tagStart, Charsets.UTF_8)
+                    val msg = String(
+                        bytes,
+                        p + 1,
+                        (off + 20 + len - (p + 1)).coerceAtLeast(0),
+                        Charsets.UTF_8,
+                    ).trimEnd('\u0000', '\n')
+                    if (tag != "pixelflinger") {
+                        val pl = when (prio) {
+                            2 -> "V"; 3 -> "D"; 4 -> "I"
+                            5 -> "W"; 6 -> "E"; 7 -> "F"
+                            else -> prio.toString()
+                        }
+                        entries.add("$pl/$tag($pid): $msg")
+                    }
+                    off += 20 + len
                 }
-                if (run.length >= 6) sb.append(run).append('\n')
-                val body = sb.toString().takeLast(24000)
+                val body = if (entries.isNotEmpty()) {
+                    entries.takeLast(500).joinToString("\n")
+                } else {
+                    // Fallback: the old strings extraction.
+                    val sb = StringBuilder()
+                    var run = StringBuilder()
+                    for (b in bytes) {
+                        val c = (b.toInt() and 0xFF).toChar()
+                        if (c in ' '..'~' || c == '\n' || c == '\t') {
+                            run.append(c)
+                        } else {
+                            if (run.length >= 6) sb.append(run).append('\n')
+                            run = StringBuilder()
+                        }
+                    }
+                    if (run.length >= 6) sb.append(run).append('\n')
+                    sb.toString().takeLast(24000)
+                }
                 if (body.isNotEmpty()) {
                     guestLogs.append(
-                        "\n===== guest /dev/log/$ch (strings) =====\n",
+                        "\n===== guest /dev/log/$ch =====\n",
                     ).append(body)
                 }
             }
