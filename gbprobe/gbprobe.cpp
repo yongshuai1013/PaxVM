@@ -54,6 +54,29 @@ struct gb_cblk_t {
 
 using namespace android;
 
+// Gun 5 test card (the user's call): stop chasing the
+// dim boot wordmark -- draw one big bright circle
+// instead. Transparent elsewhere, opaque white disc
+// of radius min(w,h)/4 at the center: unmissable in
+// the preview, and its bounding box and pixel count
+// are known exactly, so the supervisor's page census
+// can verdict composition without eyeballing shades
+// of black.
+static void paint_circle(Surface::SurfaceInfo &info) {
+    uint32_t *px = (uint32_t *)info.bits;
+    const int cx = (int)info.w / 2;
+    const int cy = (int)info.h / 2;
+    const int r = (int)(info.w < info.h ? info.w : info.h) / 4;
+    for (uint32_t y = 0; y < info.h; y++) {
+        for (uint32_t x = 0; x < info.w; x++) {
+            const int dx = (int)x - cx;
+            const int dy = (int)y - cy;
+            px[y * info.s + x] = (dx * dx + dy * dy <= r * r)
+                ? 0xFFFFFFFFu : 0x00000000u;
+        }
+    }
+}
+
 static void marker(const char *path) { mkdir(path, 0); }
 
 static void marker_sfx(const char *base, const char *sfx) {
@@ -108,7 +131,7 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
     int tries_small = 0;
     while (tries_small < 5) {
         ctrl = client->createSurface(
-                getpid(), String8("gbprobe"), 0, 64, 64,
+                getpid(), String8("gbprobe"), 0, 480, 800,
                 PIXEL_FORMAT_RGBA_8888, 0);
         if (ctrl != NULL) break;
         tries_small++;
@@ -121,7 +144,7 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         int tries_big = 0;
         while (tries_big < 5) {
             ctrl = client->createSurface(
-                    getpid(), String8("gbprobe"), 0, 480, 800,
+                    getpid(), String8("gbprobe"), 0, 64, 64,
                     PIXEL_FORMAT_RGBA_8888, 0);
             if (ctrl != NULL) break;
             tries_big++;
@@ -169,7 +192,9 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         }
     }
 
-    ctrl->setLayer(100000);
+    // Above bootanimation's 0x40000000: its opaque black
+    // surface must not cover the test circle (gun 5).
+    ctrl->setLayer(0x40000001);
     marker_sfx("/data/GB_LAYER", sfx);
 
     sp<Surface> surf = ctrl->getSurface();
@@ -187,15 +212,7 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
     }
     marker_sfx("/data/GB_LOCK", sfx);
 
-    // Paint a solid color over the whole 64x64 surface.
-    {
-        uint32_t *px = (uint32_t *)info.bits;
-        for (uint32_t y = 0; y < info.h; y++) {
-            for (uint32_t x = 0; x < info.w; x++) {
-                px[y * info.s + x] = 0xFF00FF00u;
-            }
-        }
-    }
+    paint_circle(info);
     marker_sfx("/data/GB_DRAWN", sfx);
 
     st = surf->unlockAndPost();
@@ -208,6 +225,10 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
     Surface::SurfaceInfo info2;
     st = surf->lock(&info2);
     if (st == NO_ERROR && info2.bits != NULL) {
+        // Repaint: round 2 posts the OTHER buffer, and
+        // posting it blank would erase the circle from
+        // the composition for the rest of the run.
+        paint_circle(info2);
         surf->unlockAndPost();
         marker_sfx("/data/GB_ROUND2", sfx);
     } else {
