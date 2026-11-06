@@ -71,6 +71,13 @@ class MainActivity : Activity() {
     // and 下載日誌 serves it when this launch has not run
     // a session yet (the force-stop-and-reopen recovery).
     private var logFileOut: FileOutputStream? = null
+    // 0.9.54 batching: pending session-log text (guarded
+    // by logFileLock, flushed at 64 KB / 250 ms) and
+    // pending on-screen text (same lock, flushed to the
+    // TextView at most every 250 ms).
+    private val pendingLogText = StringBuilder()
+    private val pendingUiText = StringBuilder()
+    private var uiFlushPosted = false
     private val logFileLock = Object()
     private var previousLogFile: File? = null
     private var sessionRan = false
@@ -82,7 +89,6 @@ class MainActivity : Activity() {
     // and scrolls coalesce. The file keeps everything.
     private var lastUiLine: String? = null
     private var dupLineCount = 0
-    @Volatile private var scrollPosted = false
 
     /** Rootfs of the GB session whose framebuffer is being
      * previewed, or null. The preview thread polls while its
@@ -366,20 +372,62 @@ class MainActivity : Activity() {
                 previousLogFile = prev
             }
             logFileOut = FileOutputStream(cur, true)
+            // The 0.9.54 batching flusher: lands buffered
+            // session-log lines every 250 ms so the file
+            // trails reality by at most a quarter second
+            // even when nothing forces a flush.
+            thread(name = "log-flusher", isDaemon = true) {
+                while (true) {
+                    try {
+                        Thread.sleep(250)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    flushLogFile()
+                }
+            }
         } catch (e: Exception) {
             logFileOut = null
         }
     }
 
     private fun writeLogLineToFile(line: String) {
-        val out = logFileOut ?: return
-        try {
-            synchronized(logFileLock) {
-                out.write((line + "\n").toByteArray(Charsets.UTF_8))
+        // Batched since 0.9.54: a boot flood is ~70k
+        // lines, and one write syscall per line on an
+        // unbuffered stream was a real share of the
+        // boot-stretch interface stutter the user felt.
+        // Lines accumulate and land at 64 KB or on the
+        // flusher thread's 250 ms pass; content and
+        // order are unchanged, and saveLog flushes
+        // before it reads the file back.
+        synchronized(logFileLock) {
+            pendingLogText.append(line).append('\n')
+            if (pendingLogText.length >= 65536) {
+                flushPendingLogLocked()
             }
+        }
+    }
+
+    /** Caller holds logFileLock. */
+    private fun flushPendingLogLocked() {
+        val out = logFileOut ?: run {
+            pendingLogText.setLength(0)
+            return
+        }
+        if (pendingLogText.isEmpty()) return
+        try {
+            out.write(
+                pendingLogText.toString().toByteArray(Charsets.UTF_8),
+            )
         } catch (e: Exception) {
             // A dead log file must not break the session.
         }
+        pendingLogText.setLength(0)
+    }
+
+    /** Land every buffered line in the session file now. */
+    private fun flushLogFile() {
+        synchronized(logFileLock) { flushPendingLogLocked() }
     }
 
     private fun buildUi() {
@@ -709,6 +757,10 @@ class MainActivity : Activity() {
         // 0.9.23's view-first logic returned just the
         // trimmed tail for a session downloaded in the
         // same launch).
+        // Land the batched lines first (0.9.54): the
+        // newest quarter-second of the session must not
+        // be missing from the downloaded record.
+        flushLogFile()
         val prev = previousLogFile
         val cur = File(filesDir, "session-log.txt")
         val fromFile: File? = when {
@@ -961,6 +1013,11 @@ class MainActivity : Activity() {
             val pageFile = File(rootfs, ".fb-page")
             val pageBytes = 480 * 800 * 4
             val buf = ByteArray(pageBytes)
+            // 0.9.54: the boot stretch is when the guest
+            // floods the supervisor and the interface is
+            // tightest; run the preview at 2 fps for the
+            // first 75 seconds, then the usual 5 fps.
+            val previewStart = System.currentTimeMillis()
             while (fbSession === rootfs) {
                 try {
                     val yoff =
@@ -1012,7 +1069,9 @@ class MainActivity : Activity() {
                     // iteration (or the session end) sorts it.
                 }
                 try {
-                    Thread.sleep(200)
+                    val bootPhase =
+                        System.currentTimeMillis() - previewStart < 75_000
+                    Thread.sleep(if (bootPhase) 500 else 200)
                 } catch (_: InterruptedException) {
                     break
                 }
@@ -1032,36 +1091,52 @@ class MainActivity : Activity() {
         writeLogLineToFile(line)
         // The screen is a view, not the record: collapse
         // exact repeats so a log storm cannot drown the
-        // UI thread (0.9.22's frozen-interface run).
-        val collapsed: Int
+        // UI (0.9.22's frozen-interface run), and (0.9.54)
+        // accumulate the surviving lines
+        // into a batch that one UI pass appends at most
+        // every 250 ms -- a boot flood previously posted
+        // one UI-thread task per line (~70k per boot),
+        // which was the interface stutter itself.
+        val needPost: Boolean
         synchronized(logFileLock) {
             if (line == lastUiLine) {
                 dupLineCount++
                 return
             }
-            collapsed = dupLineCount
+            val collapsed = dupLineCount
             dupLineCount = 0
             lastUiLine = line
-        }
-        runOnUiThread {
             if (collapsed >= 3) {
-                logView.append("[shell] （上一行重複 $collapsed 次，畫面折疊；檔案有完整記錄）\n")
+                pendingUiText.append(
+                    "[shell] （上一行重複 $collapsed 次，畫面折疊；檔案有完整記錄）\n",
+                )
             }
-            logView.append(line + "\n")
-            // An ever-growing TextView makes every append
-            // re-lay-out the whole text; keep the tail.
-            val t = logView.text
-            if (t.length > 262144) {
-                logView.text = "［畫面只保留最近的日誌，完整記錄在日誌檔案］\n" +
-                    t.subSequence(131072, t.length)
-            }
-            if (!scrollPosted) {
-                scrollPosted = true
-                scrollView.postDelayed({
-                    scrollPosted = false
-                    scrollView.fullScroll(ScrollView.FOCUS_DOWN)
-                }, 200)
-            }
+            pendingUiText.append(line).append('\n')
+            needPost = !uiFlushPosted
+            if (needPost) uiFlushPosted = true
+        }
+        if (needPost) {
+            logView.postDelayed({
+                val batch: String
+                synchronized(logFileLock) {
+                    batch = pendingUiText.toString()
+                    pendingUiText.setLength(0)
+                    uiFlushPosted = false
+                }
+                if (batch.isNotEmpty()) {
+                    logView.append(batch)
+                    // An ever-growing TextView makes every
+                    // append re-lay-out the whole text;
+                    // keep the tail.
+                    val t = logView.text
+                    if (t.length > 262144) {
+                        logView.text =
+                            "［畫面只保留最近的日誌，完整記錄在日誌檔案］\n" +
+                            t.subSequence(131072, t.length)
+                    }
+                }
+                scrollView.fullScroll(ScrollView.FOCUS_DOWN)
+            }, 250)
         }
     }
 }

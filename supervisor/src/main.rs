@@ -319,14 +319,44 @@ fn nr_name64(nr: u64) -> &'static str {
 }
 
 // ---- line output (the shell's only view of us) ----
-static OUT_LOCK: Mutex<()> = Mutex::new(());
+// Batched since S7's field runs: a zygote preload makes
+// the guest issue ~70k logged calls in a few minutes,
+// and a flush per line put a pipe write on the
+// supervisor's critical path for every one of them --
+// the phone's interface stuttered for exactly that
+// stretch (user-reported twice). [sys] lines now
+// accumulate and flush at 16 KB or 100 ms, whichever
+// comes first; [sup] lines (state changes, verdicts)
+// still flush immediately, so nothing a human is
+// waiting on is ever delayed and no content is lost.
+struct OutState {
+    buf: String,
+    last: std::time::Instant,
+}
+static OUT: Mutex<Option<OutState>> = Mutex::new(None);
 
 fn emit(tag: &str, msg: &str) {
-    let _g = OUT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let stdout = std::io::stdout();
-    let mut h = stdout.lock();
-    let _ = writeln!(h, "[{tag}] {msg}");
-    let _ = h.flush();
+    let mut g = OUT.lock().unwrap_or_else(|p| p.into_inner());
+    let st = g.get_or_insert_with(|| OutState {
+        buf: String::new(),
+        last: std::time::Instant::now(),
+    });
+    st.buf.push('[');
+    st.buf.push_str(tag);
+    st.buf.push_str("] ");
+    st.buf.push_str(msg);
+    st.buf.push('\n');
+    if tag != "sys"
+        || st.buf.len() >= 16384
+        || st.last.elapsed() >= std::time::Duration::from_millis(100)
+    {
+        let stdout = std::io::stdout();
+        let mut h = stdout.lock();
+        let _ = h.write_all(st.buf.as_bytes());
+        let _ = h.flush();
+        st.buf.clear();
+        st.last = std::time::Instant::now();
+    }
 }
 
 macro_rules! sup {
