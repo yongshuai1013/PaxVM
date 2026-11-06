@@ -216,6 +216,11 @@ class MainActivity : Activity() {
         // S5c-era count) should see it.
         "sleep 5",
         "/system/bin/lbprobe list2",
+        // S6 gun 4 white-box: walk the real graphics client
+        // stack step by step (GB_ markers), the same road
+        // bootanimation dies on, with the lights on.
+        "/system/bin/paxsvc waitmgr",
+        "/system/bin/gbprobe gprobe r1",
         // S6 gun 4: the boot animation is SurfaceFlinger's
         // first real client; its gralloc buffers reach SF
         // inside binder parcels -- the FD-passing path
@@ -511,7 +516,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v8")
+        val marker = File(sysDir, ".gbsystem-v9")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

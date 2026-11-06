@@ -1,0 +1,8 @@
+// Minimal <new> for the freestanding guest build: only
+// what the era headers need (placement new/delete).
+#pragma once
+#include <stddef.h>
+inline void* operator new(size_t, void* p) throw() { return p; }
+inline void* operator new[](size_t, void* p) throw() { return p; }
+inline void operator delete(void*, void*) throw() { }
+inline void operator delete[](void*, void*) throw() { }

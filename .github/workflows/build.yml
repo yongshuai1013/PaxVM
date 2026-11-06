@@ -412,6 +412,18 @@ jobs:
           "$TC/llvm-readelf" -d gbsys/bin/lbprobe | grep -q 'NEEDED.*libbinder.so'
           ! "$TC/llvm-readelf" -r gbsys/bin/lbprobe | grep -q IRELATIVE
 
+      # gbprobe (S6 gun 4): a real graphics-stack client
+      # walking session/surface/lock/post with markers.
+      - name: Build gbprobe (guest graphics client)
+        run: |
+          set -euo pipefail
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          python3 gbprobe/build_gbprobe.py "$TC" gbsys/lib gbsys/bin/gbprobe
+          "$TC/llvm-readelf" -h gbsys/bin/gbprobe | grep -q 'Class:.*ELF32'
+          "$TC/llvm-readelf" -h gbsys/bin/gbprobe | grep -q 'Type:.*EXEC'
+          "$TC/llvm-readelf" -d gbsys/bin/gbprobe | grep -q 'NEEDED.*libsurfaceflinger_client.so'
+          ! "$TC/llvm-readelf" -r gbsys/bin/gbprobe | grep -q IRELATIVE
+
       - name: Zip gbsystem subset
         run: |
           set -euo pipefail
