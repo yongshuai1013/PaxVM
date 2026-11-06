@@ -198,6 +198,15 @@ class MainActivity : Activity() {
         // S5c-era count) should see it.
         "sleep 5",
         "/system/bin/lbprobe list2",
+        // S6 gun 4: the boot animation as SurfaceFlinger's
+        // first real client. Its gralloc buffers reach SF
+        // inside binder parcels -- the FD-passing path. It
+        // starts only after fbprobe's ~25 s are done, so the
+        // two never fight over the framebuffer; the SDK
+        // image carries no bootanimation.zip, so the stock
+        // built-in ANDROID wordmark animation plays.
+        "sleep 21",
+        "/system/bin/bootanimation &",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
