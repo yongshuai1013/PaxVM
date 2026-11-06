@@ -3946,7 +3946,7 @@ fn main() {
                     binder.thread_arena.insert(pid, arena.clone());
                     pend.mmap_binder = Some((arena, regs.arg(1) as u32));
                     pend.desc = Some(format!(
-                        "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
+                        "mmap({nr}) pid={pid} binder arena (PRIVATE -> SHARED for driver writes)"
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
@@ -3963,7 +3963,7 @@ fn main() {
                             format!("fd {}", regs.arg(4) as i32)
                         });
                     pend.desc = Some(format!(
-                        "mmap({nr}) EXEC prot={} len={} on {} (passed through)",
+                        "mmap({nr}) pid={pid} EXEC prot={} len={} on {} (passed through)",
                         regs.arg(2),
                         regs.arg(1),
                         fdname.rsplit('/').next().unwrap_or("").to_string()
@@ -3977,7 +3977,7 @@ fn main() {
                     let key = fd_ashmem(pid, regs.arg(4) as i32).unwrap();
                     let name = key.rsplit('/').next().unwrap_or("").to_string();
                     pend.desc = Some(format!(
-                        "mmap({nr}) virtual ashmem {name} len={} prot={} flags=0x{:x} (passed through)",
+                        "mmap({nr}) pid={pid} virtual ashmem {name} len={} prot={} flags=0x{:x} (passed through)",
                         regs.arg(1),
                         regs.arg(2),
                         regs.arg(3)
