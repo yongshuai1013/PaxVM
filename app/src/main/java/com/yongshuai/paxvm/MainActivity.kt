@@ -122,6 +122,7 @@ class MainActivity : Activity() {
         "    setprop pax.stage boot",
         "    start servicemanager",
         "    start surfaceflinger",
+        "    start bootanimation",
         "    start paxprobe",
         "",
         "service paxprobe /bin/sh /probe.sh",
@@ -139,6 +140,15 @@ class MainActivity : Activity() {
         // drops to system/graphics; credential switching
         // is a later refinement, not this round's variable).
         "service surfaceflinger /system/bin/surfaceflinger",
+        "",
+        // S6 gun 4 (0.9.3): the boot animation as a real
+        // init service -- the stock arrangement -- started
+        // in parallel at boot instead of trailing the probe
+        // sequence. A wrapper script retries while SF is
+        // not yet registered (asked a moment too early, the
+        // binary exits at once); once connected it stays
+        // up for the whole session.
+        "service bootanimation /bin/sh /bootanim.sh",
         "",
     ).joinToString("\n")
 
@@ -198,19 +208,13 @@ class MainActivity : Activity() {
         // S5c-era count) should see it.
         "sleep 5",
         "/system/bin/lbprobe list2",
-        // S6 gun 4: the boot animation as SurfaceFlinger's
-        // first real client. Its gralloc buffers reach SF
+        // S6 gun 4: the boot animation is SurfaceFlinger's
+        // first real client; its gralloc buffers reach SF
         // inside binder parcels -- the FD-passing path
         // (field-proven 0.9.1: SF's reply fd 9 became the
-        // client's fd 4). It starts as soon as fbprobe's
-        // ~25 s are done; the retry loop covers the case of
-        // it asking the manager for SurfaceFlinger a moment
-        // before SF registered (it exits at once then, and
-        // the loop relaunches it -- once connected it never
-        // exits on its own). The SDK image carries no
-        // bootanimation.zip, so the built-in ANDROID
-        // wordmark animation plays.
-        "while true; do /system/bin/bootanimation; sleep 1; done &",
+        // client's fd 4). Since 0.9.3 it runs as an init
+        // service (see gbInitRc), not from this probe
+        // script, so nothing here waits for it.
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
@@ -461,6 +465,13 @@ class MainActivity : Activity() {
         }
         writeFresh(File(rootfs, "init.rc"), gbInitRc)
         writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
+        // The bootanimation init service's wrapper: retry
+        // until SurfaceFlinger is registered, then the
+        // animation runs for the rest of the session.
+        writeFresh(
+            File(rootfs, "bootanim.sh"),
+            "while true; do /system/bin/bootanimation; sleep 1; done\n"
+        )
         // init reads the kernel cmdline for androidboot.hardware
         // (and looks for /init.<hardware>.rc, absent on purpose).
         // This is the file init chmods to 0440 — writeFresh is
