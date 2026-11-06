@@ -26,6 +26,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.io.File
+import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
@@ -61,6 +62,27 @@ class MainActivity : Activity() {
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
     private lateinit var fbView: ImageView
+
+    // Session log file (0.9.23): every log line is also
+    // written straight to filesDir/session-log.txt,
+    // unbuffered, so a frozen or killed UI cannot take the
+    // session's evidence with it. On launch, the previous
+    // launch's file is rotated to previous-session-log.txt
+    // and 下載日誌 serves it when this launch has not run
+    // a session yet (the force-stop-and-reopen recovery).
+    private var logFileOut: FileOutputStream? = null
+    private val logFileLock = Object()
+    private var previousLogFile: File? = null
+    private var sessionRan = false
+
+    // On-screen log flood guards (0.9.23): exact-repeat
+    // lines collapse, the view is trimmed when huge (a
+    // TextView append re-lays-out the whole text, so an
+    // unbounded view freezes the UI under a log storm),
+    // and scrolls coalesce. The file keeps everything.
+    private var lastUiLine: String? = null
+    private var dupLineCount = 0
+    @Volatile private var scrollPosted = false
 
     /** Rootfs of the GB session whose framebuffer is being
      * previewed, or null. The preview thread polls while its
@@ -280,9 +302,43 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        initLogFiles()
         buildUi()
         prepareRootfs(rootfsDir)
         statusView.text = "rootfs: ${rootfsDir.absolutePath}\n狀態：待命"
+        val prev = previousLogFile
+        if (prev != null && prev.exists() && prev.length() > 0) {
+            appendLog("[shell] 上一場的日誌已保留（${prev.length()} 位元組）；本場未啟動前按「下載日誌」可取得")
+        }
+    }
+
+    /** Rotate the session log files and open this
+     * launch's writer. Never throws: logging must not be
+     * able to take the app down. */
+    private fun initLogFiles() {
+        try {
+            val cur = File(filesDir, "session-log.txt")
+            val prev = File(filesDir, "previous-session-log.txt")
+            if (cur.exists() && cur.length() > 0) {
+                if (prev.exists()) prev.delete()
+                cur.renameTo(prev)
+                previousLogFile = prev
+            }
+            logFileOut = FileOutputStream(cur, true)
+        } catch (e: Exception) {
+            logFileOut = null
+        }
+    }
+
+    private fun writeLogLineToFile(line: String) {
+        val out = logFileOut ?: return
+        try {
+            synchronized(logFileLock) {
+                out.write((line + "\n").toByteArray(Charsets.UTF_8))
+            }
+        } catch (e: Exception) {
+            // A dead log file must not break the session.
+        }
     }
 
     private fun buildUi() {
@@ -580,7 +636,21 @@ class MainActivity : Activity() {
      * needed; legacy public dir below that). Added 0.3.5 at the
      * user's request, alongside 複製日誌. */
     private fun saveLog() {
-        val text = logView.text.toString()
+        // After a force-stop + reopen (the frozen-UI
+        // recovery), this launch has run no session and the
+        // view is nearly empty: serve the previous launch's
+        // complete session log file instead (0.9.23).
+        val prev = previousLogFile
+        val fromPrevious = !sessionRan && prev != null && prev.exists() && prev.length() > 0
+        val text = if (fromPrevious) {
+            try {
+                prev!!.readText()
+            } catch (e: Exception) {
+                logView.text.toString()
+            }
+        } else {
+            logView.text.toString()
+        }
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val name = "paxvm-log-$stamp.txt"
         try {
@@ -607,7 +677,10 @@ class MainActivity : Activity() {
                 dir.mkdirs()
                 File(dir, name).writeText(text)
             }
-            appendLog("[shell] 日誌已存到 Download/$name")
+            appendLog(
+                if (fromPrevious) "[shell] 上一場日誌已存到 Download/$name"
+                else "[shell] 日誌已存到 Download/$name"
+            )
         } catch (e: Exception) {
             appendLog("[shell] 存日誌失敗：$e")
         }
@@ -654,6 +727,7 @@ class MainActivity : Activity() {
             return
         }
         supervisor = proc
+        sessionRan = true
         if (gb) {
             startFbPreview(rootfs)
         }
@@ -767,9 +841,41 @@ class MainActivity : Activity() {
     }
 
     private fun appendLog(line: String) {
+        // The file gets every line, unconditionally and
+        // first: it is the session's durable record.
+        writeLogLineToFile(line)
+        // The screen is a view, not the record: collapse
+        // exact repeats so a log storm cannot drown the
+        // UI thread (0.9.22's frozen-interface run).
+        val collapsed: Int
+        synchronized(logFileLock) {
+            if (line == lastUiLine) {
+                dupLineCount++
+                return
+            }
+            collapsed = dupLineCount
+            dupLineCount = 0
+            lastUiLine = line
+        }
         runOnUiThread {
+            if (collapsed >= 3) {
+                logView.append("[shell] （上一行重複 $collapsed 次，畫面折疊；檔案有完整記錄）\n")
+            }
             logView.append(line + "\n")
-            scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+            // An ever-growing TextView makes every append
+            // re-lay-out the whole text; keep the tail.
+            val t = logView.text
+            if (t.length > 262144) {
+                logView.text = "［畫面只保留最近的日誌，完整記錄在日誌檔案］\n" +
+                    t.subSequence(131072, t.length)
+            }
+            if (!scrollPosted) {
+                scrollPosted = true
+                scrollView.postDelayed({
+                    scrollPosted = false
+                    scrollView.fullScroll(ScrollView.FOCUS_DOWN)
+                }, 200)
+            }
         }
     }
 }
