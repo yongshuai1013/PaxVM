@@ -1349,10 +1349,15 @@ fn entry_fb_ioctl(
                 f.read_exact_at(&mut head, base).ok()?;
                 f.read_exact_at(
                     &mut tail,
-                    base + (FB_W as u64) * (FB_H as u64) * 4 - 1024,
+                    base + (FB_W as u64) * (FB_H as u64) * 2,
                 )
                 .ok()?;
                 let nz = |b: &[u8]| b.iter().filter(|x| **x != 0).count();
+                // "tail" is really the page's middle
+                // kilobyte: the fallback animation's
+                // glowing wordmark sits in the vertical
+                // middle band, while head and true tail
+                // are black bands of the animation itself.
                 Some(format!("nz={}/{}", nz(&head), nz(&tail)))
             })()
             .unwrap_or_else(|| "nz=?".to_string());
