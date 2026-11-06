@@ -1534,6 +1534,35 @@ struct BinderState {
     /// with the receiver-side number.
     fd_pending: HashMap<String, Vec<FdFixup>>,
     fd_cache: HashMap<(String, i32, i32), i32>,
+    /// Transactions addressed to handle 0 before any
+    /// context manager registered (0.9.24). On real
+    /// hardware this cannot happen -- servicemanager is
+    /// up before any client -- and the driver has no
+    /// DEAD_REPLY for the manager handle; the supervisor
+    /// used to invent one, and a client that lost the
+    /// boot race on it wedged for good (0.9.22 device
+    /// run: gbprobe's first getService dead-replied, its
+    /// retry never completed). Queued here instead and
+    /// delivered when SET_CONTEXT_MGR lands; the sender
+    /// parks in its read side meanwhile, exactly like a
+    /// slow synchronous call.
+    mgr_pending: Vec<PendingMgrTxn>,
+}
+
+/// One transaction held for the context manager (see
+/// BinderState::mgr_pending). Everything the normal
+/// delivery path needs, captured at the sender's entry
+/// stop.
+struct PendingMgrTxn {
+    sender_arena: String,
+    sender_pid: i32,
+    target_handle: u32,
+    cookie: u32,
+    code: u32,
+    flags: u32,
+    veuid: u32,
+    data: Vec<u8>,
+    offs: Vec<u8>,
 }
 
 struct AshmemRec {
@@ -2078,6 +2107,29 @@ fn binder_handle_txn(
         st.procs.get(arena).and_then(|p| p.handles.get(&target).copied())
     };
     let Some(node) = node else {
+        if target == 0 {
+            // No context manager yet: queue for its
+            // registration instead of inventing a
+            // DEAD_REPLY the real driver never sends for
+            // handle 0 (see mgr_pending). The sender's
+            // read side finds nothing and parks, like a
+            // slow synchronous call.
+            st.mgr_pending.push(PendingMgrTxn {
+                sender_arena: arena.to_string(),
+                sender_pid: pid,
+                target_handle: target,
+                cookie,
+                code,
+                flags,
+                veuid,
+                data,
+                offs,
+            });
+            notes.push(
+                "TRANSACTION to manager before it registered -> queued".to_string(),
+            );
+            return;
+        }
         if let Some(bp) = st.procs.get_mut(arena) {
             bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
@@ -2099,6 +2151,34 @@ fn binder_handle_txn(
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie)
     };
+    binder_send_txn(
+        st, wakes, notes, arena, pid, target, cookie, nptr, ncookie, &owner, code, flags,
+        veuid, &data, &offs,
+    );
+}
+
+/// The delivery half of a transaction to a known node:
+/// translate the parcel, deliver it, register the reply
+/// wait and complete the sender's call. Shared by the
+/// direct path and by the manager-queue flush (0.9.24).
+#[allow(clippy::too_many_arguments)]
+fn binder_send_txn(
+    st: &mut BinderState,
+    wakes: &mut Vec<i32>,
+    notes: &mut Vec<String>,
+    arena: &str,
+    pid: i32,
+    target: u32,
+    cookie: u32,
+    nptr: u32,
+    ncookie: u32,
+    owner: &str,
+    code: u32,
+    flags: u32,
+    veuid: u32,
+    data: &[u8],
+    offs: &[u8],
+) {
     // Telemetry: decode the interface token so the log states
     // who this transaction speaks to and whether it is one-way.
     {
@@ -2139,7 +2219,7 @@ fn binder_handle_txn(
         return;
     }
     if flags & TF_ONE_WAY == 0 {
-        st.waiters.entry(owner.clone()).or_default().push(ReplyWait {
+        st.waiters.entry(owner.to_string()).or_default().push(ReplyWait {
             sender_pid: pid,
             sender_arena: arena.to_string(),
             cookie,
@@ -2512,6 +2592,9 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     if st.thread_arena.values().any(|a| a == arena) {
         return; // sibling threads still hold this arena
     }
+    // Queued manager transactions from this arena's
+    // senders die with it (0.9.24).
+    st.mgr_pending.retain(|q| q.sender_arena != arena);
     if st.mgr_arena.as_deref() == Some(arena) {
         st.mgr_arena = None;
         if let Some(mi) = st.mgr_node.take() {
@@ -4109,6 +4192,50 @@ fn main() {
                                 }
                                 Some(a) => *a == arena,
                             };
+                            if ok && !binder.mgr_pending.is_empty() {
+                                // Deliver everything clients
+                                // addressed to the manager
+                                // before it existed (0.9.24);
+                                // their senders are parked in
+                                // their read sides and complete
+                                // through the normal wake path.
+                                let node = binder.mgr_node.unwrap();
+                                let (nptr, ncookie) = {
+                                    let nd = &binder.nodes[node];
+                                    (nd.ptr, nd.cookie)
+                                };
+                                let queued: Vec<PendingMgrTxn> =
+                                    std::mem::take(&mut binder.mgr_pending);
+                                let total = queued.len();
+                                let mut delivered = 0;
+                                for q in queued {
+                                    if !binder.procs.contains_key(&q.sender_arena) {
+                                        continue;
+                                    }
+                                    let mut qnotes: Vec<String> = Vec::new();
+                                    binder_send_txn(
+                                        &mut binder,
+                                        &mut wakes,
+                                        &mut qnotes,
+                                        &q.sender_arena,
+                                        q.sender_pid,
+                                        q.target_handle,
+                                        q.cookie,
+                                        nptr,
+                                        ncookie,
+                                        &arena,
+                                        q.code,
+                                        q.flags,
+                                        q.veuid,
+                                        &q.data,
+                                        &q.offs,
+                                    );
+                                    delivered += 1;
+                                }
+                                sup!(
+                                    "binder: SET_CONTEXT_MGR flushed {delivered}/{total} queued manager transaction(s)"
+                                );
+                            }
                             skip_syscall(pid, &mut regs, &mut pend, if ok { 0 } else { -1 });
                             pend.desc = Some(format!(
                                 "binder SET_CONTEXT_MGR -> {}",
@@ -4403,6 +4530,43 @@ fn main() {
                     );
                 } else {
                     sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo){regdump}");
+                }
+                // Memory around the crash (0.9.24): on this
+                // device GETSIGINFO fails, so the fault
+                // address is usually unknown. The bytes at
+                // pc name the faulting instruction; the
+                // bytes at the data registers show what the
+                // code was about to touch (e.g. the
+                // pixelflinger JIT's emission pointer).
+                if sig == 11 {
+                    if let Some(r) = &fregs {
+                        let hexat = |addr: u64, n: usize| -> String {
+                            match read_mem_vec(pid, addr, n) {
+                                Some(b) => b
+                                    .iter()
+                                    .map(|x| format!("{x:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .concat(),
+                                None => "??".to_string(),
+                            }
+                        };
+                        let mut line = format!(
+                            "FATAL mem pid={pid} pc@0x{:x}: {}",
+                            pc & !1,
+                            hexat(pc & !1, 16)
+                        );
+                        for (nm, v) in
+                            [("r2", r.arg(2)), ("r3", r.arg(3)), ("sp", r.sp())]
+                        {
+                            if v > 0x10000 {
+                                line += &format!(
+                                    " {nm}@0x{v:x}: {}",
+                                    hexat(v, 16)
+                                );
+                            }
+                        }
+                        sup!("{line}");
+                    }
                 }
                 // Name the guest library the crash pc lives
                 // in, from the dying thread's memory map, so

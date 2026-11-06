@@ -636,15 +636,28 @@ class MainActivity : Activity() {
      * needed; legacy public dir below that). Added 0.3.5 at the
      * user's request, alongside 複製日誌. */
     private fun saveLog() {
-        // After a force-stop + reopen (the frozen-UI
-        // recovery), this launch has run no session and the
-        // view is nearly empty: serve the previous launch's
-        // complete session log file instead (0.9.23).
+        // The session log FILE is the complete record; the
+        // on-screen view is trimmed and can lag behind.
+        // Serve the file whenever it has content -- this
+        // launch's file first (it holds the whole session,
+        // untrimmed), then the previous launch's (the
+        // force-stop-and-reopen recovery) -- and fall back
+        // to the view only when no file exists (0.9.24;
+        // 0.9.23's view-first logic returned just the
+        // trimmed tail for a session downloaded in the
+        // same launch).
         val prev = previousLogFile
-        val fromPrevious = !sessionRan && prev != null && prev.exists() && prev.length() > 0
-        val text = if (fromPrevious) {
+        val cur = File(filesDir, "session-log.txt")
+        val fromFile: File? = when {
+            cur.exists() && cur.length() > 0 -> cur
+            prev != null && prev.exists() && prev.length() > 0 -> prev
+            else -> null
+        }
+        val fromPrevious = fromFile != null && prev != null &&
+            fromFile.absolutePath == prev.absolutePath
+        val text = if (fromFile != null) {
             try {
-                prev!!.readText()
+                fromFile.readText()
             } catch (e: Exception) {
                 logView.text.toString()
             }
