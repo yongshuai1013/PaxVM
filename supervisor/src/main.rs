@@ -1370,6 +1370,58 @@ fn entry_fb_ioctl(
                 Some(format!("nz={}/{}", nz(&head), nz(&tail)))
             })()
             .unwrap_or_else(|| "nz=?".to_string());
+            // Every 40th pan, also dump the composed page's
+            // coarse shape: 20 row bands, each a decile digit
+            // of nonzero density, then the busiest band's 8
+            // column deciles. Two 1KB windows could not tell
+            // a displaced/scaled/ghost composition from an
+            // absent one (gun 5, 0.9.34 field run: page
+            // windows read ~0/105 while the client's own
+            // buffer held the full logo) -- the shape can.
+            static PAN_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let shape = if PAN_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % 40
+                == 0
+            {
+                (|| -> Option<String> {
+                    use std::os::unix::fs::FileExt;
+                    let f = std::fs::File::open(format!("{rootfs}/.fb0")).ok()?;
+                    let base = (yoff as u64) * (FB_W as u64) * 4;
+                    let mut page = vec![0u8; (FB_W * FB_H * 4) as usize];
+                    f.read_exact_at(&mut page, base).ok()?;
+                    let band_bytes = page.len() / 20;
+                    let mut rows = String::new();
+                    let mut best = (0usize, 0usize);
+                    for b in 0..20 {
+                        let s = &page[b * band_bytes..(b + 1) * band_bytes];
+                        let n = s.iter().filter(|x| **x != 0).count();
+                        if n > best.1 {
+                            best = (b, n);
+                        }
+                        rows.push(char::from_digit(
+                            ((n * 10) / band_bytes).min(9) as u32,
+                            10,
+                        )?);
+                    }
+                    let s = &page[best.0 * band_bytes..(best.0 + 1) * band_bytes];
+                    let col_bytes = band_bytes / 8;
+                    let mut cols = String::new();
+                    for c in 0..8 {
+                        let cs = &s[c * col_bytes..(c + 1) * col_bytes];
+                        let n = cs.iter().filter(|x| **x != 0).count();
+                        cols.push(char::from_digit(
+                            ((n * 10) / col_bytes).min(9) as u32,
+                            10,
+                        )?);
+                    }
+                    Some(format!(" shape={rows}|{cols}"))
+                })()
+                .unwrap_or_default()
+            } else {
+                String::new()
+            };
             // Alongside the framebuffer page, fingerprint
             // every virtual ashmem file the same way, so
             // the log shows whether animation pixels ever
@@ -1412,7 +1464,7 @@ fn entry_fb_ioctl(
                 }
             })();
             format!(
-                "fb PAN yoffset={yoff} (page {}) by pid={pid} {fp}{ash}",
+                "fb PAN yoffset={yoff} (page {}) by pid={pid} {fp}{shape}{ash}",
                 yoff / FB_H
             )
         }
