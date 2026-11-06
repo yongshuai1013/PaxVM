@@ -1834,15 +1834,19 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, st: &mut Binde
     let _ = write_mem(pid, park.read_buf as u64, &bytes);
     let _ = write_mem(pid, (park.bwr + 4) as u64, &park.write_consumed.to_le_bytes());
     let _ = write_mem(pid, (park.bwr + 16) as u64, &(bytes.len() as u32).to_le_bytes());
-    if let Some(proc) = procs.get_mut(&pid) {
-        if let Some(pend) = proc.pending.as_mut() {
-            pend.inject = None;
-        }
-        if let Some(mut regs) = get_regs(pid, proc.compat) {
-            regs.set_retval(0);
-            let _ = set_regs(pid, &regs);
-        }
-    }
+    // The pending record must keep its inject: on this device
+    // the SIGSYS belonging to a cancelled syscall is delivered
+    // *after* its exit stop, and the signal-stop rescue can
+    // only recognise it while the record (with inject) lives.
+    // An earlier version cleared inject here "so the rescue
+    // would not mistake the record" -- exactly backwards: the
+    // first parked completion (0.6.5 device run) woke
+    // servicemanager, which then died of its own parked
+    // ioctl's late SIGSYS. Leaving inject in place gives the
+    // parked call the ordinary fake lifecycle: the exit stop
+    // applies the 0 and retains the record, the late SIGSYS
+    // is rescued and consumes it. (No regs surgery here: the
+    // exit stop applies the inject itself.)
     cont_syscall(pid, 0);
 }
 
