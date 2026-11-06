@@ -1373,7 +1373,7 @@ fn entry_fb_ioctl(
                 };
                 let mut names: Vec<_> = rd.flatten().collect();
                 names.sort_by_key(|e| e.file_name());
-                for e in names.iter().take(6) {
+                for e in names.iter().take(10) {
                     let Ok(f) = std::fs::File::open(e.path()) else {
                         continue;
                     };
@@ -4330,6 +4330,32 @@ fn main() {
                     );
                 } else {
                     sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo){regdump}");
+                }
+                // Name the guest library the crash pc lives
+                // in, from the dying thread's memory map, so
+                // a bare address becomes a library and an
+                // offset in the next reading.
+                if sig == 11 || sig == 6 {
+                    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+                        for line in maps.lines() {
+                            let mut it = line.split_whitespace();
+                            let Some(range) = it.next() else { continue };
+                            let Some((lo, hi)) = range.split_once('-') else {
+                                continue;
+                            };
+                            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+                            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+                            if pc >= lo && pc < hi {
+                                let name = line.rsplit('/').next().unwrap_or("?");
+                                sup!(
+                                    "FATAL map: pc in {} (+0x{:x})",
+                                    name.trim(),
+                                    pc - lo
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             if sig == SIGSYS {
