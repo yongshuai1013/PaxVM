@@ -513,12 +513,25 @@ static int do_ping(void) {
 }
 
 int guest_main(int argc, char **argv, char **envp) {
-    int i;
+    int i, rc = 1;
     (void)envp;
     for (i = 1; i < argc; i++) {
-        if (xstreq(argv[i], "serve")) return do_serve();
-        if (xstreq(argv[i], "list")) return do_list();
-        if (xstreq(argv[i], "ping")) return do_ping();
+        if (xstreq(argv[i], "serve")) rc = do_serve();
+        else if (xstreq(argv[i], "list")) rc = do_list();
+        else if (xstreq(argv[i], "ping")) rc = do_ping();
+        else continue;
+        break;
     }
-    return 1;
+    /* Exit through _exit, not by returning: returning runs
+     * libc's exit()/__cxa_finalize path, which faults in this
+     * freestanding binary (deterministic SIGSEGV at pc=0x4
+     * after all work is done; stock guest binaries with the
+     * full crtbegin/crtend exit cleanly, and our arrays/table
+     * verify byte-identical to theirs -- the divergence is
+     * somewhere subtler in the hand-rolled startup and is
+     * noted in the S5 spec as an open micro-mystery). paxsvc
+     * keeps no stdio/malloc state to flush, so _exit loses
+     * nothing. */
+    _exit(rc);
+    return rc;
 }
