@@ -1335,7 +1335,28 @@ fn entry_fb_ioctl(
             };
             let _ = std::fs::write(format!("{rootfs}/.fb-page"), format!("{yoff}"));
             skip_syscall(pid, regs, pend, 0);
-            format!("fb PAN yoffset={yoff} (page {})", yoff / FB_H)
+            // Content fingerprint of the page about to be
+            // shown: nonzero-byte counts of its first and
+            // last kilobyte, so the log can tell whether
+            // the composer is actually writing new pixels
+            // into this framebuffer or flipping stale ones.
+            let fp = (|| -> Option<String> {
+                use std::os::unix::fs::FileExt;
+                let f = std::fs::File::open(format!("{rootfs}/.fb0")).ok()?;
+                let base = (yoff as u64) * (FB_W as u64) * 4;
+                let mut head = [0u8; 1024];
+                let mut tail = [0u8; 1024];
+                f.read_exact_at(&mut head, base).ok()?;
+                f.read_exact_at(
+                    &mut tail,
+                    base + (FB_W as u64) * (FB_H as u64) * 4 - 1024,
+                )
+                .ok()?;
+                let nz = |b: &[u8]| b.iter().filter(|x| **x != 0).count();
+                Some(format!("nz={}/{}", nz(&head), nz(&tail)))
+            })()
+            .unwrap_or_else(|| "nz=?".to_string());
+            format!("fb PAN yoffset={yoff} (page {}) {fp}", yoff / FB_H)
         }
         _ => {
             // FBIO_WAITFORVSYNC and anything else in the
