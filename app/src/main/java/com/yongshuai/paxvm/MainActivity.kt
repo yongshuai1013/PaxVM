@@ -672,25 +672,21 @@ class MainActivity : Activity() {
                         Bitmap.Config.ARGB_8888,
                     ).also { fbBitmap = it }
                     // The guest writes framebuffer-standard
-                    // pixels (u32 0xAARRGGBB, i.e. B,G,R,A
-                    // bytes); a raw buffer copy into an
-                    // Android bitmap reads them as R,G,B,A
-                    // bytes, swapping red and blue (yellow
-                    // lamps came out sky blue in the 0.7.0
-                    // field test). Convert per pixel instead.
+                    // pixels (u32 0xAARRGGBB, stored little-
+                    // endian as B,G,R,A bytes). Read back as
+                    // little-endian ints they are exactly the
+                    // 0xAARRGGBB values setPixels expects --
+                    // no channel juggling. (0.7.0 copied the
+                    // raw bytes into the bitmap, whose memory
+                    // order is R,G,B,A, swapping red/blue;
+                    // 0.7.1 then swapped a second time inside
+                    // the ints and landed on the same wrong
+                    // picture. The int path needs no swap.)
                     val ints = IntArray(480 * 800)
                     ByteBuffer.wrap(buf)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         .asIntBuffer()
                         .get(ints)
-                    for (i in ints.indices) {
-                        val v = ints[i]
-                        val r = (v shr 16) and 0xFF
-                        val b = v and 0xFF
-                        ints[i] =
-                            (v and 0xFF00FF00.toInt()) or
-                                (b shl 16) or r
-                    }
                     bmp.setPixels(ints, 0, 480, 0, 0, 480, 800)
                     runOnUiThread { fbView.setImageBitmap(bmp) }
                 } catch (_: Exception) {
