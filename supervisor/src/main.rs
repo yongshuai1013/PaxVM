@@ -3950,6 +3950,25 @@ fn main() {
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
+                    && regs.arg(2) & 4 != 0
+                {
+                    // Telemetry only: any executable mapping.
+                    // A JIT code buffer must be mapped
+                    // PROT_EXEC; if the host policy denies
+                    // that on our file-backed ashmem, the
+                    // exit stop shows the failure here.
+                    let fdname = fd_ashmem(pid, regs.arg(4) as i32)
+                        .or_else(|| fd_arena(pid, regs.arg(4) as i32))
+                        .unwrap_or_else(|| {
+                            format!("fd {}", regs.arg(4) as i32)
+                        });
+                    pend.desc = Some(format!(
+                        "mmap({nr}) EXEC prot={} len={} on {} (passed through)",
+                        regs.arg(2),
+                        regs.arg(1),
+                        fdname.rsplit('/').next().unwrap_or("").to_string()
+                    ));
+                } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
                     && fd_ashmem(pid, regs.arg(4) as i32).is_some()
                 {
                     // Telemetry only: the call still passes
