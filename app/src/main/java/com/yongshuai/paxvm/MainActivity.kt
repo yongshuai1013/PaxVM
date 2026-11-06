@@ -121,6 +121,7 @@ class MainActivity : Activity() {
         "on boot",
         "    setprop pax.stage boot",
         "    start servicemanager",
+        "    start surfaceflinger",
         "    start paxprobe",
         "",
         "service paxprobe /bin/sh /probe.sh",
@@ -130,6 +131,14 @@ class MainActivity : Activity() {
         // supervisor's virtual binder driver. Not oneshot:
         // init restarts it if it ever exits.
         "service servicemanager /system/bin/servicemanager",
+        "",
+        // S6b/c: the real SurfaceFlinger. It composes
+        // through the stock gralloc framebuffer HAL onto
+        // the supervisor's virtual fb0; the shell presents
+        // the pages. Run as root for this round (stock rc
+        // drops to system/graphics; credential switching
+        // is a later refinement, not this round's variable).
+        "service surfaceflinger /system/bin/surfaceflinger",
         "",
     ).joinToString("\n")
 
@@ -183,6 +192,12 @@ class MainActivity : Activity() {
         // preview area shows it live. It runs in the
         // background so the rest of the probe can finish.
         "/system/bin/fbprobe &",
+        // S6b/c late census: by now SurfaceFlinger has had
+        // the whole probe run to come up and register; a
+        // second list (LB2 prefix, so it cannot blur the
+        // S5c-era count) should see it.
+        "sleep 5",
+        "/system/bin/lbprobe list2",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
@@ -457,7 +472,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v5")
+        val marker = File(sysDir, ".gbsystem-v6")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->
@@ -656,7 +671,27 @@ class MainActivity : Activity() {
                         800,
                         Bitmap.Config.ARGB_8888,
                     ).also { fbBitmap = it }
-                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(buf))
+                    // The guest writes framebuffer-standard
+                    // pixels (u32 0xAARRGGBB, i.e. B,G,R,A
+                    // bytes); a raw buffer copy into an
+                    // Android bitmap reads them as R,G,B,A
+                    // bytes, swapping red and blue (yellow
+                    // lamps came out sky blue in the 0.7.0
+                    // field test). Convert per pixel instead.
+                    val ints = IntArray(480 * 800)
+                    ByteBuffer.wrap(buf)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        .asIntBuffer()
+                        .get(ints)
+                    for (i in ints.indices) {
+                        val v = ints[i]
+                        val r = (v shr 16) and 0xFF
+                        val b = v and 0xFF
+                        ints[i] =
+                            (v and 0xFF00FF00.toInt()) or
+                                (b shl 16) or r
+                    }
+                    bmp.setPixels(ints, 0, 480, 0, 0, 480, 800)
                     runOnUiThread { fbView.setImageBitmap(bmp) }
                 } catch (_: Exception) {
                     // Mid-teardown or a torn read: the next

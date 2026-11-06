@@ -362,15 +362,31 @@ jobs:
             "https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip"
           echo "b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df  sysimg10.zip" | sha256sum -c -
           unzip -o -q sysimg10.zip "armeabi-v7a/system.img"
-          mkdir -p gbsys/bin gbsys/lib
+          mkdir -p gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media
           for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
                    lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
                    lib/liblog.so lib/libcutils.so lib/libbinder.so \
-                   lib/libutils.so lib/libz.so; do
+                   lib/libutils.so lib/libz.so \
+                   bin/surfaceflinger bin/bootanimation \
+                   lib/libsurfaceflinger.so lib/libsurfaceflinger_client.so \
+                   lib/libui.so lib/libEGL.so lib/libGLESv1_CM.so \
+                   lib/libhardware.so lib/libhardware_legacy.so \
+                   lib/libpixelflinger.so lib/libskia.so lib/libjpeg.so \
+                   lib/libemoji.so lib/libnetutils.so lib/libwpa_client.so \
+                   lib/hw/gralloc.default.so lib/egl/libGLES_android.so; do
             debugfs -R "dump -p /$p gbsys/$p" armeabi-v7a/system.img 2>/dev/null
             test -s "gbsys/$p" || { echo "missing from system.img: $p" >&2; exit 1; }
           done
-          ls -la gbsys/bin gbsys/lib
+          # The SDK image's egl.cfg selects the emulator's
+          # GL-forwarding stack (needs /dev/qemu_pipe, which
+          # does not exist here). Point EGL at the stock
+          # software renderer instead (S6 design note).
+          printf '0 0 android\n' > gbsys/lib/egl/egl.cfg
+          # Optional: the stock boot animation archive. The
+          # SDK image may not carry one; bootanimation then
+          # falls back to its built-in logo animation.
+          debugfs -R "dump -p /media/bootanimation.zip gbsys/media/bootanimation.zip" armeabi-v7a/system.img 2>/dev/null || true
+          ls -la gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media
           (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
 
       # lbprobe (S5c): a real libbinder client/server. Built

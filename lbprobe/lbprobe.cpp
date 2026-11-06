@@ -87,14 +87,14 @@ static int do_serve(void) {
     return 0;
 }
 
-static int do_list(void) {
+static int do_list(const char *prefix) {
     sp<IServiceManager> sm = defaultServiceManager();
     if (sm == NULL) {
         marker("/data/LB_NOSM");
         return 1;
     }
     Vector<String16> names = sm->listServices();
-    marker_num("/data/LB_LIST_N_", (unsigned)names.size());
+    marker_num(prefix, (unsigned)names.size());
     return 0;
 }
 
@@ -142,7 +142,9 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         if (xstreq(argv[i], "serve"))
             rc = do_serve();
         else if (xstreq(argv[i], "list"))
-            rc = do_list();
+            rc = do_list("/data/LB_LIST_N_");
+        else if (xstreq(argv[i], "list2"))
+            rc = do_list("/data/LB2_LIST_N_");
         else if (xstreq(argv[i], "ping"))
             rc = do_ping();
         else
