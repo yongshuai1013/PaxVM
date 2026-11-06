@@ -1175,12 +1175,22 @@ class MainActivity : Activity() {
                     logView.append(batch)
                     // An ever-growing TextView makes every
                     // append re-lay-out the whole text;
-                    // keep the tail.
+                    // keep the tail. The cap was 256 KB
+                    // until 0.9.58: at flood rates a layout
+                    // pass over a quarter megabyte of text
+                    // takes a visible slice of a second on
+                    // this phone, so during boot the UI
+                    // thread lived inside layout and even
+                    // a button's disabled state painted
+                    // late (field report: press, wait, then
+                    // grey). 48 KB keeps several hundred
+                    // lines on screen -- the file remains
+                    // the complete record.
                     val t = logView.text
-                    if (t.length > 262144) {
+                    if (t.length > 49152) {
                         logView.text =
                             "［畫面只保留最近的日誌，完整記錄在日誌檔案］\n" +
-                            t.subSequence(131072, t.length)
+                            t.subSequence(24576, t.length)
                     }
                 }
                 scrollView.fullScroll(ScrollView.FOCUS_DOWN)
