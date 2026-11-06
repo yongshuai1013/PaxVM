@@ -448,19 +448,19 @@ class MainActivity : Activity() {
         startButton = Button(this).apply {
             text = "啟動"
             setOnClickListener {
-                startSupervisor(rootfsDir, "libbusybox.so", listOf("sh", "/verify.sh"))
+                queueStart(rootfsDir, "libbusybox.so", listOf("sh", "/verify.sh"))
             }
         }
         probeButton = Button(this).apply {
             text = "啟動32"
             setOnClickListener {
-                startSupervisor(rootfs32Dir, "libbusybox32.so", listOf("sh", "/verify.sh"))
+                queueStart(rootfs32Dir, "libbusybox32.so", listOf("sh", "/verify.sh"))
             }
         }
         gbButton = Button(this).apply {
             text = "啟動GB"
             setOnClickListener {
-                startSupervisor(
+                queueStart(
                     rootfsGBDir,
                     "libgbinit.so",
                     listOf("/init"),
@@ -909,6 +909,32 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Button entry point for the three start buttons:
+     * flip the controls immediately, then run the start
+     * (whose rootfs preparation extracts hundreds of
+     * files) on a worker thread. Until 0.9.56 the whole
+     * start ran on the UI thread, so the buttons' state
+     * change painted only after preparation finished --
+     * the user's 'button state responds slowly' report,
+     * present since the GB scene grew a payload. */
+    private fun queueStart(
+        rootfs: File,
+        guestLib: String,
+        guestArgs: List<String>,
+        bbLib: String? = null,
+        loaderLib: String? = null,
+        gb: Boolean = false,
+    ) {
+        startButton.isEnabled = false
+        probeButton.isEnabled = false
+        gbButton.isEnabled = false
+        statusView.text =
+            "rootfs: ${rootfs.absolutePath}\n狀態：準備中…"
+        thread(name = "supervisor-start") {
+            startSupervisor(rootfs, guestLib, guestArgs, bbLib, loaderLib, gb)
+        }
+    }
+
     private fun startSupervisor(
         rootfs: File,
         guestLib: String,
@@ -947,6 +973,13 @@ class MainActivity : Activity() {
             // Do not swallow: packaging/exec problems surface here
             // verbatim (M0 spec risk 7, unchanged in M1).
             appendLog("[shell] failed to start supervisor: $e")
+            runOnUiThread {
+                startButton.isEnabled = true
+                probeButton.isEnabled = true
+                gbButton.isEnabled = true
+                stopButton.isEnabled = false
+                statusView.text = "狀態：啟動失敗（見日誌）"
+            }
             return
         }
         supervisor = proc
@@ -954,11 +987,14 @@ class MainActivity : Activity() {
         if (gb) {
             startFbPreview(rootfs)
         }
-        startButton.isEnabled = false
-        probeButton.isEnabled = false
-        gbButton.isEnabled = false
-        stopButton.isEnabled = true
-        statusView.text = "rootfs: ${rootfs.absolutePath}\n狀態：監督器執行中"
+        runOnUiThread {
+            startButton.isEnabled = false
+            probeButton.isEnabled = false
+            gbButton.isEnabled = false
+            stopButton.isEnabled = true
+            statusView.text =
+                "rootfs: ${rootfs.absolutePath}\n狀態：監督器執行中"
+        }
         appendLog("[shell] supervisor started")
         thread(name = "supervisor-reader") {
             try {
@@ -1084,6 +1120,14 @@ class MainActivity : Activity() {
     }
 
     private fun stopSupervisor() {
+        // Flip the controls NOW (0.9.56): the state used
+        // to change only after the supervisor had fully
+        // died and its captured logs were read back,
+        // which reads as a dead button during a flood.
+        // The reader thread's completion block sets the
+        // final state when the exit lands.
+        stopButton.isEnabled = false
+        statusView.text = "狀態：停止中…"
         // SIGTERM; the supervisor kills the guest root first, and
         // PTRACE_O_EXITKILL takes the rest of the tree with it.
         supervisor?.destroy()
