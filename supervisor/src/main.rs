@@ -1438,22 +1438,22 @@ fn entry_fb_ioctl(
                             y1 = y1.max(y);
                         }
                     }
-                    // Shared-stack dump: the composition
-                    // clip mystery (gun 5) lives or dies by
-                    // what each surface's SharedBufferStack
-                    // actually contains -- SF latches the
-                    // posted dirty region from these exact
-                    // bytes (Layer::lockPageFlip ->
-                    // getDirtyRegion). Layout per GB's
-                    // SharedBufferStack.h: stack = head/
-                    // available/queued/status (5 x i32),
-                    // reallocMask, index[16], identity,
-                    // token, stats(16B), headBuf+reserved,
-                    // then 16 BufferData of 64B (FlatRegion
-                    // 52B + crop 8B + transform/reserved).
-                    // Scan plausible heaps for that
-                    // signature and print each stack's
-                    // slots 0..2 dirty rects.
+                    // Shared-stack dump, take 2: the 0.9.40
+                    // signature scan found bootanimation's
+                    // stack at heap+8 with a perfect
+                    // swap-rect dirty, but gbprobe's heap
+                    // only validated at +96 with permanently
+                    // empty slots -- either its real stack
+                    // (at the same +8 as every SharedClient)
+                    // failed the plausibility gate, or the
+                    // +96 hit is a lookalike inside it. No
+                    // more gating: interpret offset +8 of
+                    // every mid-size heap as surfaces[0]
+                    // verbatim and print the raw fields.
+                    // (GB SharedBufferStack.h layout; the
+                    // client heaps are exactly 32768 bytes,
+                    // both clients provably map the files
+                    // SF allocated -- 0.9.40 mmap lines.)
                     let stacks = (|| -> String {
                         use std::os::unix::fs::FileExt;
                         let mut out = String::new();
@@ -1475,10 +1475,10 @@ fn entry_fb_ioctl(
                             };
                             let len =
                                 f.metadata().map(|m| m.len()).unwrap_or(0);
-                            if !(2048..=70000).contains(&len) {
+                            if !(8192..=70000).contains(&len) {
                                 continue;
                             }
-                            let mut data = vec![0u8; len as usize];
+                            let mut data = vec![0u8; 1200];
                             if f.read_exact_at(&mut data, 0).is_err() {
                                 continue;
                             }
@@ -1497,62 +1497,62 @@ fn entry_fb_ioctl(
                                     data[o..o + 2].try_into().unwrap(),
                                 )
                             };
-                            let mut off = 0usize;
-                            while off + 1096 <= data.len() && found < 4 {
-                                let (head, avail, queued, status) = (
-                                    i32at(off),
-                                    i32at(off + 4),
-                                    i32at(off + 8),
-                                    i32at(off + 16),
-                                );
-                                let (ident, token) =
-                                    (i32at(off + 40), i32at(off + 44));
-                                let plausible = (0..=16).contains(&head)
-                                    && (0..=16).contains(&avail)
-                                    && (0..=16).contains(&queued)
-                                    && status == 0
-                                    && (1..=64).contains(&ident)
-                                    && (0..=31).contains(&token);
-                                if plausible {
-                                    let mut slots = String::new();
-                                    for b in 0..3usize {
-                                        let bo = off + 72 + b * 64;
-                                        let cnt = u32at(bo);
-                                        if cnt == 0 {
-                                            slots.push_str(" []");
-                                        } else if cnt <= 5 {
-                                            slots.push_str(&format!(
-                                                " [{}:{},{},{},{}]",
-                                                cnt,
-                                                u16at(bo + 4),
-                                                u16at(bo + 6),
-                                                u16at(bo + 8),
-                                                u16at(bo + 10)
-                                            ));
-                                        } else {
-                                            slots.push_str(" [?]");
-                                        }
-                                    }
-                                    out.push_str(&format!(
-                                        " stk[{}+{} id={} tok={} q={}{}]",
-                                        e.file_name().to_string_lossy(),
-                                        off,
-                                        ident,
-                                        token,
-                                        queued,
-                                        slots
+                            let off = 8usize;
+                            let mut slots = String::new();
+                            for b in 0..3usize {
+                                let bo = off + 72 + b * 64;
+                                let cnt = u32at(bo);
+                                if cnt == 0 {
+                                    slots.push_str(" []");
+                                } else if cnt <= 5 {
+                                    slots.push_str(&format!(
+                                        " [{}:{},{},{},{}]",
+                                        cnt,
+                                        u16at(bo + 4),
+                                        u16at(bo + 6),
+                                        u16at(bo + 8),
+                                        u16at(bo + 10)
                                     ));
-                                    found += 1;
-                                    off += 1096;
                                 } else {
-                                    off += 4;
+                                    slots.push_str(&format!(" [!{cnt}]"));
                                 }
                             }
+                            out.push_str(&format!(
+                                " stk8[{} id={} tok={} h={} a={} q={} st={}{}]",
+                                e.file_name().to_string_lossy(),
+                                i32at(off + 40),
+                                i32at(off + 44),
+                                i32at(off),
+                                i32at(off + 4),
+                                i32at(off + 8),
+                                i32at(off + 16),
+                                slots
+                            ));
+                            found += 1;
                         }
                         out
                     })();
+                    // Brightness census for the page: the
+                    // nonzero count cannot tell a bright
+                    // white wordmark from values like
+                    // 0x00010802 that read as black to the
+                    // eye (the 0.9.38/39 previews looked
+                    // black while the census counted 3.6k
+                    // 'lit' pixels).
+                    let bright = {
+                        let mut n = 0usize;
+                        let mut mx = 0u8;
+                        for p in page.chunks_exact(4) {
+                            let m = p.iter().copied().max().unwrap_or(0);
+                            if m >= 0x80 {
+                                n += 1;
+                            }
+                            mx = mx.max(m);
+                        }
+                        format!(" bright={n} maxv={mx}")
+                    };
                     Some(format!(
-                        " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}{stacks}"
+                        " shape={rows}|{cols} px={px} bb={x0},{y0}-{x1},{y1}{bright}{stacks}"
                     ))
                 })()
                 .unwrap_or_default()
