@@ -420,6 +420,7 @@ class MainActivity : Activity() {
         // (the supervisor also recreates state per pid, this is
         // belt and braces).
         File(rootfs, ".binder").deleteRecursively()
+        File(rootfs, ".ashmem").deleteRecursively()
         // Virtual framebuffer backing (S6): two 480x800x32
         // pages, zeroed per session, plus the visible-page
         // note the supervisor's fb ioctl handler maintains.

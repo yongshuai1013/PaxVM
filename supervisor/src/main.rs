@@ -978,6 +978,9 @@ fn entry_translate(
             if guest_abs(vcwd, &p) == "/dev/binder" {
                 return entry_open_binder(pid, rootfs, compat, nr, regs, binder);
             }
+            if guest_abs(vcwd, &p) == "/dev/ashmem" {
+                return entry_open_ashmem(pid, rootfs, compat, nr, regs, binder);
+            }
         }
     }
     // (arg index of path, arg index of its dirfd or -1 for cwd semantics)
@@ -1398,6 +1401,20 @@ struct BinderState {
     /// the real driver notifies once per new reference
     /// holder, not once per parcel (S5c)
     ref_notified: HashSet<(usize, String)>,
+    /// Virtual ashmem (S6b): canonical backing-file path ->
+    /// region record. The host kernel's /dev/ashmem is
+    /// policy-denied to app-domain processes on the Android
+    /// 12 host (open returns EACCES), so the device is
+    /// virtualized like binder and fb0: one plain shared
+    /// file per open, ioctls answered from this table.
+    ashmem: HashMap<String, AshmemRec>,
+    ashmem_seq: u64,
+}
+
+struct AshmemRec {
+    size: u64,
+    name: String,
+    prot: u64,
 }
 
 impl BinderState {
@@ -2140,6 +2157,158 @@ fn entry_open_binder(
     }
 }
 
+/// Virtual ashmem open (S6b): reroute to a fresh backing
+/// file under {rootfs}/.ashmem; the record lives in the
+/// state table keyed by the canonical path (fd readlinks
+/// resolve symlinks -- the same lesson as binder arenas).
+fn entry_open_ashmem(
+    pid: i32,
+    rootfs: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+    st: &mut BinderState,
+) -> String {
+    let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
+        1
+    } else {
+        0
+    };
+    st.ashmem_seq += 1;
+    let seq = st.ashmem_seq;
+    let raw = format!("{rootfs}/.ashmem/a{pid}-{seq}");
+    let _ = std::fs::create_dir_all(format!("{rootfs}/.ashmem"));
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&raw);
+    let key = std::fs::canonicalize(&raw)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(raw.clone());
+    st.ashmem.insert(
+        key,
+        AshmemRec {
+            size: 0,
+            name: String::new(),
+            prot: 7,
+        },
+    );
+    let mut cursor = regs.sp().saturating_sub(256);
+    match scratch_write(pid, &mut cursor, &raw) {
+        Some(addr) => {
+            regs.set_arg(path_arg, addr);
+            "open '/dev/ashmem' -> virtual ashmem region (host device is policy-denied)".to_string()
+        }
+        None => "open '/dev/ashmem' (scratch write failed)".to_string(),
+    }
+}
+
+fn fd_ashmem(pid: i32, fd: i32) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    let s = target.to_string_lossy().into_owned();
+    if s.contains("/.ashmem/") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+// Ashmem ioctls, guest-era numbering (bionic 2.3.7
+// linux/ashmem.h, __ASHMEMIOC 0x77). SET_SIZE and
+// SET_PROT_MASK take their value BY VALUE in arg (see
+// libcutils ashmem-dev.c); PIN/UNPIN take a pointer to
+// struct ashmem_pin, which we never need to read because
+// the answers are constants on a file-backed region that
+// is never purged.
+const ASHMEM_SET_NAME: u32 = 0x4100_7701;
+const ASHMEM_GET_NAME: u32 = 0x8100_7702;
+const ASHMEM_SET_SIZE: u32 = 0x4004_7703;
+const ASHMEM_GET_SIZE: u32 = 0x0000_7704;
+const ASHMEM_SET_PROT_MASK: u32 = 0x4004_7705;
+const ASHMEM_GET_PROT_MASK: u32 = 0x0000_7706;
+const ASHMEM_PIN: u32 = 0x4008_7707;
+const ASHMEM_UNPIN: u32 = 0x4008_7708;
+const ASHMEM_GET_PIN_STATUS: u32 = 0x0000_7709;
+const ASHMEM_PURGE_ALL_CACHES: u32 = 0x0000_770a;
+
+fn entry_ashmem_ioctl(
+    pid: i32,
+    key: &str,
+    req: u32,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    st: &mut BinderState,
+) -> String {
+    let arg = regs.arg(2);
+    let missing = AshmemRec {
+        size: 0,
+        name: String::new(),
+        prot: 7,
+    };
+    match req {
+        ASHMEM_SET_NAME => {
+            let mut buf = [0u8; 256];
+            let _ = read_mem(pid, arg, &mut buf);
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(256);
+            let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+            st.ashmem.entry(key.to_string()).or_insert(missing).name = name.clone();
+            skip_syscall(pid, regs, pend, 0);
+            format!("ashmem SET_NAME '{name}'")
+        }
+        ASHMEM_GET_NAME => {
+            let rec = st.ashmem.get(key);
+            let name = rec.map(|r| r.name.clone()).unwrap_or_default();
+            let mut buf = [0u8; 256];
+            let n = name.len().min(255);
+            buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+            let _ = write_mem(pid, arg, &buf);
+            skip_syscall(pid, regs, pend, 0);
+            "ashmem GET_NAME".to_string()
+        }
+        ASHMEM_SET_SIZE => {
+            let size = arg as u64;
+            st.ashmem.entry(key.to_string()).or_insert(missing).size = size;
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(key) {
+                let _ = f.set_len(size);
+            }
+            skip_syscall(pid, regs, pend, 0);
+            format!("ashmem SET_SIZE -> {size}")
+        }
+        ASHMEM_GET_SIZE => {
+            let size = st.ashmem.get(key).map(|r| r.size).unwrap_or(0);
+            skip_syscall(pid, regs, pend, size as i64);
+            format!("ashmem GET_SIZE -> {size}")
+        }
+        ASHMEM_SET_PROT_MASK => {
+            st.ashmem.entry(key.to_string()).or_insert(missing).prot = arg as u64;
+            skip_syscall(pid, regs, pend, 0);
+            "ashmem SET_PROT_MASK".to_string()
+        }
+        ASHMEM_GET_PROT_MASK => {
+            let prot = st.ashmem.get(key).map(|r| r.prot).unwrap_or(7);
+            skip_syscall(pid, regs, pend, prot as i64);
+            "ashmem GET_PROT_MASK".to_string()
+        }
+        ASHMEM_PIN => {
+            skip_syscall(pid, regs, pend, 0); // ASHMEM_NOT_PURGED
+            "ashmem PIN -> NOT_PURGED".to_string()
+        }
+        ASHMEM_UNPIN => {
+            skip_syscall(pid, regs, pend, 0); // ASHMEM_IS_UNPINNED
+            "ashmem UNPIN".to_string()
+        }
+        ASHMEM_GET_PIN_STATUS => {
+            skip_syscall(pid, regs, pend, 1); // ASHMEM_IS_PINNED
+            "ashmem GET_PIN_STATUS -> PINNED".to_string()
+        }
+        _ => {
+            skip_syscall(pid, regs, pend, 0);
+            "ashmem ioctl (accepted)".to_string()
+        }
+    }
+}
+
 fn is_setid_emulated(compat: bool, nr: u64) -> bool {
     if compat {
         // The 16-bit and 32-bit uid forms, both: musl calls the
@@ -2248,7 +2417,10 @@ fn is_open_family(compat: bool, nr: u64) -> bool {
 fn device_map(rootfs: &str, guest_abs_path: &str) -> Option<String> {
     match guest_abs_path {
         "/dev/null" | "/dev/__null__" | "/dev/console" => Some("/dev/null".to_string()),
-        "/dev/ashmem" => Some("/dev/ashmem".to_string()),
+        // /dev/ashmem is NOT mapped here anymore: the host
+        // device is policy-denied to app processes, so opens
+        // are intercepted earlier (entry_open_ashmem) and the
+        // device is virtualized outright.
         "/dev/zero" => Some("/dev/zero".to_string()),
         "/dev/urandom" | "/dev/random" => Some("/dev/urandom".to_string()),
         "/dev/__kmsg__" => Some(format!("{rootfs}/.kmsg")),
@@ -3351,6 +3523,33 @@ fn main() {
                     pend.mmap_binder = Some((arena, regs.arg(1) as u32));
                     pend.desc = Some(format!(
                         "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
+                    && matches!(
+                        regs.arg(1) as u32,
+                        ASHMEM_SET_NAME
+                            | ASHMEM_GET_NAME
+                            | ASHMEM_SET_SIZE
+                            | ASHMEM_GET_SIZE
+                            | ASHMEM_SET_PROT_MASK
+                            | ASHMEM_GET_PROT_MASK
+                            | ASHMEM_PIN
+                            | ASHMEM_UNPIN
+                            | ASHMEM_GET_PIN_STATUS
+                            | ASHMEM_PURGE_ALL_CACHES
+                    )
+                    && fd_ashmem(pid, regs.arg(0) as i32).is_some()
+                {
+                    // Virtual ashmem ioctls (S6b).
+                    let key = fd_ashmem(pid, regs.arg(0) as i32).unwrap();
+                    pend.desc = Some(entry_ashmem_ioctl(
+                        pid,
+                        &key,
+                        regs.arg(1) as u32,
+                        &mut regs,
+                        &mut pend,
+                        &mut binder,
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
