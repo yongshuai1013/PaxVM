@@ -1752,10 +1752,26 @@ fn binder_deliver(
                 .copied();
             match parked_looper {
                 Some(p) => {
+                    sup!("binder: txn for {target} landed in parked looper pid={p}'s queue");
                     bp.push_to(p, &br_cmd.to_le_bytes());
                     bp.push_to(p, &txn);
                 }
                 None => {
+                    let parked_here: Vec<String> = st
+                        .parked
+                        .keys()
+                        .map(|p| {
+                            format!(
+                                "{p}(arena={}, looper={})",
+                                st.thread_arena.get(p).cloned().unwrap_or_default(),
+                                bp.loopers.contains(p)
+                            )
+                        })
+                        .collect();
+                    sup!(
+                        "binder: txn for {target} pooled in inbound (parked: [{}])",
+                        parked_here.join(", ")
+                    );
                     bp.inbound.extend_from_slice(&br_cmd.to_le_bytes());
                     bp.inbound.extend_from_slice(&txn);
                 }
