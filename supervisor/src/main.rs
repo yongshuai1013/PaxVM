@@ -1909,6 +1909,83 @@ impl BinderState {
     }
 }
 
+/// One tracer-side effect the binder driver decided on
+/// (multi-process split, spec stage S1a). The binder
+/// family used to perform these inline while it decided;
+/// it now only returns them, and the entry-stop caller
+/// executes them in order (exec_binder_actions). This is
+/// the seam the coordinator IPC later sits on: decisions
+/// travel as data, execution stays with whoever holds
+/// the tracee's ptrace stop. Contents and order are
+/// exactly the old inline effects, so behaviour is
+/// unchanged.
+enum BAction {
+    /// write_mem(pid, addr, bytes); result ignored,
+    /// as it was at every old inline site.
+    WriteMem { addr: u64, bytes: Vec<u8> },
+    /// skip_syscall(pid, regs, pend, value).
+    SkipSyscall(i64),
+    /// st.parked.insert(pid, park): this call parks.
+    Park { pid: i32, park: ParkedIoctl },
+    /// pend.binder_parked = true (the caller keys its
+    /// no-continue decision off the flag, as before).
+    MarkBinderParked,
+    /// A parked pid has work waiting. The caller appends
+    /// it to its wakes list -- deduplicated there, where
+    /// binder_maybe_wake used to deduplicate against the
+    /// same vec -- and completes it after the entry stop,
+    /// exactly as before.
+    Wake(i32),
+    /// Settle one arena's fd fixups inline, riding the
+    /// current call's entry stop (resolve_fd_fixups_core);
+    /// when rides were needed, the fake result is applied
+    /// to the regs and pend.applied is set -- the old
+    /// inline tail of binder_write_read, verbatim.
+    ResolveFdFixupsInline { arena: String, fixups: Vec<FdFixup> },
+}
+
+/// Execute, in order, the effects a binder decision
+/// returned. Runs at the entry stop that made the
+/// decision, with that stop's regs/pend in hand -- the
+/// same place and order the family used to act in.
+fn exec_binder_actions(
+    pid: i32,
+    compat: bool,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    st: &mut BinderState,
+    actions: Vec<BAction>,
+    wakes: &mut Vec<i32>,
+) {
+    for a in actions {
+        match a {
+            BAction::WriteMem { addr, bytes } => {
+                let _ = write_mem(pid, addr, &bytes);
+            }
+            BAction::SkipSyscall(v) => skip_syscall(pid, regs, pend, v),
+            BAction::Park { pid: p, park } => {
+                st.parked.insert(p, park);
+            }
+            BAction::MarkBinderParked => pend.binder_parked = true,
+            BAction::Wake(w) => {
+                if !wakes.contains(&w) {
+                    wakes.push(w);
+                }
+            }
+            BAction::ResolveFdFixupsInline { arena, fixups } => {
+                let rides =
+                    resolve_fd_fixups_core(pid, compat, st, &arena, &fixups, regs);
+                if rides > 0 {
+                    regs.set_retval(0);
+                    if set_regs(pid, regs) {
+                        pend.applied = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Rewrite one flat_binder_object slot in a parcel being
 /// transferred `to` a process: the node is presented as a
 /// local object when the receiver owns it, else as a handle
@@ -1942,7 +2019,7 @@ fn binder_notify_ref(
     node: usize,
     to: &str,
     weak: bool,
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
 ) {
     let (owner, nptr, ncookie, dead) = {
         let n = &st.nodes[node];
@@ -1964,7 +2041,7 @@ fn binder_notify_ref(
             bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
         }
     }
-    binder_maybe_wake(st, &owner, wakes);
+    binder_maybe_wake(st, &owner, actions);
     st.note("ref notice queued to object owner");
 }
 
@@ -1981,7 +2058,7 @@ fn binder_translate(
     to: &str,
     data: &[u8],
     offs: &[u8],
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
     fd_fixups: &mut Vec<(usize, i32)>,
 ) -> Vec<u8> {
     let mut out = data.to_vec();
@@ -1999,7 +2076,7 @@ fn binder_translate(
             OBJ_BINDER | OBJ_WEAK_BINDER => {
                 let node = st.node_for_local(from, ptr, cookie);
                 binder_write_obj(st, to, node, ty == OBJ_WEAK_BINDER, &mut out, off);
-                binder_notify_ref(st, node, to, ty == OBJ_WEAK_BINDER, wakes);
+                binder_notify_ref(st, node, to, ty == OBJ_WEAK_BINDER, actions);
             }
             OBJ_HANDLE | OBJ_WEAK_HANDLE => {
                 let node = if ptr == 0 {
@@ -2012,7 +2089,7 @@ fn binder_translate(
                 match node {
                     Some(n) => {
                         binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off);
-                        binder_notify_ref(st, n, to, ty == OBJ_WEAK_HANDLE, wakes);
+                        binder_notify_ref(st, n, to, ty == OBJ_WEAK_HANDLE, actions);
                     }
                     None => st.note("parcel carried an unknown handle; left untranslated"),
                 }
@@ -2142,22 +2219,26 @@ fn binder_deliver(
     Ok(())
 }
 
-/// If the target arena has a parked reader, schedule its
-/// wake (the main loop performs it after the entry stop).
-fn binder_maybe_wake(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
+/// Which parked threads of `arena` have work they may
+/// read. Pure decision, shared by the action-returning
+/// family (binder_maybe_wake) and by binder_on_proc_exit
+/// (binder_maybe_wake_pids), whose caller still collects
+/// plain pids and completes them on the spot.
+fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
     let Some(bp) = st.procs.get(arena) else {
-        return;
+        return Vec::new();
     };
     if bp.inbound.is_empty() && bp.queues.values().all(|q| q.is_empty()) {
-        return;
+        return Vec::new();
     }
     // Wake exactly the parked threads that have bytes they
     // may read: a thread with addressed bytes, or a looper
     // while the inbound stream is non-empty. (The old code
     // woke the first parked thread it found and handed it
     // the whole shared queue, whatever the bytes were for.)
+    let mut out = Vec::new();
     for (pid, park) in &st.parked {
-        if park.read_size == 0 || wakes.contains(pid) {
+        if park.read_size == 0 {
             continue;
         }
         if st.thread_arena.get(pid).map(|a| a != arena).unwrap_or(true) {
@@ -2165,7 +2246,30 @@ fn binder_maybe_wake(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
         }
         let own = bp.queues.get(pid).map_or(0, |q| q.len());
         if own > 0 || (!bp.inbound.is_empty() && bp.loopers.contains(pid)) {
-            wakes.push(*pid);
+            out.push(*pid);
+        }
+    }
+    out
+}
+
+/// If the target arena has parked readers with work,
+/// queue their wakes as actions (the caller executes
+/// them after the entry stop, as it always did; the
+/// executor deduplicates against the wakes vec, where
+/// the old inline version deduplicated too).
+fn binder_maybe_wake(st: &BinderState, arena: &str, actions: &mut Vec<BAction>) {
+    for pid in binder_wake_candidates(st, arena) {
+        actions.push(BAction::Wake(pid));
+    }
+}
+
+/// binder_maybe_wake for binder_on_proc_exit: same
+/// candidates, same dedup against the caller's vec
+/// the old shared implementation applied.
+fn binder_maybe_wake_pids(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
+    for pid in binder_wake_candidates(st, arena) {
+        if !wakes.contains(&pid) {
+            wakes.push(pid);
         }
     }
 }
@@ -2178,7 +2282,7 @@ fn binder_process_stream(
     stream: &[u8],
     st: &mut BinderState,
     veuid: u32,
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
     notes: &mut Vec<String>,
 ) {
     let mut cur = 0usize;
@@ -2283,7 +2387,7 @@ fn binder_process_stream(
                 }
                 let txn: Vec<u8> = stream[cur..cur + 40].to_vec();
                 cur += 40;
-                binder_handle_txn(pid, arena, cmd == BC_REPLY, &txn, st, veuid, wakes, notes);
+                binder_handle_txn(pid, arena, cmd == BC_REPLY, &txn, st, veuid, actions, notes);
             }
             other => {
                 notes.push(format!("unknown BC {other:#010x}; stream parse stopped"));
@@ -2301,7 +2405,7 @@ fn binder_handle_txn(
     txn: &[u8],
     st: &mut BinderState,
     veuid: u32,
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
     notes: &mut Vec<String>,
 ) {
     let target = u32_at(txn, 0);
@@ -2335,7 +2439,7 @@ fn binder_handle_txn(
             return;
         };
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
-        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, wakes, &mut fd_fixups);
+        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, actions, &mut fd_fixups);
         let delivered = binder_deliver(
             st,
             &w.sender_arena,
@@ -2357,7 +2461,7 @@ fn binder_handle_txn(
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
         }
-        binder_maybe_wake(st, &w.sender_arena, wakes);
+        binder_maybe_wake(st, &w.sender_arena, actions);
         sup!(
             "binder: reply ({}B) delivered for waiter pid {}",
             tdata.len(),
@@ -2424,7 +2528,7 @@ fn binder_handle_txn(
         (n.owner.clone(), n.ptr, n.cookie)
     };
     binder_send_txn(
-        st, wakes, notes, arena, pid, target, cookie, nptr, ncookie, &owner, code, flags,
+        st, actions, notes, arena, pid, target, cookie, nptr, ncookie, &owner, code, flags,
         veuid, &data, &offs,
     );
 }
@@ -2436,7 +2540,7 @@ fn binder_handle_txn(
 #[allow(clippy::too_many_arguments)]
 fn binder_send_txn(
     st: &mut BinderState,
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
     notes: &mut Vec<String>,
     arena: &str,
     pid: i32,
@@ -2477,7 +2581,7 @@ fn binder_send_txn(
         );
     }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
-    let tdata = binder_translate(st, arena, &owner, &data, &offs, wakes, &mut fd_fixups);
+    let tdata = binder_translate(st, arena, &owner, &data, &offs, actions, &mut fd_fixups);
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
         &fd_fixups,
@@ -2501,25 +2605,41 @@ fn binder_send_txn(
     if let Some(bp) = st.procs.get_mut(arena) {
         bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
     }
-    binder_maybe_wake(st, &owner, wakes);
+    binder_maybe_wake(st, &owner, actions);
     notes.push(format!("TRANSACTION code {code} -> node in {owner} ({}B)", tdata.len()));
 }
 
-/// Emulate one BINDER_WRITE_READ ioctl at its entry stop.
+/// Emulate one BINDER_WRITE_READ ioctl at its entry
+/// stop: the decision half (S1a). The caller pre-reads
+/// the ioctl's inputs from the tracee -- the 24-byte
+/// bwr struct at `bwr_addr`, and the write stream when
+/// the struct says one follows (same condition the old
+/// inline read used) -- and executes the actions this
+/// returns at the stop, in order. Everything the old
+/// body did to the tracee (memory writes, the skip,
+/// the park, the inline fd-fixup settle) is in the
+/// action list at the same position it used to happen.
+/// Parcel payload reads deliberately stay inside
+/// binder_handle_txn: they gate the drop branches
+/// mid-decision and read a stopped tracee (no
+/// observable effect), so pre-reading them would mean
+/// speculatively reading unvalidated txn headers and
+/// re-plumbing every branch; when the split goes
+/// cross-process they move with the protocol's read
+/// side, at the same single site.
 #[allow(clippy::too_many_arguments)]
 fn binder_write_read(
     pid: i32,
-    compat: bool,
     arena: &str,
-    regs: &mut Regs,
-    pend: &mut Pending,
+    bwr_addr: u64,
+    bwr: Option<Vec<u8>>,
+    stream: Option<Vec<u8>>,
     st: &mut BinderState,
     vcreds: &HashMap<i32, (u32, u32)>,
-    wakes: &mut Vec<i32>,
+    actions: &mut Vec<BAction>,
 ) -> String {
-    let bwr_addr = regs.arg(2);
-    let Some(bwr) = read_mem_vec(pid, bwr_addr, 24) else {
-        skip_syscall(pid, regs, pend, -14);
+    let Some(bwr) = bwr else {
+        actions.push(BAction::SkipSyscall(-14));
         return "binder WRITE_READ: bwr unreadable -> -EFAULT".to_string();
     };
     let ws = u32_at(&bwr, 0);
@@ -2531,9 +2651,9 @@ fn binder_write_read(
     let veuid = vcreds.get(&pid).copied().unwrap_or((0, 0)).0;
     let mut notes: Vec<String> = Vec::new();
     if ws > wc0 && ws <= (1 << 20) {
-        match read_mem_vec(pid, (wb + wc0) as u64, (ws - wc0) as usize) {
+        match stream {
             Some(stream) => {
-                binder_process_stream(pid, &arena, &stream, st, veuid, wakes, &mut notes)
+                binder_process_stream(pid, &arena, &stream, st, veuid, actions, &mut notes)
             }
             None => notes.push("write stream unreadable".to_string()),
         }
@@ -2574,9 +2694,16 @@ fn binder_write_read(
             .map(|bp| bp.drain_for(pid, fill_n).0)
             .unwrap_or_default();
         dump_mgr_read(st, &arena, pid, &bytes);
-        let _ = write_mem(pid, rb as u64, &bytes);
-        let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
-        skip_syscall(pid, regs, pend, 0);
+        let filled = bytes.len();
+        actions.push(BAction::WriteMem {
+            addr: rb as u64,
+            bytes,
+        });
+        actions.push(BAction::WriteMem {
+            addr: bwr_addr,
+            bytes: writeback(filled as u32).to_vec(),
+        });
+        actions.push(BAction::SkipSyscall(0));
         // Deliveries to this arena may have left fd fixups
         // unresolved. They are normally settled when the
         // receiver is woken out of a park; a thread that
@@ -2588,37 +2715,37 @@ fn binder_write_read(
         // the same skipped state the parked path resolves
         // from: rides consume this call's entry->exit
         // transition, so the fake result is applied to the
-        // regs here and the caller drops its exit-stop
-        // expectation (it keys that off pend.applied).
+        // regs by the executor and the caller drops its
+        // exit-stop expectation (it keys that off
+        // pend.applied).
         if let Some(fixups) = st.fd_pending.remove(&arena) {
             if !fixups.is_empty() {
-                let rides =
-                    resolve_fd_fixups_core(pid, compat, st, &arena, &fixups, regs);
-                if rides > 0 {
-                    regs.set_retval(0);
-                    if set_regs(pid, regs) {
-                        pend.applied = true;
-                    }
-                }
+                actions.push(BAction::ResolveFdFixupsInline {
+                    arena: arena.clone(),
+                    fixups,
+                });
             }
         }
-        notes.push(format!("read filled {}B", bytes.len()));
+        notes.push(format!("read filled {}B", filled));
     } else if rs > 0 {
-        skip_syscall(pid, regs, pend, 0);
-        st.parked.insert(
+        actions.push(BAction::SkipSyscall(0));
+        actions.push(BAction::Park {
             pid,
-            ParkedIoctl {
+            park: ParkedIoctl {
                 bwr: bwr_addr as u32,
                 read_buf: rb,
                 read_size: rs,
                 write_consumed: ws,
             },
-        );
-        pend.binder_parked = true;
+        });
+        actions.push(BAction::MarkBinderParked);
         notes.push("parked awaiting work".to_string());
     } else {
-        let _ = write_mem(pid, bwr_addr, &writeback(0));
-        skip_syscall(pid, regs, pend, 0);
+        actions.push(BAction::WriteMem {
+            addr: bwr_addr,
+            bytes: writeback(0).to_vec(),
+        });
+        actions.push(BAction::SkipSyscall(0));
     }
     if notes.is_empty() {
         notes.push("no work".to_string());
@@ -3067,7 +3194,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
             }
-            binder_maybe_wake(st, &w.sender_arena, wakes);
+            binder_maybe_wake_pids(st, &w.sender_arena, wakes);
         }
     }
     for v in st.waiters.values_mut() {
@@ -3089,7 +3216,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
                     bp.inbound.extend_from_slice(&cookie.to_le_bytes());
                     notices += 1;
                 }
-                binder_maybe_wake(st, &watcher_arena, wakes);
+                binder_maybe_wake_pids(st, &watcher_arena, wakes);
             }
         }
     }
@@ -4877,6 +5004,13 @@ fn main() {
                                     std::mem::take(&mut binder.mgr_pending);
                                 let total = queued.len();
                                 let mut delivered = 0;
+                                // S1a: the flush's deliveries
+                                // decide here; their effects
+                                // (wakes only, by construction)
+                                // are executed right after the
+                                // loop, as the old inline
+                                // version's wakes were.
+                                let mut flush_actions: Vec<BAction> = Vec::new();
                                 for q in queued {
                                     sup!(
                                         "binder: flushing queued mgr txn from pid={} code={}",
@@ -4892,7 +5026,7 @@ fn main() {
                                     let mut qnotes: Vec<String> = Vec::new();
                                     binder_send_txn(
                                         &mut binder,
-                                        &mut wakes,
+                                        &mut flush_actions,
                                         &mut qnotes,
                                         &q.sender_arena,
                                         q.sender_pid,
@@ -4909,6 +5043,15 @@ fn main() {
                                     );
                                     delivered += 1;
                                 }
+                                exec_binder_actions(
+                                    pid,
+                                    proc.compat,
+                                    &mut regs,
+                                    &mut pend,
+                                    &mut binder,
+                                    flush_actions,
+                                    &mut wakes,
+                                );
                                 sup!(
                                     "binder: SET_CONTEXT_MGR flushed {delivered}/{total} queued manager transaction(s)"
                                 );
@@ -4932,16 +5075,54 @@ fn main() {
                             pend.desc = Some("binder THREAD_EXIT".to_string());
                         }
                         BINDER_WRITE_READ => {
-                            pend.desc = Some(binder_write_read(
+                            // S1a split: pre-read the
+                            // ioctl's inputs (the 24-byte
+                            // bwr struct, then the write
+                            // stream under the same
+                            // condition the decision used
+                            // inline), let the binder
+                            // family decide, then execute
+                            // its actions at this stop.
+                            let bwr_addr = regs.arg(2);
+                            let bwr = read_mem_vec(pid, bwr_addr, 24);
+                            let stream = match &bwr {
+                                Some(b) => {
+                                    let ws = u32_at(b, 0);
+                                    let wc0 = u32_at(b, 4);
+                                    let wb = u32_at(b, 8);
+                                    if ws > wc0 && ws <= (1 << 20) {
+                                        read_mem_vec(
+                                            pid,
+                                            (wb + wc0) as u64,
+                                            (ws - wc0) as usize,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }
+                                None => None,
+                            };
+                            let mut actions: Vec<BAction> = Vec::new();
+                            let desc = binder_write_read(
+                                pid,
+                                &arena,
+                                bwr_addr,
+                                bwr,
+                                stream,
+                                &mut binder,
+                                &vcreds,
+                                &mut actions,
+                            );
+                            exec_binder_actions(
                                 pid,
                                 proc.compat,
-                                &arena,
                                 &mut regs,
                                 &mut pend,
                                 &mut binder,
-                                &vcreds,
+                                actions,
                                 &mut wakes,
-                            ));
+                            );
+                            pend.desc = Some(desc);
                         }
                         req => {
                             skip_syscall(pid, &mut regs, &mut pend, 0);
