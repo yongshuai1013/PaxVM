@@ -19,8 +19,35 @@
 #include <surfaceflinger/Surface.h>
 #include <utils/String8.h>
 #include <ui/PixelFormat.h>
+#include <ui/DisplayInfo.h>
+
+// The server control block layout, from
+// private/surfaceflinger/SharedBufferStack.h
+// (android-2.3.7_r1): a connected byte, padding, then
+// one display block per display. Declared locally so
+// this probe does not drag that header's whole chain
+// in; only displays[0].w/h are read.
+struct gb_display_cblk_t {
+    uint16_t w;
+    uint16_t h;
+    uint8_t format;
+    uint8_t orientation;
+    uint8_t reserved[2];
+    float fps;
+    float density;
+    float xdpi;
+    float ydpi;
+    uint32_t pad[2];
+};
+struct gb_cblk_t {
+    uint8_t connected;
+    uint8_t reserved[3];
+    uint32_t pad[7];
+    gb_display_cblk_t displays[4];
+};
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
@@ -33,6 +60,23 @@ static void marker_sfx(const char *base, const char *sfx) {
     char buf[96];
     int i = 0;
     while (*base) buf[i++] = *base++;
+    while (*sfx) buf[i++] = *sfx++;
+    buf[i] = 0;
+    mkdir(buf, 0);
+}
+
+static void marker_val(const char *base, unsigned n, const char *sfx) {
+    char buf[96];
+    int i = 0;
+    while (*base) buf[i++] = *base++;
+    char dig[12];
+    int d = 0;
+    if (n == 0) dig[d++] = '0';
+    while (n > 0) {
+        dig[d++] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+    while (d > 0) buf[i++] = dig[--d];
     while (*sfx) buf[i++] = *sfx++;
     buf[i] = 0;
     mkdir(buf, 0);
@@ -89,7 +133,44 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         }
         marker_sfx("/data/GB_CTRL_BIG", sfx);
     }
+
+    // The library's Surface::init() reads the server
+    // control block (via getDisplayInfo) as its very
+    // first step; both guest graphics clients die there.
+    // Inspect that pointer with our own hands first --
+    // classified, never dereferenced while it looks bad:
+    //   GB_CBLK_NULL   the pointer is NULL
+    //   GB_CBLK_BAD    the pointer is -1 (a failed mmap
+    //                  of the received heap, whose fd
+    //                  never became ours)
+    //   GB_CBLK_OK + GB_DW_<w> + GB_DH_<h>
+    //                  a live block; the display size it
+    //                  carries (expect 480x800)
+    {
+        volatile gb_cblk_t const *cblk =
+                (volatile gb_cblk_t const *)
+                        ComposerService::getControlBlock();
+        if (cblk == NULL) {
+            marker_sfx("/data/GB_CBLK_NULL", sfx);
+            return 1;
+        }
+        if ((const void *)cblk == (const void *)(uintptr_t)-1) {
+            marker_sfx("/data/GB_CBLK_BAD", sfx);
+            return 1;
+        }
+        marker_sfx("/data/GB_CBLK_OK", sfx);
+        marker_val("/data/GB_DW_", cblk->displays[0].w, sfx);
+        marker_val("/data/GB_DH_", cblk->displays[0].h, sfx);
+        DisplayInfo dinfo;
+        if (SurfaceComposerClient::getDisplayInfo(0, &dinfo) == NO_ERROR) {
+            marker_sfx("/data/GB_DINFO_OK", sfx);
+        } else {
+            marker_sfx("/data/GB_DINFO_FAIL", sfx);
+        }
+    }
+
     ctrl->setLayer(100000);
+    marker_sfx("/data/GB_LAYER", sfx);
 
     sp<Surface> surf = ctrl->getSurface();
     if (surf == NULL) {

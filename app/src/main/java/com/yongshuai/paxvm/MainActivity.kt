@@ -530,7 +530,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v9")
+        val marker = File(sysDir, ".gbsystem-v10")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

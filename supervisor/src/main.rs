@@ -2102,12 +2102,15 @@ fn binder_handle_txn(
     // Telemetry: decode the interface token so the log states
     // who this transaction speaks to and whether it is one-way.
     {
-        let tok = if data.len() >= 12 {
-            let n = u32_at(&data, 8) as usize;
-            if n <= 128 && data.len() >= 12 + (n + 1) * 2 {
+        let tok = if data.len() >= 8 {
+            // Parcel layout: strict-policy word, then the
+            // interface token as a char count followed by
+            // UTF-16 code units.
+            let n = u32_at(&data, 4) as usize;
+            if n <= 128 && data.len() >= 8 + (n + 1) * 2 {
                 (0..n)
                     .map(|k| {
-                        u16::from_le_bytes([data[12 + k * 2], data[13 + k * 2]]) as u8 as char
+                        u16::from_le_bytes([data[8 + k * 2], data[9 + k * 2]]) as u8 as char
                     })
                     .collect::<String>()
             } else {
@@ -2154,6 +2157,7 @@ fn binder_handle_txn(
 #[allow(clippy::too_many_arguments)]
 fn binder_write_read(
     pid: i32,
+    compat: bool,
     arena: &str,
     regs: &mut Regs,
     pend: &mut Pending,
@@ -2207,6 +2211,31 @@ fn binder_write_read(
         let _ = write_mem(pid, rb as u64, &bytes);
         let _ = write_mem(pid, bwr_addr, &writeback(bytes.len() as u32));
         skip_syscall(pid, regs, pend, 0);
+        // Deliveries to this arena may have left fd fixups
+        // unresolved. They are normally settled when the
+        // receiver is woken out of a park; a thread that
+        // finds its reply already queued on entry never
+        // parks, and would go on to read the parcel with
+        // the senders' raw fds still in it (a received
+        // heap's client-side mmap then fails on a foreign
+        // fd). Settle them now, while this call sits in
+        // the same skipped state the parked path resolves
+        // from: rides consume this call's entry->exit
+        // transition, so the fake result is applied to the
+        // regs here and the caller drops its exit-stop
+        // expectation (it keys that off pend.applied).
+        if let Some(fixups) = st.fd_pending.remove(&arena) {
+            if !fixups.is_empty() {
+                let rides =
+                    resolve_fd_fixups_core(pid, compat, st, &arena, &fixups, regs);
+                if rides > 0 {
+                    regs.set_retval(0);
+                    if set_regs(pid, regs) {
+                        pend.applied = true;
+                    }
+                }
+            }
+        }
         notes.push(format!("read filled {}B", bytes.len()));
     } else if rs > 0 {
         skip_syscall(pid, regs, pend, 0);
@@ -2332,20 +2361,20 @@ fn inject_openat(
 /// standing for the late-SIGSYS rescue). When every fixup
 /// is a cache hit nothing is ridden and the ordinary flow
 /// is left untouched.
-fn resolve_fd_fixups(
+/// Core of the fixup resolution: have the receiver open
+/// each sender fd (cache first), patch the parcel words in
+/// the arena file, and return how many injection rides were
+/// needed. Settling the receiver's stop state differs
+/// between callers (parked wake vs WRITE_READ entry), so it
+/// stays with them.
+fn resolve_fd_fixups_core(
     pid: i32,
-    procs: &mut HashMap<i32, ProcState>,
+    compat: bool,
     st: &mut BinderState,
     arena: &str,
     fixups: &[FdFixup],
-) {
-    let Some(proc0) = procs.get(&pid) else {
-        return;
-    };
-    let compat = proc0.compat;
-    let Some(mut regs) = get_regs(pid, compat) else {
-        return;
-    };
+    regs: &mut Regs,
+) -> usize {
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
     let mut rides = 0;
@@ -2356,7 +2385,7 @@ fn resolve_fd_fixups(
         } else {
             let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
             let fd = match scratch_write(pid, &mut cursor, &path) {
-                Some(addr) => inject_openat(pid, compat, addr, entry_pc, rides > 0, &mut regs),
+                Some(addr) => inject_openat(pid, compat, addr, entry_pc, rides > 0, &mut *regs),
                 None => -1,
             };
             rides += 1;
@@ -2377,6 +2406,24 @@ fn resolve_fd_fixups(
             pid
         );
     }
+    rides
+}
+
+fn resolve_fd_fixups(
+    pid: i32,
+    procs: &mut HashMap<i32, ProcState>,
+    st: &mut BinderState,
+    arena: &str,
+    fixups: &[FdFixup],
+) {
+    let Some(proc0) = procs.get(&pid) else {
+        return;
+    };
+    let compat = proc0.compat;
+    let Some(mut regs) = get_regs(pid, compat) else {
+        return;
+    };
+    let rides = resolve_fd_fixups_core(pid, compat, st, arena, fixups, &mut regs);
     if rides == 0 {
         return;
     }
@@ -4083,6 +4130,7 @@ fn main() {
                         BINDER_WRITE_READ => {
                             pend.desc = Some(binder_write_read(
                                 pid,
+                                proc.compat,
                                 &arena,
                                 &mut regs,
                                 &mut pend,
@@ -4142,8 +4190,14 @@ fn main() {
                 if dirty {
                     set_regs(pid, &regs);
                 }
+                // A WRITE_READ whose entry handling rode fd
+                // fixup injections has already consumed its
+                // entry->exit transition and applied its fake
+                // result (pend.applied): the next stop is a
+                // fresh entry stop, not this call's exit.
+                let transition_consumed = pend.applied;
                 proc.pending = Some(pend);
-                proc.expect_exit = true;
+                proc.expect_exit = !transition_consumed;
                 if !parked {
                     cont_syscall(pid, 0);
                 }
