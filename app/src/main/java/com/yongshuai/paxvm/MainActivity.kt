@@ -378,7 +378,11 @@ class MainActivity : Activity() {
      * carries (getprop/setprop). */
     private fun installGBSystem(rootfs: File) {
         val sysDir = File(rootfs, "system")
-        val marker = File(sysDir, ".gbsystem-v1")
+        // Bump this marker whenever the gbsystem.zip payload
+        // changes: with the old name present, extraction is
+        // skipped and new payload files (paxsvc in 0.6.2) never
+        // reach the rootfs -- that cost a whole device run.
+        val marker = File(sysDir, ".gbsystem-v2")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->
