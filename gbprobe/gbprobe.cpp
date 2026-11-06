@@ -236,6 +236,28 @@ extern "C" int guest_main(int argc, char **argv, char **envp) {
         return 1;
     }
 
+    // Gun 5: behave like a real application -- keep
+    // posting. The 0.9.38 field run showed the posted
+    // circle composited ONLY inside the boot
+    // animation's 240x34 swap-rect band (bbox
+    // 120,383-359,416, 3.6k px of the expected 45k):
+    // SurfaceFlinger's partial-update repaint set
+    // contained no other dirty region, so a client
+    // that posts twice and goes quiet ages out of the
+    // repaint set entirely. A client that reposts --
+    // every real app -- re-dirties its bounds each
+    // cycle. If the circle now fills in and stays,
+    // the composition stack is faithful and the band
+    // was that aging artifact.
+    for (int i = 0; i < 300; i++) {
+        Surface::SurfaceInfo inf;
+        st = surf->lock(&inf);
+        if (st != NO_ERROR || inf.bits == NULL) break;
+        paint_circle(inf);
+        if (surf->unlockAndPost() != NO_ERROR) break;
+        usleep(100 * 1000);
+    }
+
     marker_sfx("/data/GB_OK", sfx);
     return 0;
 }
