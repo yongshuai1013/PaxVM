@@ -1428,8 +1428,9 @@ fn binder_translate(st: &mut BinderState, from: &str, to: &str, data: &[u8], off
 }
 
 /// Copy a translated parcel into the target arena and queue
-/// the BR_TRANSACTION / BR_REPLY carrying it. Returns false
-/// when the target cannot receive (no mmap, arena full).
+/// the BR_TRANSACTION / BR_REPLY carrying it. On failure the
+/// Err names the exact stage, so a dead delivery explains
+/// itself in the log instead of hiding behind a bool.
 fn binder_deliver(
     st: &mut BinderState,
     target: &str,
@@ -1442,21 +1443,21 @@ fn binder_deliver(
     sender_euid: u32,
     data: &[u8],
     offs: &[u8],
-) -> bool {
+) -> Result<(), &'static str> {
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
-        return false;
+        return Err("alloc failed (no such arena state, or out of mapped space)");
     };
     let Some(bp) = st.procs.get_mut(target) else {
-        return false;
+        return Err("arena state vanished after alloc");
     };
     let Some(&base) = bp.base.values().next() else {
-        return false;
+        return Err("target arena has no recorded mmap base");
     };
     if bp.file.write_all_at(data, off as u64).is_err()
         || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
     {
-        return false;
+        return Err("arena file write failed");
     }
     let mut txn = [0u8; 40];
     put_u32(&mut txn, 0, target_ptr);
@@ -1471,7 +1472,7 @@ fn binder_deliver(
     put_u32(&mut txn, 36, base + off + ((data.len() as u32 + 3) & !3));
     bp.queue.extend_from_slice(&br_cmd.to_le_bytes());
     bp.queue.extend_from_slice(&txn);
-    true
+    Ok(())
 }
 
 /// If the target arena has a parked reader, schedule its
@@ -1666,7 +1667,7 @@ fn binder_handle_txn(
             return;
         };
         let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs);
-        let ok = binder_deliver(
+        let delivered = binder_deliver(
             st,
             &w.sender_arena,
             BR_REPLY,
@@ -1679,7 +1680,8 @@ fn binder_handle_txn(
             &tdata,
             &offs,
         );
-        if !ok {
+        if let Err(why) = delivered {
+            notes.push(format!("REPLY delivery failed: {why}"));
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.queue.extend_from_slice(&BR_FAILED_REPLY.to_le_bytes());
             }
@@ -1705,14 +1707,14 @@ fn binder_handle_txn(
         (n.owner.clone(), n.ptr, n.cookie)
     };
     let tdata = binder_translate(st, arena, &owner, &data, &offs);
-    let ok = binder_deliver(
+    let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
     );
-    if !ok {
+    if let Err(why) = delivered {
         if let Some(bp) = st.procs.get_mut(arena) {
             bp.queue.extend_from_slice(&BR_DEAD_REPLY.to_le_bytes());
         }
-        notes.push("TRANSACTION target cannot receive -> DEAD_REPLY".to_string());
+        notes.push(format!("TRANSACTION target cannot receive ({why}) -> DEAD_REPLY"));
         return;
     }
     if flags & TF_ONE_WAY == 0 {
@@ -3252,9 +3254,17 @@ fn main() {
                             }
                         }
                         if let Some((arena, maplen)) = &pend.mmap_binder {
-                            if ret > 0 {
+                            // mmap success is a u32 test, not
+                            // `ret > 0`: guest bases sit above
+                            // 0x80000000, whose sign-extended
+                            // i64 form is negative -- with the
+                            // signed test no base was ever
+                            // recorded and every delivery failed
+                            // (0.6.4 device run).
+                            let r32 = ret as u32;
+                            if r32 != 0 && r32 < 0xFFFFF001 {
                                 if let Some(bp) = binder.procs.get_mut(arena) {
-                                    bp.base.insert(pid, ret as u32);
+                                    bp.base.insert(pid, r32);
                                     bp.maplen.insert(pid, *maplen);
                                 }
                             }
