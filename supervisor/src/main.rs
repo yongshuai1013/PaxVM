@@ -1246,6 +1246,96 @@ fn fd_arena(pid: i32, fd: i32) -> Option<String> {
     }
 }
 
+// ---- virtual framebuffer (S6) ----
+// Fixed geometry, era-typical (Nexus S class): 480x800,
+// 32bpp, double buffered. The guest maps {rootfs}/.fb0
+// (opened via device_map) and draws; FBIOPAN_DISPLAY /
+// FBIOPUT_VSCREENINFO record the visible page's yoffset
+// into {rootfs}/.fb-page, which the shell polls to present
+// the right page. Struct layouts are the guest era's own
+// (bionic 2.3.7 linux/fb.h, verified field by field).
+const FB_W: u32 = 480;
+const FB_H: u32 = 800;
+const FB_PAGE_BYTES: u32 = FB_W * FB_H * 4;
+const FB_TOTAL_BYTES: u32 = FB_PAGE_BYTES * 2;
+const FBIOGET_VSCREENINFO: u32 = 0x4600;
+const FBIOPUT_VSCREENINFO: u32 = 0x4601;
+const FBIOGET_FSCREENINFO: u32 = 0x4602;
+const FBIOPAN_DISPLAY: u32 = 0x4606;
+const FBIO_WAITFORVSYNC: u32 = 0x4004_4620;
+
+fn fd_is_fb(pid: i32, fd: i32) -> bool {
+    match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+        Ok(t) => t.to_string_lossy().contains("/.fb0"),
+        Err(_) => false,
+    }
+}
+
+fn entry_fb_ioctl(
+    pid: i32,
+    rootfs: &str,
+    req: u32,
+    regs: &mut Regs,
+    pend: &mut Pending,
+) -> String {
+    let arg = regs.arg(2);
+    match req {
+        FBIOGET_VSCREENINFO => {
+            let mut v = [0u32; 40];
+            v[0] = FB_W;
+            v[1] = FB_H;
+            v[2] = FB_W;
+            v[3] = FB_H * 2;
+            v[6] = 32;
+            v[8] = 16;
+            v[9] = 8; // red: offset 16, length 8
+            v[11] = 8;
+            v[12] = 8; // green: offset 8, length 8
+            v[14] = 0;
+            v[15] = 8; // blue: offset 0, length 8
+            v[17] = 24;
+            v[18] = 8; // transp: offset 24, length 8
+            v[22] = 127; // height mm
+            v[23] = 76; // width mm
+            let mut bytes = [0u8; 160];
+            for (i, w) in v.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let _ = write_mem(pid, arg, &bytes);
+            skip_syscall(pid, regs, pend, 0);
+            format!("fb GET_VSCREENINFO -> {FB_W}x{FB_H}x32 (virtual {FB_W}x{})", FB_H * 2)
+        }
+        FBIOGET_FSCREENINFO => {
+            let mut b = [0u8; 68];
+            b[0..5].copy_from_slice(b"paxfb");
+            b[20..24].copy_from_slice(&FB_TOTAL_BYTES.to_le_bytes());
+            b[32..36].copy_from_slice(&2u32.to_le_bytes()); // FB_VISUAL_TRUECOLOR
+            b[38..40].copy_from_slice(&1u16.to_le_bytes()); // ypanstep
+            b[44..48].copy_from_slice(&(FB_W * 4).to_le_bytes()); // line_length
+            let _ = write_mem(pid, arg, &b);
+            skip_syscall(pid, regs, pend, 0);
+            "fb GET_FSCREENINFO".to_string()
+        }
+        FBIOPAN_DISPLAY | FBIOPUT_VSCREENINFO => {
+            let mut buf = [0u8; 160];
+            let yoff = if read_mem(pid, arg, &mut buf).is_ok() {
+                u32_at(&buf, 20)
+            } else {
+                0
+            };
+            let _ = std::fs::write(format!("{rootfs}/.fb-page"), format!("{yoff}"));
+            skip_syscall(pid, regs, pend, 0);
+            format!("fb PAN yoffset={yoff} (page {})", yoff / FB_H)
+        }
+        _ => {
+            // FBIO_WAITFORVSYNC and anything else in the
+            // intercepted set: succeed silently.
+            skip_syscall(pid, regs, pend, 0);
+            "fb ioctl (accepted)".to_string()
+        }
+    }
+}
+
 struct BinderProc {
     file: std::fs::File,
     /// thread pid -> guest address of this arena's mmap
@@ -2162,6 +2252,11 @@ fn device_map(rootfs: &str, guest_abs_path: &str) -> Option<String> {
         "/dev/zero" => Some("/dev/zero".to_string()),
         "/dev/urandom" | "/dev/random" => Some("/dev/urandom".to_string()),
         "/dev/__kmsg__" => Some(format!("{rootfs}/.kmsg")),
+        // The virtual framebuffer (S6): a plain shared file
+        // the shell creates per session; the guest maps it
+        // and draws, the shell reads pages back and shows
+        // them. Its ioctls are answered by entry_fb_ioctl.
+        "/dev/graphics/fb0" => Some(format!("{rootfs}/.fb0")),
         _ => None,
     }
 }
@@ -3256,6 +3351,28 @@ fn main() {
                     pend.mmap_binder = Some((arena, regs.arg(1) as u32));
                     pend.desc = Some(format!(
                         "mmap({nr}) binder arena (PRIVATE -> SHARED for driver writes)"
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
+                    && matches!(
+                        regs.arg(1) as u32,
+                        FBIOGET_VSCREENINFO
+                            | FBIOPUT_VSCREENINFO
+                            | FBIOGET_FSCREENINFO
+                            | FBIOPAN_DISPLAY
+                            | FBIO_WAITFORVSYNC
+                    )
+                    && fd_is_fb(pid, regs.arg(0) as i32)
+                {
+                    // Virtual framebuffer ioctls (S6): the
+                    // geometry answers and the pan bookkeeping
+                    // live in entry_fb_ioctl.
+                    pend.desc = Some(entry_fb_ioctl(
+                        pid,
+                        &rootfs,
+                        regs.arg(1) as u32,
+                        &mut regs,
+                        &mut pend,
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))

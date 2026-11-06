@@ -15,8 +15,12 @@ import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
+import android.graphics.Bitmap
+import android.widget.ImageView
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -56,6 +60,14 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
+    private lateinit var fbView: ImageView
+
+    /** Rootfs of the GB session whose framebuffer is being
+     * previewed, or null. The preview thread polls while its
+     * captured rootfs is still the current session. */
+    @Volatile
+    private var fbSession: File? = null
+    private var fbBitmap: Bitmap? = null
     private lateinit var startButton: Button
     private lateinit var probeButton: Button
     private lateinit var gbButton: Button
@@ -166,6 +178,11 @@ class MainActivity : Activity() {
         "sleep 1",
         "/system/bin/lbprobe list",
         "/system/bin/lbprobe ping",
+        // S6a: the framebuffer probe draws an animated test
+        // pattern into the virtual fb0 for ~25 s; the shell's
+        // preview area shows it live. It runs in the
+        // background so the rest of the probe can finish.
+        "/system/bin/fbprobe &",
         "ls /",
         "echo paxprobe-end",
     ).joinToString("\n", postfix = "\n")
@@ -274,6 +291,22 @@ class MainActivity : Activity() {
         root.addView(buttons)
         root.addView(logButtons)
 
+        // Guest framebuffer preview (S6): hidden until a GB
+        // session starts; the preview thread fills it from
+        // the shared .fb0 file the guest draws into.
+        fbView = ImageView(this).apply {
+            visibility = android.view.View.GONE
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(0xFF000000.toInt())
+        }
+        root.addView(
+            fbView,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (430 * resources.displayMetrics.density).toInt(),
+            ),
+        )
+
         logView = TextView(this).apply {
             textSize = 12f
             typeface = Typeface.MONOSPACE
@@ -372,6 +405,13 @@ class MainActivity : Activity() {
         // (the supervisor also recreates state per pid, this is
         // belt and braces).
         File(rootfs, ".binder").deleteRecursively()
+        // Virtual framebuffer backing (S6): two 480x800x32
+        // pages, zeroed per session, plus the visible-page
+        // note the supervisor's fb ioctl handler maintains.
+        RandomAccessFile(File(rootfs, ".fb0"), "rw").use {
+            it.setLength(480L * 800 * 4 * 2)
+        }
+        writeFresh(File(rootfs, ".fb-page"), "0")
         // Evidence markers in /data persist across sessions
         // by design (a re-run shows -EEXIST, which is itself
         // readable evidence) -- but the S5c scenario reuses
@@ -384,7 +424,8 @@ class MainActivity : Activity() {
                 n.startsWith("SERVE") || n.startsWith("LIST") ||
                 n.startsWith("GET_H_") || n.startsWith("GONE_") ||
                 n.startsWith("PING_") || n.startsWith("STAGE_IS_") ||
-                n.startsWith("FROMPROBE_IS_") || n.startsWith("LB")
+                n.startsWith("FROMPROBE_IS_") || n.startsWith("LB") ||
+                n.startsWith("FB_")
             ) {
                 f.deleteRecursively()
             }
@@ -416,7 +457,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v4")
+        val marker = File(sysDir, ".gbsystem-v5")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->
@@ -540,6 +581,9 @@ class MainActivity : Activity() {
             return
         }
         supervisor = proc
+        if (gb) {
+            startFbPreview(rootfs)
+        }
         startButton.isEnabled = false
         probeButton.isEnabled = false
         gbButton.isEnabled = false
@@ -573,6 +617,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 supervisor = null
+                fbSession = null
                 startButton.isEnabled = true
                 probeButton.isEnabled = true
                 gbButton.isEnabled = true
@@ -581,6 +626,48 @@ class MainActivity : Activity() {
                     "rootfs: ${rootfs.absolutePath}\n狀態：監督器已結束"
             }
             appendLog("[shell] supervisor exited: $code")
+        }
+    }
+
+    /** Poll the guest framebuffer file and present the
+     * visible page. The guest draws into .fb0 through the
+     * supervisor's shared mapping and reports pans in
+     * .fb-page; this loop (~5 fps) is the whole display
+     * path for now -- the picture above the log is the
+     * guest's own pixels, byte for byte. */
+    private fun startFbPreview(rootfs: File) {
+        fbSession = rootfs
+        runOnUiThread { fbView.visibility = android.view.View.VISIBLE }
+        thread(name = "fb-preview") {
+            val fbFile = File(rootfs, ".fb0")
+            val pageFile = File(rootfs, ".fb-page")
+            val pageBytes = 480 * 800 * 4
+            val buf = ByteArray(pageBytes)
+            while (fbSession === rootfs) {
+                try {
+                    val yoff =
+                        pageFile.readText().trim().toIntOrNull() ?: 0
+                    RandomAccessFile(fbFile, "r").use { raf ->
+                        raf.seek(yoff.toLong() * 480L * 4)
+                        raf.readFully(buf)
+                    }
+                    val bmp = fbBitmap ?: Bitmap.createBitmap(
+                        480,
+                        800,
+                        Bitmap.Config.ARGB_8888,
+                    ).also { fbBitmap = it }
+                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(buf))
+                    runOnUiThread { fbView.setImageBitmap(bmp) }
+                } catch (_: Exception) {
+                    // Mid-teardown or a torn read: the next
+                    // iteration (or the session end) sorts it.
+                }
+                try {
+                    Thread.sleep(200)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
         }
     }
 

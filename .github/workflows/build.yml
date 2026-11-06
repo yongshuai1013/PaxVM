@@ -327,6 +327,34 @@ jobs:
             echo "paxsvc carries IRELATIVE relocs (2.3 linker cannot)" >&2; exit 1
           fi
           ls -la gbsys/bin/paxsvc
+      # fbprobe (S6a): the framebuffer test-pattern client.
+      # Same freestanding recipe as paxsvc; its libc stub
+      # additionally carries nanosleep.
+      - name: Build fbprobe (guest framebuffer client)
+        run: |
+          set -euo pipefail
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > /tmp/libcst_fb.c <<'CEOF'
+          int open(void){return 0;} int close(void){return 0;} int read(void){return 0;}
+          int write(void){return 0;} int ioctl(void){return 0;} void *mmap(void){return 0;}
+          int munmap(void){return 0;} int mkdir(void){return 0;} void _exit(int x){(void)x;}
+          void __libc_init(void){} int nanosleep(void){return 0;}
+          CEOF
+          "$TC/clang" --target=armv7a-linux-androideabi -nostdlib -shared \
+            -Wl,-soname,libc.so -o /tmp/libc_stub_fb.so /tmp/libcst_fb.c
+          mkdir -p gbsys/bin
+          "$TC/clang" --target=armv7a-linux-androideabi -marm -O2 \
+            -fno-stack-protector -fno-builtin -nostdlib -no-pie \
+            -Wl,-e,_start -Wl,--no-undefined \
+            -Wl,-dynamic-linker,/system/bin/linker \
+            -o gbsys/bin/fbprobe fbprobe/fbprobe.c /tmp/libc_stub_fb.so
+          "$TC/llvm-readelf" -h gbsys/bin/fbprobe | grep -q 'Class:.*ELF32'
+          "$TC/llvm-readelf" -h gbsys/bin/fbprobe | grep -q 'Type:.*EXEC'
+          "$TC/llvm-readelf" -d gbsys/bin/fbprobe | grep -q 'NEEDED.*libc.so'
+          if "$TC/llvm-readelf" -r gbsys/bin/fbprobe | grep -q IRELATIVE; then
+            echo "fbprobe carries IRELATIVE relocs (2.3 linker cannot)" >&2; exit 1
+          fi
+          ls -la gbsys/bin/fbprobe
       - name: Fetch Gingerbread system subset (SDK API 10 system image)
         run: |
           set -euo pipefail
