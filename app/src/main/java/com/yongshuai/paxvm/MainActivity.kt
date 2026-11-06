@@ -134,7 +134,18 @@ class MainActivity : Activity() {
         "    export PATH /sbin:/bin:/system/bin",
         "    export ANDROID_ROOT /system",
         "    export ANDROID_DATA /data",
+        // S7: the stock BOOTCLASSPATH (ramdisk init.rc:20);
+        // app_process starts the VM with no boot classpath
+        // at all when the variable is missing.
+        "    export BOOTCLASSPATH /system/framework/core.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/core-junit.jar",
         "    mkdir /data/misc",
+        // S7: the /data skeleton zygote expects to exist
+        // (stock init.rc creates these in `on init`).
+        "    mkdir /data/dalvik-cache 0771",
+        "    mkdir /data/system",
+        "    mkdir /data/data",
+        "    mkdir /data/app",
+        "    mkdir /data/local",
         "    setprop pax.stage init",
         "",
         "on fs",
@@ -144,6 +155,7 @@ class MainActivity : Activity() {
         "    setprop pax.stage boot",
         "    start servicemanager",
         "    start surfaceflinger",
+        "    start zygote",
         "    start bootanimation",
         "    start gbprobe",
         "    start paxprobe",
@@ -194,6 +206,19 @@ class MainActivity : Activity() {
         "    user graphics",
         "    group graphics",
         "    oneshot",
+        "",
+        // S7 gun 1: the real zygote, standing alone. No
+        // --start-system-server yet (system_server is S8:
+        // if it dies, GB's zygote takes itself down with
+        // it, which would muddy this gun's verdict). The
+        // socket line makes the stock init create
+        // /dev/socket/zygote and hand app_process the fd,
+        // exactly as on hardware. No user line: root, as
+        // in the stock rc. The stock onrestart /sys writes
+        // are omitted -- this guest has no real sysfs for
+        // them to land on.
+        "service zygote /system/bin/app_process -Xzygote /system/bin --zygote",
+        "    socket zygote stream 666",
         "",
     ).joinToString("\n")
 
@@ -589,7 +614,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v14")
+        val marker = File(sysDir, ".gbsystem-v15")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->

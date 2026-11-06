@@ -366,6 +366,15 @@ jobs:
           mkdir -p gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
           for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
                    framework/framework-res.apk \
+                   build.prop \
+                   bin/app_process bin/dexopt bin/dalvikvm \
+                   framework/core.jar framework/core.odex \
+                   framework/bouncycastle.jar framework/bouncycastle.odex \
+                   framework/ext.jar framework/ext.odex \
+                   framework/framework.jar framework/framework.odex \
+                   framework/android.policy.jar framework/android.policy.odex \
+                   framework/services.jar framework/services.odex \
+                   framework/core-junit.jar framework/core-junit.odex \
                    lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
                    lib/liblog.so lib/libcutils.so lib/libbinder.so \
                    lib/libutils.so lib/libz.so lib/libETC1.so \
@@ -375,6 +384,14 @@ jobs:
                    lib/libhardware.so lib/libhardware_legacy.so \
                    lib/libpixelflinger.so lib/libskia.so lib/libjpeg.so \
                    lib/libemoji.so lib/libnetutils.so lib/libwpa_client.so \
+                   lib/libandroid_runtime.so lib/libdvm.so \
+                   lib/libnativehelper.so lib/libgui.so \
+                   lib/libcamera_client.so lib/libskiagl.so \
+                   lib/libsqlite.so lib/libsonivox.so \
+                   lib/libcrypto.so lib/libssl.so \
+                   lib/libicuuc.so lib/libicui18n.so \
+                   lib/libmedia.so lib/libnfc_ndef.so \
+                   lib/libexpat.so lib/libGLESv2.so \
                    lib/hw/gralloc.default.so lib/egl/libGLES_android.so; do
             debugfs -R "dump -p /$p gbsys/$p" armeabi-v7a/system.img 2>/dev/null
             test -s "gbsys/$p" || { echo "missing from system.img: $p" >&2; exit 1; }
