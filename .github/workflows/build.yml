@@ -366,7 +366,7 @@ jobs:
           test -f gbsys/bin/servicemanager
           test -f gbsys/framework/twframework.odex
           test -f gbsys/app/TouchWiz30Launcher.apk
-          ls -la gbsys/bin gbsys/lib gbsys/framework | head -30
+          ls -la gbsys/bin gbsys/framework
 
       # lbprobe (S5c): a real libbinder client/server. Built
       # after the subset fetch because its symbol stubs are
