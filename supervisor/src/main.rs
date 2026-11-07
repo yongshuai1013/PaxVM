@@ -4122,6 +4122,29 @@ fn binder_notify_ref(
     st.note("ref notice queued to object owner");
 }
 
+/// Compact dump of a parcel's object slots for telemetry:
+/// one "off: type +8 +12" triple per offsets entry.
+fn slot_dump(data: &[u8], offs: &[u8]) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i + 4 <= offs.len() {
+        let off = u32_at(offs, i) as usize;
+        i += 4;
+        if off + 16 > data.len() {
+            s.push_str(&format!(" @{off}:OOB"));
+            continue;
+        }
+        s.push_str(&format!(
+            " @{}: t=0x{:08x} b=0x{:x} k=0x{:x}",
+            off,
+            u32_at(data, off),
+            u32_at(data, off + 8),
+            u32_at(data, off + 12)
+        ));
+    }
+    s
+}
+
 /// The driver's parcel translation: local objects become
 /// nodes, handles resolve through the sender's table, and
 /// everything is re-expressed in the receiver's view. FD
@@ -4228,6 +4251,12 @@ fn binder_deliver(
         || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
     {
         return Err("arena file write failed");
+    }
+    if !offs.is_empty() {
+        bsup!(
+            "binder: deliver to={target} br={br_cmd} code={code} from_pid={sender_pid} slots{}",
+            slot_dump(data, offs)
+        );
     }
     let mut txn = [0u8; 40];
     put_u32(&mut txn, 0, target_ptr);
@@ -4538,6 +4567,12 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     } else {
         Vec::new()
     };
+    if !offs.is_empty() {
+        bsup!(
+            "binder: raw txn pid={pid} arena={arena} reply={is_reply} code={code} slots{}",
+            slot_dump(&data, &offs)
+        );
+    }
     if is_reply {
         let w = st
             .waiters
