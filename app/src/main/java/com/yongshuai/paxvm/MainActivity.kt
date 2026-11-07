@@ -82,6 +82,7 @@ class MainActivity : Activity() {
     private var uiFlushPosted = false
     private val logFileLock = Object()
     private var previousLogFile: File? = null
+    private var sessionLogFileRef: File? = null
     private var sessionRan = false
 
     // On-screen log flood guards (0.9.23): exact-repeat
@@ -352,6 +353,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         initLogFiles()
+        installCrashRecorder()
         thread(name = "exitinfo", isDaemon = true) {
             reportPreviousExits()
         }
@@ -376,6 +378,7 @@ class MainActivity : Activity() {
                 cur.renameTo(prev)
                 previousLogFile = prev
             }
+            sessionLogFileRef = cur
             logFileOut = FileOutputStream(cur, true)
             // The 0.9.54 batching flusher: lands buffered
             // session-log lines every 250 ms so the file
@@ -403,14 +406,73 @@ class MainActivity : Activity() {
                     // kill, e.g. LMK).
                     passes++
                     if (passes % 40 == 0 && supervisor != null) {
+                        // 0.9.74: the heartbeat also carries
+                        // the app process's own memory, so
+                        // the next death's log shows whether
+                        // memory climbed steadily (a leak)
+                        // or spiked (one huge allocation).
+                        // The 0.9.73 death was a Java CRASH
+                        // at pss 833 MB -- our own code.
+                        val rt = Runtime.getRuntime()
+                        val heapKb = (rt.totalMemory() - rt.freeMemory()) / 1024
                         writeLogLineToFile(
-                            "[shell] heartbeat (app alive)",
+                            "[shell] heartbeat (app alive) heapKB=$heapKb rssKB=${selfRssKb()}",
                         )
                     }
                 }
             }
         } catch (e: Exception) {
             logFileOut = null
+        }
+    }
+
+    /** This process's resident size in KB, from procfs. */
+    private fun selfRssKb(): Long {
+        return try {
+            val line = File("/proc/self/status").useLines { lines ->
+                lines.firstOrNull { it.startsWith("VmRSS") }
+            } ?: return -1
+            line.filter { it.isDigit() }.toLong()
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    /**
+     * Record an uncaught exception's stack into the
+     * session log before the system takes the process
+     * down. The 0.9.73 field death was recorded by the
+     * system as CRASH (a Java exception in our own
+     * code) at pss 833 MB, but the stack itself only
+     * ever reached logcat, which we cannot read from
+     * here; the next crash must leave its stack in the
+     * downloadable log. The write bypasses the batched
+     * flusher and syncs straight to disk, then the
+     * previous handler still runs so the system's own
+     * bookkeeping is unchanged.
+     */
+    private fun installCrashRecorder() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            try {
+                val sw = java.io.StringWriter()
+                error.printStackTrace(java.io.PrintWriter(sw))
+                val rt = Runtime.getRuntime()
+                val heapKb = (rt.totalMemory() - rt.freeMemory()) / 1024
+                val text = "[crash] uncaught in thread ${thread.name} " +
+                    "heapKB=$heapKb rssKB=${selfRssKb()}:\n$sw\n"
+                val f = sessionLogFileRef
+                if (f != null) {
+                    java.io.FileOutputStream(f, true).use { out ->
+                        out.write(text.toByteArray())
+                        out.flush()
+                        out.fd.sync()
+                    }
+                }
+            } catch (e: Exception) {
+                // Nothing sensible left to do at this point.
+            }
+            previous?.uncaughtException(thread, error)
         }
     }
 
