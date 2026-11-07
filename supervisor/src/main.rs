@@ -3194,7 +3194,7 @@ fn binder_open_arena(
     let arena = std::fs::canonicalize(&arena_raw)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or(arena_raw.clone());
-    match std::fs::OpenOptions::new().create(true).write(true).open(&arena) {
+    match std::fs::OpenOptions::new().create(true).read(true).write(true).open(&arena) {
         Ok(f) => {
             if f.metadata().map(|m| m.len()).unwrap_or(0) < BINDER_ARENA_CAP as u64 {
                 let _ = f.set_len(BINDER_ARENA_CAP as u64);
