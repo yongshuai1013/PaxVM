@@ -51,8 +51,14 @@ class SystemLimitActivity : Activity() {
         actionBar?.apply {
             setDisplayHomeAsUpEnabled(true)
             setDisplayShowHomeEnabled(false)
-            setDisplayShowTitleEnabled(false)
+            // Title slot carries the word 返回 next to
+            // the arrow (see SettingsActivity's note).
+            setDisplayShowTitleEnabled(true)
+            // The genuine Android 4.4 Holo up indicator
+            // (see SettingsActivity's note).
+            setHomeAsUpIndicator(R.drawable.ic_ab_back_holo_dark)
         }
+        setTitle("返回")
         buildUi()
     }
 

@@ -25,8 +25,17 @@ class SettingsActivity : Activity() {
         actionBar?.apply {
             setDisplayHomeAsUpEnabled(true)
             setDisplayShowHomeEnabled(false)
-            setDisplayShowTitleEnabled(false)
+            // Title slot carries the word 返回 next to
+            // the arrow (the user asked for the text
+            // there), not the page name.
+            setDisplayShowTitleEnabled(true)
+            // The genuine Android 4.4 Holo up indicator
+            // (ic_ab_back_holo_dark_am from AOSP 4.4) --
+            // the modern framework's thin chevron looked
+            // wrong to the user.
+            setHomeAsUpIndicator(R.drawable.ic_ab_back_holo_dark)
         }
+        setTitle("返回")
         fragmentManager.beginTransaction()
             .replace(android.R.id.content, SettingsFragment())
             .commit()
