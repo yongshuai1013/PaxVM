@@ -29,6 +29,7 @@ import java.util.Date
 import java.util.Locale
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
@@ -914,211 +915,276 @@ class MainActivity : Activity() {
         appendLog("[shell] 日誌已複製到剪貼簿（${text.count { it == '\n' } + 1} 行）")
     }
 
-    /** Save the whole log view as a .txt in the device's
-     * Download folder (MediaStore on API 29+, no permission
-     * needed; legacy public dir below that). Added 0.3.5 at the
-     * user's request, alongside 複製日誌. */
+    /** Export the session's log FILES into a fresh
+     * directory under Download (Download/PaxVM-logs-<time>/):
+     * session-log.txt, previous-session-log.txt, the
+     * supervisor's direct mirror logs and the guest
+     * /dev/log channels are copied file by file, streamed
+     * through a small buffer, never loaded whole into
+     * memory; a parsed, readable rendering of the guest
+     * channels is added as guest-log.txt (last 500 entries
+     * per channel, pixelflinger dropped as before).
+     *
+     * This replaces the pre-0.9.77 single-file export,
+     * which composed the whole download as one string in
+     * RAM (session readText + previous readText + every
+     * direct log readText + concatenation copies + a
+     * UTF-8 byte copy on top): at S8 log volumes that is
+     * several hundred MB of live text against a 256MB
+     * heap, and the resulting OutOfMemoryError is an
+     * Error, not an Exception, so none of the old
+     * try/catch blocks caught it -- pressing the download
+     * button crashed the app deterministically
+     * (2026-11-07, two fields in a row, the second on a
+     * fresh launch whose only job was the export). */
+    private val exportingLog =
+        java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun saveLog() {
-        // The session log FILE is the complete record; the
-        // on-screen view is trimmed and can lag behind.
-        // Serve the file whenever it has content -- this
-        // launch's file first (it holds the whole session,
-        // untrimmed), then the previous launch's (the
-        // force-stop-and-reopen recovery) -- and fall back
-        // to the view only when no file exists (0.9.24;
-        // 0.9.23's view-first logic returned just the
-        // trimmed tail for a session downloaded in the
-        // same launch).
+        if (!exportingLog.compareAndSet(false, true)) {
+            appendLog("[shell] 日誌匯出進行中，請稍候")
+            return
+        }
+        thread(name = "log-export") {
+            try {
+                exportLogDir()
+            } catch (e: Exception) {
+                appendLog("[shell] 存日誌失敗：$e")
+            } finally {
+                exportingLog.set(false)
+            }
+        }
+    }
+
+    private fun exportLogDir() {
         // Land the batched lines first (0.9.54): the
         // newest quarter-second of the session must not
-        // be missing from the downloaded record.
+        // be missing from the exported record.
         flushLogFile()
-        val prev = previousLogFile
-        val cur = File(filesDir, "session-log.txt")
-        val fromFile: File? = when {
-            cur.exists() && cur.length() > 0 -> cur
-            prev != null && prev.exists() && prev.length() > 0 -> prev
-            else -> null
-        }
-        val fromPrevious = fromFile != null && prev != null &&
-            fromFile.absolutePath == prev.absolutePath
-        val text = if (fromFile != null) {
-            try {
-                fromFile.readText()
-            } catch (e: Exception) {
-                logView.text.toString()
-            }
-        } else {
-            logView.text.toString()
-        }
-        // Guest log channels (S7 gun 3): the supervisor
-        // maps /dev/log/* to plain files under .logs/;
-        // fold a printable-strings extraction of the main
-        // and system channels into the saved log, so the
-        // guest runtime's own error account (the thing
-        // that was invisible while app_process died
-        // silently) travels with every log download.
-        val guestLogs = StringBuilder()
-        for (ch in listOf("main", "system")) {
-            val f = File(rootfsGBDir, ".logs/log-$ch")
-            if (f.exists() && f.length() > 0) {
-                val bytes = try {
-                    f.readBytes()
-                } catch (e: Exception) {
-                    ByteArray(0)
-                }
-                // Parse the GB logger_entry stream properly
-                // (20-byte header: u16 len, u16 pad, pid,
-                // tid, sec, nsec; payload = priority byte,
-                // NUL-terminated tag, message). The 0.9.51
-                // strings extraction drowned the signal:
-                // SurfaceFlinger's pixelflinger tag floods
-                // the channel, so its entries are dropped
-                // here and the runtime's own lines (Zygote,
-                // AndroidRuntime) survive to the saved log.
-                val entries = ArrayList<String>()
-                var off = 0
-                fun u16le(o: Int) =
-                    (bytes[o].toInt() and 0xFF) or
-                        ((bytes[o + 1].toInt() and 0xFF) shl 8)
-                fun i32le(o: Int) =
-                    (bytes[o].toInt() and 0xFF) or
-                        ((bytes[o + 1].toInt() and 0xFF) shl 8) or
-                        ((bytes[o + 2].toInt() and 0xFF) shl 16) or
-                        ((bytes[o + 3].toInt() and 0xFF) shl 24)
-                while (off + 20 <= bytes.size) {
-                    val len = u16le(off)
-                    if (len < 2 || len > 8192 ||
-                        off + 20 + len > bytes.size
-                    ) {
-                        off++
-                        continue
-                    }
-                    val pid = i32le(off + 4)
-                    val prio = bytes[off + 20].toInt() and 0xFF
-                    var p = off + 21
-                    val tagStart = p
-                    while (p < off + 20 + len && bytes[p] != 0.toByte()) p++
-                    if (p >= off + 20 + len) {
-                        off++
-                        continue
-                    }
-                    val tag = String(bytes, tagStart, p - tagStart, Charsets.UTF_8)
-                    val msg = String(
-                        bytes,
-                        p + 1,
-                        (off + 20 + len - (p + 1)).coerceAtLeast(0),
-                        Charsets.UTF_8,
-                    ).trimEnd('\u0000', '\n')
-                    if (tag != "pixelflinger") {
-                        val pl = when (prio) {
-                            2 -> "V"; 3 -> "D"; 4 -> "I"
-                            5 -> "W"; 6 -> "E"; 7 -> "F"
-                            else -> prio.toString()
-                        }
-                        entries.add("$pl/$tag($pid): $msg")
-                    }
-                    off += 20 + len
-                }
-                val body = if (entries.isNotEmpty()) {
-                    entries.takeLast(500).joinToString("\n")
-                } else {
-                    // Fallback: the old strings extraction.
-                    val sb = StringBuilder()
-                    var run = StringBuilder()
-                    for (b in bytes) {
-                        val c = (b.toInt() and 0xFF).toChar()
-                        if (c in ' '..'~' || c == '\n' || c == '\t') {
-                            run.append(c)
-                        } else {
-                            if (run.length >= 6) sb.append(run).append('\n')
-                            run = StringBuilder()
-                        }
-                    }
-                    if (run.length >= 6) sb.append(run).append('\n')
-                    sb.toString().takeLast(24000)
-                }
-                if (body.isNotEmpty()) {
-                    guestLogs.append(
-                        "\n===== guest /dev/log/$ch =====\n",
-                    ).append(body)
-                }
-            }
-        }
-        // 0.9.61: when this launch's session file holds
-        // only the rotation stub (the app died last
-        // launch and was reopened), the crashed session
-        // sits in the previous file and the cur-first
-        // rule above would never serve it -- append it
-        // in full so a crash can always be diagnosed
-        // from the next download.
-        var fullText = text
-        if (cur.length() in 1..4096 && prev != null &&
-            prev.exists() && prev.length() > 4096
-        ) {
-            try {
-                fullText +=
-                    "\n===== previous session (preserved) =====\n" +
-                    prev.readText()
-            } catch (e: Exception) {
-            }
-        }
-        // 0.9.61: the supervisor's direct mirror logs
-        // (written by the supervisor processes
-        // themselves, so they survive the app dying);
-        // fold current then previous, W0 first.
-        val directLogs = StringBuilder()
-        val vmDir = File(filesDir, "vm0")
-        for (w in 0..4) {
-            for (suffix in listOf("", "-prev")) {
-                val f = File(vmDir, "supervisor-direct-w$w$suffix.log")
-                if (f.exists() && f.length() > 0) {
-                    try {
-                        directLogs
-                            .append(
-                                "\n===== supervisor direct W$w$suffix =====\n",
-                            )
-                            .append(f.readText())
-                    } catch (e: Exception) {
-                    }
-                }
-            }
-        }
-        val outText = fullText + guestLogs.toString() +
-            directLogs.toString()
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val name = "paxvm-log-$stamp.txt"
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, name)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-                    put(
-                        MediaStore.Downloads.RELATIVE_PATH,
-                        Environment.DIRECTORY_DOWNLOADS,
-                    )
-                }
-                val uri = contentResolver.insert(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    values,
-                ) ?: throw IOException("MediaStore insert returned null")
-                val out = contentResolver.openOutputStream(uri)
-                    ?: throw IOException("openOutputStream returned null")
-                out.use { it.write(outText.toByteArray(Charsets.UTF_8)) }
-            } else {
-                val dir = Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS,
+        val stamp = SimpleDateFormat(
+            "yyyyMMdd-HHmmss", Locale.US,
+        ).format(Date())
+        val dirName = "PaxVM-logs-$stamp"
+        val legacyDir: File? =
+            if (Build.VERSION.SDK_INT >= 29) null else {
+                val d = File(
+                    Environment
+                        .getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS,
+                        ),
+                    dirName,
                 )
-                dir.mkdirs()
-                File(dir, name).writeText(outText)
+                d.mkdirs()
+                d
             }
-            appendLog(
-                if (fromPrevious) "[shell] 上一場日誌已存到 Download/$name"
-                else "[shell] 日誌已存到 Download/$name"
-            )
-        } catch (e: Exception) {
-            appendLog("[shell] 存日誌失敗：$e")
+        fun sink(name: String): OutputStream? {
+            return try {
+                if (legacyDir != null) {
+                    FileOutputStream(File(legacyDir, name))
+                } else {
+                    val values = ContentValues().apply {
+                        put(
+                            MediaStore.Downloads.DISPLAY_NAME,
+                            name,
+                        )
+                        put(
+                            MediaStore.Downloads.MIME_TYPE,
+                            "text/plain",
+                        )
+                        put(
+                            MediaStore.Downloads.RELATIVE_PATH,
+                            Environment.DIRECTORY_DOWNLOADS +
+                                "/" + dirName,
+                        )
+                    }
+                    val uri = contentResolver.insert(
+                        MediaStore.Downloads
+                            .EXTERNAL_CONTENT_URI,
+                        values,
+                    ) ?: return null
+                    contentResolver.openOutputStream(uri)
+                }
+            } catch (e: Exception) {
+                null
+            }
         }
+        var count = 0
+        fun copyFile(name: String, src: File) {
+            if (!src.exists() || src.length() == 0L) return
+            val out = sink(name) ?: return
+            try {
+                out.use { o ->
+                    src.inputStream().use {
+                        it.copyTo(o, 64 * 1024)
+                    }
+                }
+                count++
+            } catch (e: Exception) {
+                // One bad file must not lose the rest.
+            }
+        }
+        copyFile(
+            "session-log.txt",
+            File(filesDir, "session-log.txt"),
+        )
+        val prev = previousLogFile
+        if (prev != null) {
+            copyFile("previous-session-log.txt", prev)
+        }
+        // Supervisor direct mirrors (written by the
+        // supervisor processes themselves, so they
+        // survive the app dying): current then -prev,
+        // W0..W6 (0.9.77: the old export stopped at W4).
+        val vmDir = File(filesDir, "vm0")
+        for (w in 0..6) {
+            for (suffix in listOf("", "-prev")) {
+                copyFile(
+                    "supervisor-direct-w$w$suffix.log",
+                    File(vmDir, "supervisor-direct-w$w$suffix.log"),
+                )
+            }
+        }
+        // Guest /dev/log channels, raw logger_entry files.
+        for (ch in listOf("main", "system", "radio", "events")) {
+            copyFile(
+                "log-$ch",
+                File(rootfsGBDir, ".logs/log-$ch"),
+            )
+        }
+        // Readable rendering of the guest channels.
+        val gout = sink("guest-log.txt")
+        if (gout != null) {
+            try {
+                gout.use { o ->
+                    for (ch in listOf("main", "system")) {
+                        val body = renderGuestChannel(ch)
+                        if (body.isNotEmpty()) {
+                            o.write(
+                                ("\n===== guest /dev/log/$ch" +
+                                    " =====\n")
+                                    .toByteArray(Charsets.UTF_8),
+                            )
+                            o.write(
+                                body.toByteArray(Charsets.UTF_8),
+                            )
+                        }
+                    }
+                }
+                count++
+            } catch (e: Exception) {
+            }
+        }
+        if (count > 0) {
+            appendLog(
+                "[shell] 日誌已存到 Download/$dirName/" +
+                    "（共 $count 個檔案）",
+            )
+        } else {
+            appendLog(
+                "[shell] 存日誌失敗：沒有可匯出的日誌檔案",
+            )
+        }
+    }
+
+    /** Parse one guest /dev/log channel (GB logger_entry
+     * stream: 20-byte header of u16 len, u16 pad, pid,
+     * tid, sec, nsec; payload = priority byte,
+     * NUL-terminated tag, message) into readable lines,
+     * keeping only the last 500 entries and dropping the
+     * pixelflinger tag (SurfaceFlinger's flood drowns the
+     * runtime's own account). Reads at most the tail 8MB
+     * of the channel file; the parser resyncs byte by
+     * byte on a bad length, so starting mid-stream is
+     * safe. Falls back to a bounded printable-strings
+     * extraction when no entry parses. */
+    private fun renderGuestChannel(ch: String): String {
+        val f = File(rootfsGBDir, ".logs/log-$ch")
+        if (!f.exists() || f.length() == 0L) return ""
+        val bytes = try {
+            val all = f.readBytes()
+            if (all.size > 8 * 1024 * 1024) {
+                all.copyOfRange(
+                    all.size - 8 * 1024 * 1024, all.size,
+                )
+            } else {
+                all
+            }
+        } catch (e: Exception) {
+            return ""
+        }
+        val entries = ArrayDeque<String>()
+        var off = 0
+        fun u16le(o: Int) =
+            (bytes[o].toInt() and 0xFF) or
+                ((bytes[o + 1].toInt() and 0xFF) shl 8)
+        fun i32le(o: Int) =
+            (bytes[o].toInt() and 0xFF) or
+                ((bytes[o + 1].toInt() and 0xFF) shl 8) or
+                ((bytes[o + 2].toInt() and 0xFF) shl 16) or
+                ((bytes[o + 3].toInt() and 0xFF) shl 24)
+        while (off + 20 <= bytes.size) {
+            val len = u16le(off)
+            if (len < 2 || len > 8192 ||
+                off + 20 + len > bytes.size
+            ) {
+                off++
+                continue
+            }
+            val pid = i32le(off + 4)
+            val prio = bytes[off + 20].toInt() and 0xFF
+            var p = off + 21
+            val tagStart = p
+            while (p < off + 20 + len &&
+                bytes[p] != 0.toByte()
+            ) {
+                p++
+            }
+            if (p >= off + 20 + len) {
+                off++
+                continue
+            }
+            val tag = String(
+                bytes, tagStart, p - tagStart, Charsets.UTF_8,
+            )
+            val msg = String(
+                bytes,
+                p + 1,
+                (off + 20 + len - (p + 1)).coerceAtLeast(0),
+                Charsets.UTF_8,
+            ).trimEnd('\u0000', '\n')
+            if (tag != "pixelflinger") {
+                val pl = when (prio) {
+                    2 -> "V"; 3 -> "D"; 4 -> "I"
+                    5 -> "W"; 6 -> "E"; 7 -> "F"
+                    else -> prio.toString()
+                }
+                entries.addLast("$pl/$tag($pid): $msg")
+                if (entries.size > 500) entries.removeFirst()
+            }
+            off += 20 + len
+        }
+        if (entries.isNotEmpty()) {
+            return entries.joinToString("\n")
+        }
+        // Fallback: printable-strings, bounded output.
+        val sb = StringBuilder()
+        var run = StringBuilder()
+        for (b in bytes) {
+            if (sb.length > 24000) break
+            val c = (b.toInt() and 0xFF).toChar()
+            if (c in ' '..'~' || c == '\n' || c == '\t') {
+                run.append(c)
+            } else {
+                if (run.length >= 6) {
+                    sb.append(run).append('\n')
+                }
+                run = StringBuilder()
+            }
+        }
+        if (run.length >= 6 && sb.length <= 24000) {
+            sb.append(run).append('\n')
+        }
+        return sb.toString()
     }
 
     /** Button entry point for the three start buttons:
