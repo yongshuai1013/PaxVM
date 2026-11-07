@@ -8297,7 +8297,6 @@ fn tracer_loop(ctx: TracerCtx) {
                                 }
                             }
                         }
-                        }
                     }
                 }
             }
