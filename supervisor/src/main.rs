@@ -5368,6 +5368,31 @@ fn is_setid_emulated(compat: bool, nr: u64) -> bool {
     }
 }
 
+/// capset (compat 185, native 90): answered from the
+/// virtual world, like the set*id family above. The
+/// host process is an Android app and holds no real
+/// capabilities, so a passed-through capset asking for
+/// any permitted bit fails EPERM on the host kernel --
+/// and GB's forkAndSpecialize treats exactly that as
+/// fatal: "cannot set capabilities" -> dvmAbort ->
+/// the deliberate *(char*)0xDEADD00D store (S8 gun 1
+/// field: system_server died at libdvm+0x4612c on all
+/// 13 zygote tenures, right after the emulated
+/// setuid). Capability sets are bookkeeping of the
+/// guest's virtual credential state, so the call is
+/// answered success here without reaching the kernel.
+/// capget is deliberately left passed through for
+/// now: nothing in the specialization path reads the
+/// sets back, and a future consumer that does will
+/// name itself the same way this one did.
+fn is_capset(compat: bool, nr: u64) -> bool {
+    if compat {
+        nr == 185
+    } else {
+        nr == 90
+    }
+}
+
 /// F class (getcwd, fchdir): cancel the syscall and fabricate the
 /// answer from the virtual cwd (M1 spec section 3).
 fn entry_fake(
@@ -7075,6 +7100,21 @@ fn tracer_loop(ctx: TracerCtx) {
                     coord.vcred_publish(pid, (vu, vg));
                     pend.desc = Some(format!(
                         "{}({}) emulated (return 0); virtual creds now uid={vu} gid={vg}",
+                        nr_name(proc.compat, nr),
+                        nr
+                    ));
+                    dirty = true;
+                } else if is_capset(proc.compat, nr) {
+                    // Virtual capabilities (see is_capset):
+                    // the guest's capability sets belong to
+                    // its emulated credential state. Passed
+                    // through, the host kernel refuses any
+                    // nonzero request -- the app holds no
+                    // real caps -- and GB's specialization
+                    // aborts the child over it (S8 gun 1).
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                    pend.desc = Some(format!(
+                        "{}({}) FAKED -> 0 (virtual caps)",
                         nr_name(proc.compat, nr),
                         nr
                     ));
