@@ -1235,7 +1235,7 @@ fn entry_translate(
         match read_path(pid, addr) {
             Some(old) => match translate(rootfs, vcwd, dirfd, &old) {
                 Some(new) => {
-                    let new = if is_open_family(compat, nr) {
+                    let new = if is_open_family(compat, nr) || is_device_probe(compat, nr) {
                         device_map(rootfs, &guest_abs(vcwd, &old)).unwrap_or(new)
                     } else {
                         new
@@ -5527,6 +5527,29 @@ fn is_capset(compat: bool, nr: u64) -> bool {
     }
 }
 
+/// ioprio_set / ioprio_get (compat 314/315, native
+/// 30/31): answered success here, like capset above.
+/// GB's init applies a service's `ioprio` line in the
+/// forked child before exec; the host app seccomp
+/// filter traps the call with SIGSYS and, unrescued,
+/// the signal kills the child before it ever reaches
+/// execve (0.9.83 field: vold, the only service with
+/// an ioprio line, died all 63 tenures at exactly
+/// this call -- SIGSYS regs nr=0x13a, a2=0x4002 =
+/// IOPRIO_CLASS_BE/2, matching the rc line). I/O
+/// priority is advisory bookkeeping the guest gains
+/// nothing real from; faking success lets the child
+/// proceed to exec. ioprio_get faked to 0 reports
+/// the default priority, which is what an untouched
+/// process holds anyway.
+fn is_ioprio(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 314 | 315)
+    } else {
+        matches!(nr, 30 | 31)
+    }
+}
+
 /// F class (getcwd, fchdir): cancel the syscall and fabricate the
 /// answer from the virtual cwd (M1 spec section 3).
 fn entry_fake(
@@ -5605,6 +5628,27 @@ fn is_open_family(compat: bool, nr: u64) -> bool {
         matches!(nr, 5 | 8 | 322) // open, creat, openat
     } else {
         nr == 56 // openat
+    }
+}
+
+/// Path probes (compat access/stat64/lstat64) get the
+/// device_map redirection too, not just opens. A probe
+/// translated plainly into the rootfs hits a nonexistent
+/// node and reports the device ABSENT even though opens
+/// of it are redirected and would succeed -- and library
+/// code that probes once and caches the verdict poisons
+/// itself for the process's whole life: Harmony's
+/// RandomBitsSupplier probes /dev/urandom with access(2)
+/// during class init; in the 0.9.83 field the zygote's
+/// probe came back -ENOENT, the class marked itself
+/// unavailable ("no random devices"), and the forked
+/// system_server inherited the verdict, killing
+/// SettingsProvider at installSystemProviders time.
+fn is_device_probe(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 33 | 195 | 196) // access, stat64, lstat64
+    } else {
+        false
     }
 }
 
@@ -5776,6 +5820,16 @@ fn entry_ftruncate(pid: i32, regs: &mut Regs, pend: &mut Pending) -> String {
 /// path field is capped at 108 bytes; our rootfs paths fit.
 /// Abstract sockets (leading NUL) and non-Unix families pass
 /// untouched.
+/// The address family at the head of a guest sockaddr,
+/// or None when the head bytes are unreadable.
+fn sockaddr_family(pid: i32, addr_ptr: u64) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    match read_mem(pid, addr_ptr, &mut buf) {
+        Ok(2) => Some(u16::from_ne_bytes(buf)),
+        _ => None,
+    }
+}
+
 fn entry_unix_sockaddr(
     pid: i32,
     rootfs: &str,
@@ -7127,6 +7181,53 @@ fn tracer_loop(ctx: TracerCtx) {
                     // entry_ftruncate).
                     pend.desc = Some(entry_ftruncate(pid, &mut regs, &mut pend));
                     dirty = true;
+                } else if proc.compat && nr == 282 && sockaddr_family(pid, regs.arg(1)) == Some(libc::AF_NETLINK as u16) {
+                    // bind with a netlink sockaddr: the
+                    // uevent socket substituted below is a
+                    // unix socket in truth, and the host
+                    // kernel would refuse a netlink address
+                    // on it (EAFNOSUPPORT) -- on real
+                    // hardware this bind is what enrolls the
+                    // socket for kernel uevents, which this
+                    // engine never delivers anyway. Answer
+                    // success without the kernel. (A guest
+                    // binding a REAL netlink socket would
+                    // also land here; no GB component binds
+                    // one explicitly -- route sockets are
+                    // kernel-bound implicitly on first send.)
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                    pend.desc = Some(
+                        "bind(282) netlink sockaddr FAKED -> 0 (virtual uevent socket)"
+                            .to_string(),
+                    );
+                    dirty = true;
+                } else if proc.compat && nr == 281
+                    && regs.arg(0) == libc::AF_NETLINK as u64
+                    && regs.arg(2) == 15
+                {
+                    // socket(AF_NETLINK, _, NETLINK_KOBJECT_
+                    // UEVENT): the host SELinux policy denies
+                    // netlink uevent sockets to app processes
+                    // outright (0.9.83 field: netd exited 63
+                    // tenures in a row on "Unable to create
+                    // uevent socket: Permission denied", and
+                    // NetworkManagementService's create()
+                    // latch never released). Substitute a
+                    // plain unix datagram socket: real fd,
+                    // blocks in select/recv forever, never
+                    // readable -- semantically a uevent
+                    // socket on hardware that never changes.
+                    // netd's real work runs on the separate
+                    // init-provided command socket, which is
+                    // untouched. arg0 family -> AF_UNIX,
+                    // arg2 protocol -> 0; type (arg1) kept.
+                    regs.set_arg(0, libc::AF_UNIX as u64);
+                    regs.set_arg(2, 0);
+                    pend.desc = Some(
+                        "socket(281) netlink uevent -> unix dgram (virtual uevent socket)"
+                            .to_string(),
+                    );
+                    dirty = true;
                 } else if (proc.compat && (nr == 282 || nr == 283))
                     || (!proc.compat && (nr == 200 || nr == 203))
                 {
@@ -7326,6 +7427,20 @@ fn tracer_loop(ctx: TracerCtx) {
                     skip_syscall(pid, &mut regs, &mut pend, 0);
                     pend.desc = Some(format!(
                         "{}({}) FAKED -> 0 (virtual caps)",
+                        nr_name(proc.compat, nr),
+                        nr
+                    ));
+                    dirty = true;
+                } else if is_ioprio(proc.compat, nr) {
+                    // I/O priority (see is_ioprio): the
+                    // host seccomp filter traps this call
+                    // with SIGSYS; unrescued it killed
+                    // every vold service child in init's
+                    // pre-exec setup (0.9.83 field).
+                    // Answer success without the kernel.
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                    pend.desc = Some(format!(
+                        "{}({}) FAKED -> 0 (virtual ioprio)",
                         nr_name(proc.compat, nr),
                         nr
                     ));
