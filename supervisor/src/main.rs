@@ -6317,8 +6317,20 @@ fn next_stop(
             return NextStop::Stop(r, status);
         }
         if r < 0 && errno() == libc::ECHILD {
-            sup!("waitpid: no tracees left");
-            return NextStop::End;
+            if wid == 0 {
+                sup!("waitpid: no tracees left");
+                return NextStop::End;
+            }
+            // A worker holding no tracees (yet, or any
+            // more) is idle, not done: adoptions arrive
+            // over the coordinator socket, and only the
+            // coordinator going away ends a worker
+            // (step 3 below). The 0.9.61 field run lost
+            // all four workers to this line within
+            // milliseconds of their starting -- ECHILD
+            // is a newborn worker's normal state -- so
+            // every handoff was refused and W0 took
+            // each service back.
         }
         // 2) Coordinator pushes: an adoption rebuilds a
         // tracee here; a wake completes a parked ioctl.

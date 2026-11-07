@@ -377,6 +377,7 @@ class MainActivity : Activity() {
             // trails reality by at most a quarter second
             // even when nothing forces a flush.
             thread(name = "log-flusher", isDaemon = true) {
+                var passes = 0
                 while (true) {
                     try {
                         Thread.sleep(250)
@@ -384,6 +385,23 @@ class MainActivity : Activity() {
                         break
                     }
                     flushLogFile()
+                    // 0.9.62 heartbeat: while a session
+                    // runs, the app stamps its own life
+                    // into the session file every ~10 s.
+                    // Field runs keep ending mid-line
+                    // with no exit record; comparing the
+                    // last heartbeat against the
+                    // supervisor mirror's last line tells
+                    // whether the app outlived the
+                    // supervisor (a supervisor-side kill)
+                    // or they died together (a group
+                    // kill, e.g. LMK).
+                    passes++
+                    if (passes % 40 == 0 && supervisor != null) {
+                        writeLogLineToFile(
+                            "[shell] heartbeat (app alive)",
+                        )
+                    }
                 }
             }
         } catch (e: Exception) {
