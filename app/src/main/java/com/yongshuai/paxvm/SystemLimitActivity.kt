@@ -5,7 +5,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
-import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -46,7 +45,23 @@ class SystemLimitActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Back lives in the action bar (the user asked
+        // for the up arrow where the app icon was, and
+        // for the icon and title to go away there).
+        actionBar?.apply {
+            setDisplayHomeAsUpEnabled(true)
+            setDisplayShowHomeEnabled(false)
+            setDisplayShowTitleEnabled(false)
+        }
         buildUi()
+    }
+
+    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
+        if (item.itemId == android.R.id.home) {
+            finish()
+            return true
+        }
+        return super.onOptionsItemSelected(item)
     }
 
     override fun onResume() {
@@ -64,22 +79,6 @@ class SystemLimitActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val backButton = Button(this).apply {
-            text = "返回"
-            setOnClickListener { finish() }
-        }
-        header.addView(backButton)
-        val title = TextView(this).apply {
-            text = "系統限制"
-            textSize = 18f
-        }
-        header.addView(title)
-        root.addView(header)
 
         val desc = TextView(this).apply {
             text = "解除 Android 對 App 子行程的 phantom 監控與數量上限：" +

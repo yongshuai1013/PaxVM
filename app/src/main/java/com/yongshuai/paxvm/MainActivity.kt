@@ -351,6 +351,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The user asked for the app icon and name out
+        // of the action bar; the overflow menu stays.
+        actionBar?.apply {
+            setDisplayShowHomeEnabled(false)
+            setDisplayShowTitleEnabled(false)
+        }
         initLogFiles()
         thread(name = "exitinfo", isDaemon = true) {
             reportPreviousExits()

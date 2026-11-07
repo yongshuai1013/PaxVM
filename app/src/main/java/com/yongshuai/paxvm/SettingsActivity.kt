@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
 import android.view.Gravity
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -18,7 +17,23 @@ class SettingsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Back lives in the action bar (the user asked
+        // for the up arrow where the app icon was, and
+        // for the icon and title to go away there).
+        actionBar?.apply {
+            setDisplayHomeAsUpEnabled(true)
+            setDisplayShowHomeEnabled(false)
+            setDisplayShowTitleEnabled(false)
+        }
         buildUi()
+    }
+
+    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
+        if (item.itemId == android.R.id.home) {
+            finish()
+            return true
+        }
+        return super.onOptionsItemSelected(item)
     }
 
     private fun buildUi() {
@@ -26,22 +41,6 @@ class SettingsActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val backButton = Button(this).apply {
-            text = "返回"
-            setOnClickListener { finish() }
-        }
-        header.addView(backButton)
-        val title = TextView(this).apply {
-            text = "設定"
-            textSize = 18f
-        }
-        header.addView(title)
-        root.addView(header)
 
         root.addView(
             entryRow("系統限制", "phantom 監控與子行程上限") {
