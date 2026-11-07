@@ -356,166 +356,17 @@ jobs:
             echo "fbprobe carries IRELATIVE relocs (2.3 linker cannot)" >&2; exit 1
           fi
           ls -la gbsys/bin/fbprobe
-      - name: Fetch Gingerbread system subset (SDK API 10 system image)
+      - name: Fetch S2 TouchWiz system tree (vendor-ROM experiment)
         run: |
           set -euo pipefail
-          test -f sysimg10.zip || curl -fsSL --retry 3 --connect-timeout 30 -o sysimg10.zip \
-            "https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip"
-          echo "b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df  sysimg10.zip" | sha256sum -c -
-          unzip -o -q sysimg10.zip "armeabi-v7a/system.img"
-          mkdir -p gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
-          for p in bin/linker bin/servicemanager bin/toolbox bin/sh \
-                   framework/framework-res.apk \
-                   build.prop \
-                   bin/app_process bin/dexopt bin/dalvikvm \
-                   framework/core.jar framework/core.odex \
-                   framework/bouncycastle.jar framework/bouncycastle.odex \
-                   framework/ext.jar framework/ext.odex \
-                   framework/framework.jar framework/framework.odex \
-                   framework/android.policy.jar framework/android.policy.odex \
-                   framework/services.jar framework/services.odex \
-                   framework/core-junit.jar framework/core-junit.odex \
-                   lib/libc.so lib/libm.so lib/libstdc++.so lib/libdl.so \
-                   lib/liblog.so lib/libcutils.so lib/libbinder.so \
-                   lib/libutils.so lib/libz.so lib/libETC1.so \
-                   bin/surfaceflinger bin/bootanimation \
-                   lib/libsurfaceflinger.so lib/libsurfaceflinger_client.so \
-                   lib/libui.so lib/libEGL.so lib/libGLESv1_CM.so \
-                   lib/libhardware.so lib/libhardware_legacy.so \
-                   lib/libpixelflinger.so lib/libskia.so lib/libjpeg.so \
-                   lib/libemoji.so lib/libnetutils.so lib/libwpa_client.so \
-                   lib/libandroid_runtime.so lib/libdvm.so \
-                   lib/libnativehelper.so lib/libgui.so \
-                   lib/libcamera_client.so lib/libskiagl.so \
-                   lib/libsqlite.so lib/libsonivox.so \
-                   lib/libcrypto.so lib/libssl.so \
-                   lib/libicuuc.so lib/libicui18n.so \
-                   lib/libmedia.so lib/libnfc_ndef.so \
-                   lib/libexpat.so lib/libGLESv2.so \
-                   lib/hw/gralloc.default.so lib/egl/libGLES_android.so; do
-            debugfs -R "dump -p /$p gbsys/$p" armeabi-v7a/system.img 2>/dev/null
-            test -s "gbsys/$p" || { echo "missing from system.img: $p" >&2; exit 1; }
-          done
-          # The SDK image's egl.cfg selects the emulator's
-          # GL-forwarding stack (needs /dev/qemu_pipe, which
-          # does not exist here). Point EGL at the stock
-          # software renderer instead (S6 design note).
-          printf '0 0 android\n' > gbsys/lib/egl/egl.cfg
-          # The image carries no libEGL_android.so, but the
-          # EGL loader insists on dlopening libEGL_<tag>.so
-          # for the EGL half. libGLES_android.so itself
-          # exports the full EGL entry set (39 egl* symbols,
-          # verified) -- it is the single-file software
-          # driver -- so ship it under both names. SF died
-          # in strlen(NULL) on this gap in 0.8.1's field run.
-          cp gbsys/lib/egl/libGLES_android.so gbsys/lib/egl/libEGL_android.so
-          # S7 gun 2: the data directories the runtime
-          # stack reads at startup -- ICU data
-          # (usr/icu/icudt44l.dat), fonts, keylayouts and
-          # the stock /etc. app_process's first field run
-          # built its heap and JIT buffers, then aborted
-          # (Dalvik 0xdeadd00d) with these trees absent;
-          # ship them wholesale rather than guessing the
-          # one file. rdump preserves the layout under
-          # gbsys/<dir>.
-          for d in usr fonts etc; do
-            debugfs -R "rdump /$d gbsys" armeabi-v7a/system.img 2>/dev/null
-          done
-          # S7 gun 3: the whole /system/lib, wholesale.
-          # Zygote's JNI registration and class preload
-          # reach for helper libraries beyond the S6 list
-          # (media_jni and friends); enumerating them one
-          # failed device run at a time is waste. The
-          # explicit list above stays as the assert net;
-          # this overlay only adds files.
-          # rdump refuses a target directory that already
-          # exists ("File exists while making directory")
-          # and the refusal was invisible behind 2>/dev/null
-          # in run #98 -- only the assert below caught it.
-          # Stage into a scratch dir and merge instead.
-          rm -rf /tmp/gblib && mkdir -p /tmp/gblib
-          debugfs -R "rdump /lib /tmp/gblib" armeabi-v7a/system.img 2>/dev/null
-          cp -a /tmp/gblib/lib/. gbsys/lib/
-          test -s gbsys/lib/libmedia_jni.so || { echo "missing libmedia_jni.so" >&2; exit 1; }
-          # The overlay just overwrote lib/egl/egl.cfg with
-          # the image's own (emulator GL stack). Re-assert
-          # the software-renderer selection from the subset
-          # step above -- losing it breaks SF's EGL exactly
-          # as in S6's first field runs.
-          printf '0 0 android\n' > gbsys/lib/egl/egl.cfg
-          test -s gbsys/usr/icu/icudt44l.dat || { echo "missing icudt44l.dat" >&2; exit 1; }
-          test -s gbsys/fonts/DroidSans.ttf || { echo "missing DroidSans.ttf" >&2; exit 1; }
-          test -s gbsys/etc/hosts || { echo "missing etc/hosts" >&2; exit 1; }
-          # S9 (0.9.81): complete the root tree. /app was
-          # absent entirely until now -- PMS scanned an
-          # empty directory, installSystemProviders had no
-          # SettingsProvider to install, and no HOME app
-          # existed for the end of the service march --
-          # while /bin, /framework and /media were partial
-          # enumerations (no mediaserver or installd for
-          # the services that connect to them). Ship the
-          # donor's remaining directories wholesale, staged
-          # and merged the same way /lib is above, since
-          # rdump refuses a target directory that exists.
-          # This lands before the framework-res recolor
-          # below, which therefore still applies.
-          for d in app bin framework media xbin; do
-            rm -rf /tmp/gbtree && mkdir -p /tmp/gbtree
-            debugfs -R "rdump /$d /tmp/gbtree" armeabi-v7a/system.img 2>/dev/null
-            mkdir -p "gbsys/$d"
-            cp -a "/tmp/gbtree/$d/." "gbsys/$d/"
-          done
-          test -s gbsys/app/Launcher2.apk || { echo "missing Launcher2.apk" >&2; exit 1; }
-          test -s gbsys/app/SettingsProvider.apk || { echo "missing SettingsProvider.apk" >&2; exit 1; }
-          test -s gbsys/bin/mediaserver || { echo "missing mediaserver" >&2; exit 1; }
-          test -s gbsys/bin/installd || { echo "missing installd" >&2; exit 1; }
-          # Optional: the stock boot animation archive. The
-          # SDK image may not carry one; bootanimation then
-          # falls back to its built-in logo animation.
-          debugfs -R "dump -p /media/bootanimation.zip gbsys/media/bootanimation.zip" armeabi-v7a/system.img 2>/dev/null || true
-          # Gun 5: bootanimation's built-in ANDROID animation
-          # loads its two logo textures from the default asset
-          # source, framework-res.apk. The guest rootfs lacked
-          # the file entirely (0.9.33 field run: bootanimation
-          # stat'd it, got ENOENT, and animated empty textures
-          # all run). Assert the logos are really inside, so a
-          # silent absence fails the build instead of the run.
-          unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-mask.png'
-          unzip -l gbsys/framework/framework-res.apk | grep -q 'assets/images/android-logo-shine.png'
-          # Gun 5: preset the boot wordmark bright white.
-          # The stock shine texture is a dim gleam: on the
-          # shell's small preview the composed logo reads
-          # as black-on-black even when composition is
-          # correct. Recoloring is a guest-asset choice
-          # (OEMs ship their own boot marks exactly this
-          # way); the supervisor's bbox telemetry still
-          # judges composition geometry on its own merits.
-          python3 - << 'PYEOF'
-          import struct, zlib, zipfile, os
-          apk = 'gbsys/framework/framework-res.apk'
-          name = 'assets/images/android-logo-shine.png'
-          with zipfile.ZipFile(apk) as z:
-              data = z.read(name)
-          w, h = struct.unpack('>II', data[16:24])
-          print('shine texture', w, 'x', h, '-> solid white')
-          raw = b''.join(b'\x00' + b'\xff\xff\xff\xff' * w for _ in range(h))
-          def chunk(t, d):
-              c = struct.pack('>I', len(d)) + t + d
-              return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
-          png = (b'\x89PNG\r\n\x1a\n'
-                 + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
-                 + chunk(b'IDAT', zlib.compress(raw))
-                 + chunk(b'IEND', b''))
-          tmp = 'framework-res-white.apk'
-          with zipfile.ZipFile(apk) as zin, \
-               zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
-              for item in zin.infolist():
-                  zout.writestr(item, png if item.filename == name
-                                else zin.read(item.filename))
-          os.replace(tmp, apk)
-          PYEOF
-          ls -la gbsys/bin gbsys/lib gbsys/lib/hw gbsys/lib/egl gbsys/media gbsys/framework
-          (cd gbsys && sha256sum bin/linker bin/servicemanager bin/toolbox bin/sh lib/*.so)
+          cat exp-assets/s2part.0 exp-assets/s2part.1 exp-assets/s2part.2 exp-assets/s2part.3 exp-assets/s2part.4 > s2system.zip
+          echo "ca497c8d0eb8ea4319ac2e068226f64c22f2a3d9a2432e0584e6ee37f6ac3ff3  s2system.zip" | sha256sum -c -
+          mkdir -p gbsys
+          python3 -c "import zipfile; zipfile.ZipFile('s2system.zip').extractall('gbsys')"
+          test -f gbsys/bin/servicemanager
+          test -f gbsys/framework/twframework.odex
+          test -f gbsys/app/TouchWiz30Launcher.apk
+          ls -la gbsys/bin gbsys/lib gbsys/framework | head -30
 
       # lbprobe (S5c): a real libbinder client/server. Built
       # after the subset fetch because its symbol stubs are
