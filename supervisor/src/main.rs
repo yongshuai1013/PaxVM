@@ -4233,6 +4233,25 @@ fn binder_deliver(
     put_u32(&mut txn, 36, base + off + ((data.len() as u32 + 3) & !3));
     match (br_cmd, reply_to) {
         (BR_REPLY, Some(pid)) => {
+            // Kernel ordering: the reference notices for
+            // objects carried in the request (BR_INCREFS /
+            // BR_ACQUIRE) were queued when the peer received
+            // it, before the peer produced this reply, and
+            // the real driver returns them in the same read,
+            // ahead of the BR_REPLY. Our two-queue split let
+            // the reply overtake them: the caller completed
+            // its transaction, dropped the last strong ref
+            // of a temporary service object and freed it,
+            // and the pending BR_ACQUIRE then incStrong'd
+            // recycled heap (mediaserver's addService
+            // temporaries died exactly this way: mRefs read
+            // back as a small integer). Drain the shared
+            // stream into the waiting thread's queue first.
+            if !bp.inbound.is_empty() {
+                let pending = std::mem::take(&mut bp.inbound);
+                bp.push_to(pid, &pending);
+                bsup!("binder: flushed pending inbound ahead of reply to pid={pid}");
+            }
             bp.push_to(pid, &br_cmd.to_le_bytes());
             bp.push_to(pid, &txn);
         }
@@ -4259,6 +4278,14 @@ fn binder_deliver(
             match parked_looper {
                 Some(p) => {
                     bsup!("binder: txn for {target} landed in parked looper pid={p}'s queue");
+                    // Same ordering rule as the reply path:
+                    // whatever the shared stream already
+                    // holds for this arena was queued before
+                    // this transaction and must be read first.
+                    if !bp.inbound.is_empty() {
+                        let pending = std::mem::take(&mut bp.inbound);
+                        bp.push_to(p, &pending);
+                    }
                     bp.push_to(p, &br_cmd.to_le_bytes());
                     bp.push_to(p, &txn);
                 }
