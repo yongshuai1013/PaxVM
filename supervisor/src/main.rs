@@ -3699,6 +3699,29 @@ impl CoordServer {
                 let pid = d.i32();
                 let park = d.park();
                 self.st.parked.insert(pid, park);
+                // A delivery that finds nobody parked
+                // pools its bytes in the arena's inbound
+                // stream (binder_deliver), and the matching
+                // wake is only computed at delivery time --
+                // so a looper that parks AFTER the pool
+                // sleeps beside pending work forever. The
+                // 0.9.81 field froze exactly here:
+                // servicemanager re-parked a breath after
+                // system_server's addService pooled, and
+                // nothing ever woke it. Registration is the
+                // last word before sleeping, so re-check
+                // the wake candidates for the parker's arena
+                // here, the way a real driver's ioctl
+                // re-checks its wait queue under the lock
+                // before blocking.
+                if let Some(arena) = self.st.thread_arena.get(&pid).cloned() {
+                    for cand in binder_wake_candidates(&self.st, &arena) {
+                        bsup!(
+                            "binder: park of pid={pid} found pending work in {arena}; pushing wake for pid={cand}"
+                        );
+                        self.push_wake(cand);
+                    }
+                }
             }
             MSG_ONEWAY_FD_CACHE_PUT => {
                 for (k, fd) in d.cache() {
