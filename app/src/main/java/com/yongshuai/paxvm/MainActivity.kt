@@ -521,32 +521,6 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-        // Title bar (pure addition): app name on the left, the
-        // overflow menu on the right; its only entry for now
-        // opens the settings page.
-        val titleBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val titleView = TextView(this).apply {
-            text = "PaxVM"
-            textSize = 18f
-        }
-        titleBar.addView(
-            titleView,
-            LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f,
-            ),
-        )
-        val menuButton = Button(this).apply {
-            text = "⋮"
-            setOnClickListener { showMainMenu(this) }
-        }
-        titleBar.addView(menuButton)
-        root.addView(titleBar)
-
         statusView = TextView(this).apply {
             textSize = 13f
             typeface = Typeface.MONOSPACE
@@ -642,13 +616,24 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun showMainMenu(anchor: android.view.View) {
-        val menu = android.widget.PopupMenu(this, anchor)
-        menu.menu.add("設定").setOnMenuItemClickListener {
-            startActivity(android.content.Intent(this, SettingsActivity::class.java))
-            true
+    // The settings entry lives in the stock action
+    // bar's overflow menu (top right, beside the app
+    // icon) -- an earlier build grew a second,
+    // hand-rolled title row under the action bar,
+    // which the user rightly called out as wrong.
+    override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
+        menu.add("設定")
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
+        if (item.title == "設定") {
+            startActivity(
+                android.content.Intent(this, SettingsActivity::class.java),
+            )
+            return true
         }
-        menu.show()
+        return super.onOptionsItemSelected(item)
     }
 
     /** Delete-then-write for shell-owned guest files. A guest
