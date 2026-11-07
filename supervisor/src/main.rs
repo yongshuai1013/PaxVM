@@ -967,6 +967,15 @@ struct ProcState {
     /// S2: the handoff decision for this tracee (as a
     /// direct child of the guest root) has been made.
     shard_decided: bool,
+    /// S2 fix (0.9.60): an exec entry has armed the
+    /// handoff decision for the exit stop that settles
+    /// THIS exec. The 0.9.59 decision ran at the first
+    /// syscall-exit stop of a child's life -- init's
+    /// service children do fd setup and credential
+    /// syscalls before their execve, so the latch
+    /// (shard_decided) burned with exec_path still None
+    /// and no service ever handed off.
+    exec_armed: bool,
 }
 
 impl ProcState {
@@ -985,6 +994,7 @@ impl ProcState {
             exec_path: None,
             exec_blocked: false,
             shard_decided: false,
+            exec_armed: false,
         }
     }
 }
@@ -5189,6 +5199,23 @@ fn entry_ashmem_ioctl(
         }
         ASHMEM_SET_SIZE => {
             let size = arg as u64;
+            // 0.9.60 ordering fix: the file length is
+            // the guest-visible effect of SET_SIZE, and
+            // the guest may mmap and touch the region
+            // the moment this ioctl returns. Since S1b
+            // the length lived behind a one-way message
+            // to the coordinator, which applies it
+            // whenever it gets there -- a guest that won
+            // the race touched pages past EOF and took
+            // SIGBUS (SF, 0.9.59 field run). Apply the
+            // length here, synchronously, before the
+            // guest resumes -- the pre-S1b order; the
+            // coordinator's record follows on the
+            // one-way and its duplicate set_len is
+            // idempotent.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(key) {
+                let _ = f.set_len(size);
+            }
             coord.oneway_ashmem_set_size(key, size);
             skip_syscall(pid, regs, pend, 0);
             format!("ashmem SET_SIZE -> {size}")
@@ -6656,9 +6683,11 @@ fn tracer_loop(ctx: TracerCtx) {
                     pend.desc = Some(desc);
                     dirty = d;
                     // The handoff decision at this exec's
-                    // exit stop keys off these two.
+                    // exit stop keys off these two, armed
+                    // for that one stop only (0.9.60).
                     proc.exec_path = xpath;
                     proc.exec_blocked = pend.inject.is_some();
+                    proc.exec_armed = true;
                 } else if nr == nr_chdir(proc.compat) {
                     let (desc, new_vcwd) = entry_chdir(
                         pid,
@@ -7310,15 +7339,34 @@ fn tracer_loop(ctx: TracerCtx) {
                 // A blocked exec never changed image, so
                 // it never hands off.
                 let mut ho: Option<u8> = None;
-                if wid == 0
-                    && !proc.shard_decided
-                    && pid != root_pid
-                    && proc.parent == root_pid
-                {
-                    proc.shard_decided = true;
-                    if !proc.exec_blocked {
-                        if let Some(path) = &proc.exec_path {
-                            ho = shard_map.get(path.as_str()).copied();
+                if wid == 0 && proc.exec_armed {
+                    // 0.9.60: decide only at the exit stop
+                    // of the exec that armed this, and say
+                    // the outcome out loud (the 0.9.59
+                    // latch burned silently at a child's
+                    // first pre-exec syscall exit).
+                    proc.exec_armed = false;
+                    if pid != root_pid && !proc.shard_decided {
+                        proc.shard_decided = true;
+                        if proc.parent != root_pid {
+                            sup!(
+                                "handoff check pid={pid}: parent {} is not the guest root; stays on W0",
+                                proc.parent
+                            );
+                        } else if proc.exec_blocked {
+                            sup!("handoff check pid={pid}: exec blocked; stays on W0");
+                        } else if let Some(path) = &proc.exec_path {
+                            match shard_map.get(path.as_str()).copied() {
+                                Some(twid) => {
+                                    sup!("handoff check pid={pid}: {path} -> W{twid}");
+                                    ho = Some(twid);
+                                }
+                                None => {
+                                    sup!("handoff check pid={pid}: {path} has no shard; stays on W0");
+                                }
+                            }
+                        } else {
+                            sup!("handoff check pid={pid}: no decided image path; stays on W0");
                         }
                     }
                 }
