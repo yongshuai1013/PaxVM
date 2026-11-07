@@ -1396,9 +1396,20 @@ class MainActivity : Activity() {
                     // the complete record.
                     val t = logView.text
                     if (t.length > 49152) {
+                        // Keep the LAST ~24 KB. Until 0.9.74
+                        // this read subSequence(24576, len) --
+                        // dropping only the first 24 KB and
+                        // keeping everything else, so under a
+                        // log flood the view text ratcheted
+                        // upward without bound and every
+                        // flush re-laid-out the whole thing
+                        // until the main thread OOMed (field
+                        // verdict 2026-11-07: [crash] stack
+                        // ends in this setText's layout, heap
+                        // 261 MB of a 256 MB limit).
                         logView.text =
                             "［畫面只保留最近的日誌，完整記錄在日誌檔案］\n" +
-                            t.subSequence(24576, t.length)
+                            t.subSequence(t.length - 24576, t.length)
                     }
                 }
                 scrollView.fullScroll(ScrollView.FOCUS_DOWN)
