@@ -2407,6 +2407,12 @@ enum Push {
         compat: bool,
         sigmask: u32,
         creds: (u32, u32),
+        // True when the handoff came from the
+        // root-service rule (a guest-root child in
+        // W0's shard map): the adoptee becomes the
+        // worker's shard root. Kin re-shards carry
+        // false.
+        root: bool,
     },
     AdoptAck {
         pid: i32,
@@ -2538,12 +2544,14 @@ impl CoordClient {
                     let sigmask = d.u32();
                     let uid = d.u32();
                     let gid = d.u32();
+                    let root = d.bool();
                     self.inbox.push_back(Push::Adopt {
                         pid,
                         vcwd,
                         compat,
                         sigmask,
                         creds: (uid, gid),
+                        root,
                     });
                 }
                 MSG_PUSH_ADOPT_ACK => {
@@ -2877,10 +2885,12 @@ impl CoordClient {
         self.send(MSG_ONEWAY_WAKE_ROUTE, &e.0);
     }
 
-    /// S2 handoff offer: W0 has detached `pid` (stopped)
-    /// and asks the coordinator to route it to worker
-    /// `twid`, carrying the state the new tracer needs
-    /// to rebuild its ProcState.
+    /// S2 handoff offer: the offering tracer has
+    /// detached `pid` (stopped) and asks the coordinator
+    /// to route it to worker `twid`, carrying the state
+    /// the new tracer needs to rebuild its ProcState.
+    /// `root` marks a root-service handoff: the adoptee
+    /// becomes the target worker's shard root.
     fn handoff_notice(
         &mut self,
         pid: i32,
@@ -2889,6 +2899,7 @@ impl CoordClient {
         compat: bool,
         sigmask: u32,
         creds: (u32, u32),
+        root: bool,
     ) {
         let mut e = Enc::new();
         e.i32(pid);
@@ -2898,6 +2909,7 @@ impl CoordClient {
         e.u32(sigmask);
         e.u32(creds.0);
         e.u32(creds.1);
+        e.bool(root);
         self.send(MSG_ONEWAY_HANDOFF, &e.0);
     }
 
@@ -3251,6 +3263,11 @@ struct CoordServer {
     routes: HashMap<i32, usize>,
     vcreds_g: HashMap<i32, (u32, u32)>,
     w0: Option<usize>,
+    /// Handoffs in flight: guest pid -> the connection
+    /// that offered it, so the adopt verdict returns to
+    /// the offering tracer (W0 for root-service
+    /// handoffs, a worker for kin re-shards).
+    handoff_from: HashMap<i32, usize>,
 }
 
 impl CoordServer {
@@ -3300,15 +3317,13 @@ impl CoordServer {
         }
     }
 
-    /// The adopt verdict goes back to W0, the only
-    /// tracer that ever hands off.
-    fn push_adopt_ack(&mut self, pid: i32, ok: bool) {
-        if let Some(w0) = self.w0 {
-            let mut e = Enc::new();
-            e.i32(pid);
-            e.bool(ok);
-            self.send_to(w0, MSG_PUSH_ADOPT_ACK, &e.0);
-        }
+    /// The adopt verdict goes back to the tracer that
+    /// offered the handoff.
+    fn push_adopt_ack(&mut self, ci: usize, pid: i32, ok: bool) {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.bool(ok);
+        self.send_to(ci, MSG_PUSH_ADOPT_ACK, &e.0);
     }
 
     /// A connection died: drop its routes (its
@@ -3317,6 +3332,7 @@ impl CoordServer {
     /// sees EOF on its own connection.
     fn conn_died(&mut self, ci: usize) {
         self.routes.retain(|_, &mut owner| owner != ci);
+        self.handoff_from.retain(|_, &mut from| from != ci);
         if self.w0 == Some(ci) {
             std::process::exit(0);
         }
@@ -3652,6 +3668,10 @@ impl CoordServer {
                 let compat = d.bool();
                 let sigmask = d.u32();
                 let creds = (d.u32(), d.u32());
+                let root = d.bool();
+                // The verdict must find its way back to
+                // the offering tracer, whoever that is.
+                self.handoff_from.insert(pid, ci);
                 match self.conn_by_wid(twid) {
                     Some(tci) => {
                         self.routes.insert(pid, tci);
@@ -3663,21 +3683,30 @@ impl CoordServer {
                         e.u32(sigmask);
                         e.u32(creds.0);
                         e.u32(creds.1);
+                        e.bool(root);
                         self.send_to(tci, MSG_PUSH_ADOPT, &e.0);
                     }
                     None => {
                         // No such worker (its fork
-                        // failed): tell W0 at once so it
-                        // takes the tracee back instead
-                        // of waiting out the ack timeout.
-                        self.push_adopt_ack(pid, false);
+                        // failed): tell the offering
+                        // tracer at once so it takes the
+                        // tracee back instead of waiting
+                        // out the ack timeout.
+                        self.handoff_from.remove(&pid);
+                        self.push_adopt_ack(ci, pid, false);
                     }
                 }
             }
             MSG_ONEWAY_ADOPT_ACK => {
                 let pid = d.i32();
                 let ok = d.bool();
-                self.push_adopt_ack(pid, ok);
+                // Normally the recorded offering tracer;
+                // W0 is the fallback for an ack whose
+                // offer was never recorded.
+                let dest = self.handoff_from.remove(&pid).or(self.w0);
+                if let Some(ci) = dest {
+                    self.push_adopt_ack(ci, pid, ok);
+                }
             }
             _ => {}
         }
@@ -3703,6 +3732,7 @@ fn coordinator_main(sock_path: &str) -> ! {
         routes: HashMap::new(),
         vcreds_g: HashMap::new(),
         w0: None,
+        handoff_from: HashMap::new(),
     };
     loop {
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(srv.conns.len() + 1);
@@ -6162,24 +6192,37 @@ struct TracerCtx {
     /// Handoff table (W0 only): guest image path ->
     /// worker id. Empty in workers.
     shard_map: HashMap<String, u8>,
+    /// Kin re-shard target (workers only): a direct
+    /// child of this worker's shard root that exec's a
+    /// new image is handed to this worker instead.
+    /// Only W2 (sf) sets it, to W6; None on W0 and on
+    /// every other worker.
+    kin_target: Option<u8>,
+    /// The pid this worker adopted as its shard root
+    /// (a root=true adoption). A later root adoption
+    /// (a restarted service) replaces it. 0 until the
+    /// first one; unused on W0, whose root is the
+    /// guest root itself.
+    shard_root: i32,
 }
 
 /// The shard table: which worker takes which guest
 /// service binary when it is born as a direct child of
 /// the guest root. Paths are guest-absolute image
-/// paths as decided by entry_exec.
-const SHARDS: [(u8, &str, &[&str]); 4] = [
+/// paths as decided by entry_exec. W6 (kin) owns no
+/// image of its own: it receives the kin re-shards --
+/// children of another worker's shard root -- so its
+/// path list is empty.
+const SHARDS: [(u8, &str, &[&str]); 6] = [
     (1, "mgr", &["/system/bin/servicemanager"]),
     (2, "sf", &["/system/bin/surfaceflinger"]),
     (3, "zygote", &["/system/bin/app_process"]),
-    (
-        4,
-        "leaf",
-        &["/system/bin/bootanimation", "/system/bin/gbprobe"],
-    ),
+    (4, "leaf", &["/system/bin/gbprobe"]),
+    (5, "anim", &["/system/bin/bootanimation"]),
+    (6, "kin", &[]),
 ];
 
-/// Fork the four shard workers. Each child closes
+/// Fork the shard workers. Each child closes
 /// W0's coordinator connection first (its EOF is the
 /// death-chain trigger and must mean W0 itself went
 /// away) and runs worker_main. A shard whose fork
@@ -6251,6 +6294,10 @@ fn worker_main(
         seen: HashSet::new(),
         counts: HashMap::new(),
         shard_map: HashMap::new(),
+        // Only the sf worker re-shards its root's
+        // children, to the kin worker.
+        kin_target: if wid == 2 { Some(6) } else { None },
+        shard_root: 0,
     };
     tracer_loop(ctx);
     sup!("worker W{wid} done");
@@ -6307,6 +6354,7 @@ fn next_stop(
     coord: &mut CoordClient,
     procs: &mut HashMap<i32, ProcState>,
     vcreds: &mut HashMap<i32, (u32, u32)>,
+    shard_root: &mut i32,
     selfpipe_rd: i32,
 ) -> NextStop {
     loop {
@@ -6350,8 +6398,12 @@ fn next_stop(
                     compat,
                     sigmask,
                     creds,
+                    root,
                 } => {
-                    adopt_tracee(pid, &vcwd, compat, sigmask, creds, procs, vcreds, coord);
+                    adopt_tracee(
+                        pid, &vcwd, compat, sigmask, creds, root, procs, vcreds, coord,
+                        shard_root,
+                    );
                 }
                 Push::AdoptAck { .. } => {
                     // Acks are consumed by do_handoff's
@@ -6412,26 +6464,31 @@ fn next_stop(
     }
 }
 
-/// Worker side of a handoff: attach a tracee W0
-/// detached (it is stopped, with no tracer), set the
-/// full option set back, rebuild its ProcState from
-/// the state the handoff carried, and continue it.
-/// Its signal mask and vcwd travelled with the
-/// handoff; binder registrations (thread_arena and
-/// friends) are re-filed by its own later ioctls and
-/// mmaps through the existing coordinator oneways.
-/// The exec record (pend) was settled by W0 at the
-/// exec exit stop before the detach, so there is
-/// nothing to carry.
+/// Worker side of a handoff: attach a tracee the
+/// offering tracer detached (it is stopped, with no
+/// tracer), set the full option set back, rebuild its
+/// ProcState from the state the handoff carried, and
+/// continue it. Its signal mask and vcwd travelled
+/// with the handoff; binder registrations
+/// (thread_arena and friends) are re-filed by its own
+/// later ioctls and mmaps through the existing
+/// coordinator oneways. The exec record (pend) was
+/// settled by the offering tracer at the exec exit
+/// stop before the detach, so there is nothing to
+/// carry. A root adoption makes the pid this worker's
+/// shard root (replacing any previous one); a kin
+/// adoption leaves the root unchanged.
 fn adopt_tracee(
     pid: i32,
     vcwd: &str,
     compat: bool,
     sigmask: u32,
     creds: (u32, u32),
+    root: bool,
     procs: &mut HashMap<i32, ProcState>,
     vcreds: &mut HashMap<i32, (u32, u32)>,
     coord: &mut CoordClient,
+    shard_root: &mut i32,
 ) {
     if ptrace4(PTRACE_ATTACH, pid, std::ptr::null_mut(), std::ptr::null_mut()) != 0 {
         sup!("adopt: PTRACE_ATTACH pid={pid} failed errno={}", errno());
@@ -6454,24 +6511,32 @@ fn adopt_tracee(
     procs.insert(pid, ps);
     vcreds.insert(pid, creds);
     coord.adopt_ack(pid, true);
+    if root {
+        *shard_root = pid;
+    }
     sup!("adopted pid={pid} vcwd={vcwd} compat={compat}");
     // The attach stop was the SIGSTOP W0's detach
     // delivered; swallow it and run.
     cont_syscall(pid, 0);
 }
 
-/// W0 side of a handoff: detach a freshly exec'd
-/// tracee with SIGSTOP so it stays stopped with no
-/// tracer (it cannot run userland in between), offer
-/// it to the target worker through the coordinator,
-/// and wait briefly for the adopt verdict. On any
-/// failure W0 takes the tracee back itself -- attach
-/// it, rebuild the same ProcState, continue it -- so
-/// a failed handoff degrades to the old single-tracer
-/// behaviour for that pid instead of losing it.
+/// Offering side of a handoff: detach a freshly
+/// exec'd tracee with SIGSTOP so it stays stopped
+/// with no tracer (it cannot run userland in
+/// between), offer it to the target worker through
+/// the coordinator, and wait briefly for the adopt
+/// verdict. On any failure the offering tracer takes
+/// the tracee back itself -- attach it, rebuild the
+/// same ProcState, continue it -- so a failed handoff
+/// degrades to the offering tracer keeping that pid
+/// instead of losing it. W0 offers root-service
+/// handoffs (root=true); a worker offering a kin
+/// re-shard passes root=false.
 fn do_handoff(
     pid: i32,
     twid: u8,
+    root: bool,
+    from: u8,
     procs: &mut HashMap<i32, ProcState>,
     vcreds: &mut HashMap<i32, (u32, u32)>,
     coord: &mut CoordClient,
@@ -6489,7 +6554,7 @@ fn do_handoff(
     ) != 0
     {
         sup!(
-            "handoff: pid={pid} PTRACE_DETACH failed errno={}; keeping it on W0",
+            "handoff: pid={pid} PTRACE_DETACH failed errno={}; keeping it on W{from}",
             errno()
         );
         procs.insert(pid, ps);
@@ -6497,8 +6562,8 @@ fn do_handoff(
         cont_syscall(pid, 0);
         return;
     }
-    sup!("handoff: pid={pid} W0 -> W{twid} (exec {path})");
-    coord.handoff_notice(pid, twid, &ps.vcwd, ps.compat, ps.sigmask, creds);
+    sup!("handoff: pid={pid} W{from} -> W{twid} (exec {path})");
+    coord.handoff_notice(pid, twid, &ps.vcwd, ps.compat, ps.sigmask, creds, root);
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(2000);
     let mut acked: Option<bool> = None;
@@ -6518,7 +6583,7 @@ fn do_handoff(
     if acked == Some(true) {
         return;
     }
-    sup!("handoff: pid={pid} not adopted (ack={acked:?}); W0 takes it back");
+    sup!("handoff: pid={pid} not adopted (ack={acked:?}); W{from} takes it back");
     coord.unregister_pid(pid);
     if ptrace4(PTRACE_ATTACH, pid, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
         let mut status: i32 = 0;
@@ -6559,6 +6624,8 @@ fn tracer_loop(ctx: TracerCtx) {
         mut seen,
         mut counts,
         shard_map,
+        kin_target,
+        mut shard_root,
     } = ctx;
     let selfpipe_rd = install_sigchld_pipe();
     if selfpipe_rd < 0 {
@@ -6571,7 +6638,14 @@ fn tracer_loop(ctx: TracerCtx) {
     // next_stop also drains coordinator pushes and is
     // where a worker learns the run is over.)
     'main_loop: loop {
-        let (pid, status) = match next_stop(wid, &mut coord, &mut procs, &mut vcreds, selfpipe_rd) {
+        let (pid, status) = match next_stop(
+            wid,
+            &mut coord,
+            &mut procs,
+            &mut vcreds,
+            &mut shard_root,
+            selfpipe_rd,
+        ) {
             NextStop::Stop(p, s) => (p, s),
             NextStop::End => break 'main_loop,
         };
@@ -6680,7 +6754,7 @@ fn tracer_loop(ctx: TracerCtx) {
             continue;
         }
 
-        let mut pending_handoff: Option<(i32, u8)> = None;
+        let mut pending_handoff: Option<(i32, u8, bool)> = None;
         if sig == SYSCALL_STOP_SIG {
             let Some(proc) = procs.get_mut(&pid) else {
                 cont_syscall(pid, 0);
@@ -7408,18 +7482,23 @@ fn tracer_loop(ctx: TracerCtx) {
                     }
                 }
                 proc.expect_exit = false;
-                // S2 handoff decision (W0 only): a direct
-                // child of the guest root, at the exit
-                // stop of its first exec, whose decided
-                // image belongs to a worker shard changes
-                // tracer here. The exec's pend is settled
-                // above exactly as if it continued with
-                // us; the transfer itself runs after this
-                // branch, once the procs borrow is over.
-                // A blocked exec never changed image, so
-                // it never hands off.
-                let mut ho: Option<u8> = None;
-                if wid == 0 && proc.exec_armed {
+                // Handoff decisions, at the exit stop of
+                // the exec that armed them. Root-service
+                // rule (W0 only): a direct child of the
+                // guest root whose decided image belongs
+                // to a worker shard changes tracer here.
+                // Kin rule (a worker with a kin target):
+                // a direct child of this worker's shard
+                // root, exec'ing any image other than the
+                // root's own, moves to the kin worker.
+                // The exec's pend is settled above exactly
+                // as if it continued with us; the transfer
+                // itself runs after this branch, once the
+                // procs borrow is over. A blocked exec
+                // never changed image, so it never hands
+                // off.
+                let mut ho: Option<(u8, bool)> = None;
+                if proc.exec_armed && (wid == 0 || kin_target.is_some()) {
                     // 0.9.60: decide only at the exit stop
                     // of the exec that armed this, and say
                     // the outcome out loud (the 0.9.59
@@ -7428,35 +7507,65 @@ fn tracer_loop(ctx: TracerCtx) {
                     proc.exec_armed = false;
                     if pid != root_pid && !proc.shard_decided {
                         proc.shard_decided = true;
-                        if proc.parent != root_pid {
+                        if wid == 0 {
+                            if proc.parent != root_pid {
+                                sup!(
+                                    "handoff check pid={pid}: parent {} is not the guest root; stays on W0",
+                                    proc.parent
+                                );
+                            } else if proc.exec_blocked {
+                                sup!("handoff check pid={pid}: exec blocked; stays on W0");
+                            } else if let Some(path) = &proc.exec_path {
+                                match shard_map.get(path.as_str()).copied() {
+                                    Some(twid) => {
+                                        sup!("handoff check pid={pid}: {path} -> W{twid}");
+                                        ho = Some((twid, true));
+                                    }
+                                    None => {
+                                        sup!("handoff check pid={pid}: {path} has no shard; stays on W0");
+                                    }
+                                }
+                            } else {
+                                sup!("handoff check pid={pid}: no decided image path; stays on W0");
+                            }
+                        } else if proc.exec_blocked {
+                            sup!("handoff check pid={pid}: exec blocked; stays on W{wid}");
+                        } else if proc.parent != shard_root {
                             sup!(
-                                "handoff check pid={pid}: parent {} is not the guest root; stays on W0",
+                                "handoff check pid={pid}: parent {} is not the shard root; stays on W{wid}",
                                 proc.parent
                             );
-                        } else if proc.exec_blocked {
-                            sup!("handoff check pid={pid}: exec blocked; stays on W0");
                         } else if let Some(path) = &proc.exec_path {
-                            match shard_map.get(path.as_str()).copied() {
-                                Some(twid) => {
-                                    sup!("handoff check pid={pid}: {path} -> W{twid}");
-                                    ho = Some(twid);
-                                }
-                                None => {
-                                    sup!("handoff check pid={pid}: {path} has no shard; stays on W0");
-                                }
+                            // The root's own image is the
+                            // first (only) path of this
+                            // worker's shard entry: a root
+                            // child exec'ing that same
+                            // image stays; any other image
+                            // is kin and moves.
+                            let root_image = SHARDS
+                                .iter()
+                                .find(|(w, _, _)| *w == wid)
+                                .and_then(|(_, _, paths)| paths.first().copied());
+                            if Some(path.as_str()) == root_image {
+                                sup!("handoff check pid={pid}: {path} is the shard root's own image; stays on W{wid}");
+                            } else if let Some(twid) = kin_target {
+                                sup!("handoff check pid={pid}: {path} -> W{twid}");
+                                ho = Some((twid, false));
                             }
                         } else {
-                            sup!("handoff check pid={pid}: no decided image path; stays on W0");
+                            sup!("handoff check pid={pid}: no decided image path; stays on W{wid}");
                         }
                     }
                 }
                 match ho {
-                    Some(twid) => pending_handoff = Some((pid, twid)),
+                    Some((twid, root)) => {
+                        pending_handoff = Some((pid, twid, root))
+                    }
                     None => cont_syscall(pid, 0),
                 }
             }
-            if let Some((hpid, twid)) = pending_handoff.take() {
-                do_handoff(hpid, twid, &mut procs, &mut vcreds, &mut coord);
+            if let Some((hpid, twid, root)) = pending_handoff.take() {
+                do_handoff(hpid, twid, root, wid, &mut procs, &mut vcreds, &mut coord);
             }
         } else if sig == SIGTRAP && event == PTRACE_EVENT_EXEC {
             // The exec event stop sits between the execve entry and
@@ -7945,6 +8054,8 @@ fn main() {
         seen: HashSet::new(),
         counts: HashMap::new(),
         shard_map,
+        kin_target: None,
+        shard_root: 0,
     };
     tracer_loop(ctx);
 
