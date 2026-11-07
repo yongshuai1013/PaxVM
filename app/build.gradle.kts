@@ -25,8 +25,8 @@ android {
         applicationId = "com.yongshuai.paxvm"
         minSdk = 26
         targetSdk = 34
-        versionCode = 106
-        versionName = "0.9.65"
+        versionCode = 107
+        versionName = "0.9.66"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -72,4 +72,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // BouncyCastle: HKDF-SHA256 for the ADB pairing cipher in
+    // AdbLocal.kt. SPAKE2 itself is implemented there from
+    // BoringSSL's spake25519.c (the spake2-java port fails its
+    // own key-agreement tests), so no ADB/SPAKE2 library is
+    // pulled in.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 }
