@@ -8225,6 +8225,79 @@ fn tracer_loop(ctx: TracerCtx) {
                                 break;
                             }
                         }
+                        // Resolve the first stack words the
+                        // same way: a crash inside a shared
+                        // helper (an atomic, a lock) is only
+                        // attributable with its caller, and
+                        // the caller sits on the stack. Words
+                        // landing in a pathname mapping print
+                        // as "FATAL stk[i] in lib (+off)".
+                        if let Some(r) = &fregs {
+                            let sp = r.sp();
+                            if let Some(words) =
+                                read_mem_vec(pid, sp, 32)
+                            {
+                                let mut ranges: Vec<(
+                                    u64,
+                                    u64,
+                                    String,
+                                )> = Vec::new();
+                                for line in maps.lines() {
+                                    if !line.contains('/') {
+                                        continue;
+                                    }
+                                    let mut it =
+                                        line.split_whitespace();
+                                    let Some(range) = it.next()
+                                    else {
+                                        continue;
+                                    };
+                                    let Some((lo, hi)) =
+                                        range.split_once('-')
+                                    else {
+                                        continue;
+                                    };
+                                    let lo = u64::from_str_radix(
+                                        lo, 16,
+                                    )
+                                    .unwrap_or(0);
+                                    let hi = u64::from_str_radix(
+                                        hi, 16,
+                                    )
+                                    .unwrap_or(0);
+                                    let name = line
+                                        .rsplit('/')
+                                        .next()
+                                        .unwrap_or("?")
+                                        .trim()
+                                        .to_string();
+                                    ranges.push((lo, hi, name));
+                                }
+                                for i in 0..8 {
+                                    let w = u32::from_le_bytes(
+                                        words[i * 4..i * 4 + 4]
+                                            .try_into()
+                                            .unwrap(),
+                                    ) as u64;
+                                    if w < 0x10000 {
+                                        continue;
+                                    }
+                                    for (lo, hi, name) in &ranges {
+                                        if w >= *lo && w < *hi
+                                            && !name.is_empty()
+                                            && *name != "?"
+                                        {
+                                            sup!(
+                                                "FATAL stk[{i}] 0x{w:x} in {name} (+0x{:x})",
+                                                w - lo
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        }
                     }
                 }
             }
