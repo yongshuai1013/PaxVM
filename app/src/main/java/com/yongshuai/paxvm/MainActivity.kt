@@ -1,6 +1,8 @@
 package com.yongshuai.paxvm
 
 import android.app.Activity
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
@@ -350,6 +352,9 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         initLogFiles()
+        thread(name = "exitinfo", isDaemon = true) {
+            reportPreviousExits()
+        }
         buildUi()
         prepareRootfs(rootfsDir)
         statusView.text = "rootfs: ${rootfsDir.absolutePath}\n狀態：待命"
@@ -406,6 +411,69 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) {
             logFileOut = null
+        }
+    }
+
+    /** Ask Android why this app's previous processes
+     * died and write the answers into the session log.
+     * Sessions keep ending with every record cut off
+     * mid-line and no exit record anywhere: when the
+     * app process dies, the system's process-group
+     * cleanup takes the whole supervisor tree with it,
+     * so the only witness left is the system's own
+     * exit bookkeeping (ApplicationExitInfo: low-memory
+     * kill vs native/Java crash vs signaled, with RSS
+     * at death and, for crashes, a trace). */
+    private fun reportPreviousExits() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return
+        }
+        try {
+            val am = getSystemService(ActivityManager::class.java)
+            val exits =
+                am.getHistoricalProcessExitReasons(packageName, 0, 5)
+            if (exits.isEmpty()) {
+                writeLogLineToFile("[exitinfo] (no previous exits recorded)")
+            }
+            for (e in exits) {
+                val name = when (e.reason) {
+                    ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+                    ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+                    ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+                    ApplicationExitInfo.REASON_CRASH -> "CRASH"
+                    ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+                    ApplicationExitInfo.REASON_ANR -> "ANR"
+                    ApplicationExitInfo.REASON_INITIALIZATION_FAILURE ->
+                        "INITIALIZATION_FAILURE"
+                    ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE ->
+                        "EXCESSIVE_RESOURCE_USAGE"
+                    ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+                    ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+                    ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+                    ApplicationExitInfo.REASON_FREEZER -> "FREEZER"
+                    else -> "reason#${e.reason}"
+                }
+                writeLogLineToFile(
+                    "[exitinfo] ${java.util.Date(e.timestamp)} $name " +
+                        "status=${e.status} importance=${e.importance} " +
+                        "pss=${e.pss}KB rss=${e.rss}KB " +
+                        "desc=${e.description}",
+                )
+                if (e.reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                    e.reason == ApplicationExitInfo.REASON_CRASH
+                ) {
+                    try {
+                        e.traceInputStream?.bufferedReader()?.useLines { seq ->
+                            seq.take(40).forEach {
+                                writeLogLineToFile("[exitinfo-trace] $it")
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            writeLogLineToFile("[exitinfo] query failed: ${ex.message}")
         }
     }
 
