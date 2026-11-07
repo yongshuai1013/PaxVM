@@ -3302,6 +3302,52 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
             from_inbound
         );
         dump_mgr_read(st, &arena, pid, &bytes);
+        // Drain-verify: re-read every object-carrying parcel
+        // this batch points at from the arena file, under
+        // each registered base, and dump its slots as the
+        // guest is about to see them.
+        {
+            let mut vi = 0usize;
+            while vi + 4 <= bytes.len() {
+                let cmd = u32_at(&bytes, vi);
+                let adv = match cmd {
+                    BR_TRANSACTION | BR_REPLY => 44,
+                    BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
+                    BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => 8,
+                    _ => 4,
+                };
+                if (cmd == BR_TRANSACTION || cmd == BR_REPLY) && vi + 44 <= bytes.len() {
+                    let dsize = u32_at(&bytes, vi + 28) as usize;
+                    let osize = u32_at(&bytes, vi + 32) as usize;
+                    let daddr = u32_at(&bytes, vi + 36);
+                    let oaddr = u32_at(&bytes, vi + 40);
+                    if osize > 0 && dsize <= (1 << 20) && osize <= (1 << 16) {
+                        if let Some(bp) = st.procs.get(&arena) {
+                            for (bpid, base) in &bp.base {
+                                let (Some(doff), Some(ooff)) = (
+                                    daddr.checked_sub(*base),
+                                    oaddr.checked_sub(*base),
+                                ) else {
+                                    continue;
+                                };
+                                let mut dbuf = vec![0u8; dsize];
+                                let mut obuf = vec![0u8; osize];
+                                if bp.file.read_exact_at(&mut dbuf, doff as u64).is_ok()
+                                    && bp.file.read_exact_at(&mut obuf, ooff as u64).is_ok()
+                                {
+                                    bsup!(
+                                        "binder: drain-verify pid={pid} base_pid={bpid} slots{}",
+                                        slot_dump(&dbuf, &obuf)
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                vi += adv;
+            }
+        }
     }
     if bytes.is_empty() {
         st.parked.insert(pid, park);
@@ -4253,8 +4299,14 @@ fn binder_deliver(
         return Err("arena file write failed");
     }
     if !offs.is_empty() {
+        let bases: Vec<String> = bp
+            .base
+            .iter()
+            .map(|(p, b)| format!("{p}=0x{b:x}"))
+            .collect();
         bsup!(
-            "binder: deliver to={target} br={br_cmd} code={code} from_pid={sender_pid} slots{}",
+            "binder: deliver to={target} br={br_cmd} code={code} from_pid={sender_pid} base=0x{base:x} bases=[{}] slots{}",
+            bases.join(","),
             slot_dump(data, offs)
         );
     }
