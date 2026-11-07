@@ -210,6 +210,10 @@ class PairingService : Service() {
             log("連接目標：${connTarget.first}:${connTarget.second}")
             adb.connect(connTarget.first, connTarget.second)
             log("連接驗證成功")
+            // Persist for later flows: repeat mDNS
+            // discoveries of the connect service are
+            // unreliable on this device (see AdbMdns).
+            AdbMdns.rememberConnectEndpoint(this, connTarget.first, connTarget.second)
             success = true
         } catch (e: Exception) {
             val chain = generateSequence<Throwable>(e) { it.cause }

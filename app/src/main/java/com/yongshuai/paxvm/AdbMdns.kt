@@ -155,6 +155,44 @@ object AdbMdns {
         return result
     }
 
+    // ----- last-known connect endpoint -----
+    //
+    // Field finding (0.9.71, 2026-11-07): the first
+    // discovery of _adb-tls-connect in a session works
+    // (the pairing flow found it), but later discoveries
+    // in the same session return zero service-found
+    // events for the full window -- Android's mdnsd is
+    // flaky about repeat discoveries. The endpoint only
+    // changes when wireless debugging restarts, so any
+    // flow that discovers it persists it here and later
+    // flows try it directly first, falling back to
+    // discovery only when the direct connect fails.
+
+    private const val ENDPOINT_FILE = "adb-connect-endpoint.txt"
+
+    fun rememberConnectEndpoint(context: Context, host: String, port: Int) {
+        try {
+            val f = java.io.File(context.applicationContext.filesDir, ENDPOINT_FILE)
+            f.writeText("$host $port ${System.currentTimeMillis()}")
+        } catch (e: Exception) {
+            // Best-effort: discovery remains as the fallback.
+        }
+    }
+
+    fun savedConnectEndpoint(context: Context): Pair<String, Int>? {
+        return try {
+            val f = java.io.File(context.applicationContext.filesDir, ENDPOINT_FILE)
+            if (!f.exists()) return null
+            val parts = f.readText().trim().split(" ")
+            if (parts.size < 2) return null
+            val port = parts[1].toIntOrNull() ?: return null
+            if (port <= 0) return null
+            parts[0] to port
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     /** Resolves one service, serialized (see resolveLock note). */
     private fun resolveOne(
         nsd: NsdManager,

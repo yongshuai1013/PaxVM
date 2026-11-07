@@ -35,6 +35,7 @@ class SystemLimitActivity : Activity() {
 
     private lateinit var statusView: TextView
     private lateinit var recordView: TextView
+    private lateinit var recordScroll: ScrollView
 
     private var adb: AdbLocal? = null
 
@@ -134,7 +135,7 @@ class SystemLimitActivity : Activity() {
             typeface = android.graphics.Typeface.MONOSPACE
             movementMethod = ScrollingMovementMethod()
         }
-        val recordScroll = ScrollView(this).apply { addView(recordView) }
+        recordScroll = ScrollView(this).apply { addView(recordView) }
         root.addView(
             recordScroll,
             LinearLayout.LayoutParams(
@@ -180,7 +181,18 @@ class SystemLimitActivity : Activity() {
     // ----- record / status helpers -----
 
     private fun record(line: String) {
-        runOnUiThread { recordView.append(line + "\n") }
+        runOnUiThread {
+            recordView.append(line + "\n")
+            // Keep the newest line in view: without this
+            // the record stays wherever the user left it
+            // and a running operation looks like "no
+            // response" (0.9.71 field report).
+            if (::recordScroll.isInitialized) {
+                recordScroll.post {
+                    recordScroll.fullScroll(android.view.View.FOCUS_DOWN)
+                }
+            }
+        }
     }
 
     private fun setStatus(text: String) {
@@ -243,21 +255,42 @@ class SystemLimitActivity : Activity() {
         runOp(name) {
             val client = ensureAdb()
             if (!client.isConnected) {
-                record("尚未連接，先以 mDNS 發現連接服務（逾時 15 秒）")
-                val target = AdbMdns.discover(
-                    this@SystemLimitActivity,
-                    AdbMdns.TYPE_CONNECT,
-                    15_000,
-                ) { msg -> record(msg) }
-                    ?: throw IOException("mDNS 找不到連接服務（逾時）：請確認無線偵錯已開啟、且在同一個 Wi-Fi")
-                record("連接：${target.first}:${target.second}")
-                try {
-                    client.connect(target.first, target.second)
-                } catch (e: Exception) {
-                    client.close()
-                    throw e
+                var connected = false
+                // Repeat mDNS discoveries of the connect
+                // service are unreliable on this device
+                // (0.9.71 field runs), so try the endpoint
+                // saved at pairing time first.
+                val saved = AdbMdns.savedConnectEndpoint(this@SystemLimitActivity)
+                if (saved != null) {
+                    record("先試配對時保存的連接端點 ${saved.first}:${saved.second}")
+                    try {
+                        client.connect(saved.first, saved.second)
+                        connected = true
+                        setStatus("已連接")
+                    } catch (e: Exception) {
+                        client.close()
+                        record("保存的端點連不上（${e.message}），改走 mDNS 發現")
+                    }
                 }
-                setStatus("已連接")
+                if (!connected) {
+                    record("尚未連接，以 mDNS 發現連接服務（逾時 15 秒）")
+                    val target = AdbMdns.discover(
+                        this@SystemLimitActivity,
+                        AdbMdns.TYPE_CONNECT,
+                        15_000,
+                    ) { msg -> record(msg) }
+                        ?: throw IOException("mDNS 找不到連接服務（逾時）：請確認無線偵錯已開啟、且在同一個 Wi-Fi")
+                    record("連接：${target.first}:${target.second}")
+                    try {
+                        client.connect(target.first, target.second)
+                    } catch (e: Exception) {
+                        client.close()
+                        throw e
+                    }
+                    AdbMdns.rememberConnectEndpoint(
+                        this@SystemLimitActivity, target.first, target.second)
+                    setStatus("已連接")
+                }
             }
             if (!restore) {
                 shellLogged(client, "settings put global settings_enable_monitor_phantom_procs false")
