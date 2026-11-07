@@ -228,6 +228,9 @@ class MainActivity : Activity() {
         "    setprop ro.EMPTY_APP_MEM 8192",
         "    setprop pax.stage boot",
         "    start servicemanager",
+        "    start vold",
+        "    start netd",
+        "    start installd",
         "    start surfaceflinger",
         "    start zygote",
         "    start bootanimation",
@@ -297,6 +300,32 @@ class MainActivity : Activity() {
         // vm-engine-research/s8-system-server-spec.md.
         "service zygote /system/bin/app_process -Xzygote /system/bin --zygote --start-system-server",
         "    socket zygote stream 666",
+        "",
+        // S9 (0.9.83): the stock daemons the service
+        // march waits on. Their binaries have been in
+        // the payload since the root tree was completed
+        // (0.9.81); what was missing is these service
+        // definitions -- init creates the /dev/socket
+        // endpoints and hands over the listening fds.
+        // Lines copied from the stock rc
+        // (android-2.3.7_r1 rootdir/init.rc).
+        // NetworkManagementService.create() awaits a
+        // latch that only its netd connector's first
+        // successful exchange counts down; with no netd
+        // running, the 0.9.82 field's ServerThread
+        // waited on that latch forever. MountService's
+        // vold connector and the package manager's
+        // installd connector are the same shape, a few
+        // checkpoints further on.
+        "service vold /system/bin/vold",
+        "    socket vold stream 0660 root mount",
+        "    ioprio be 2",
+        "",
+        "service netd /system/bin/netd",
+        "    socket netd stream 0660 root system",
+        "",
+        "service installd /system/bin/installd",
+        "    socket installd stream 600 system system",
         "",
     ).joinToString("\n")
 
