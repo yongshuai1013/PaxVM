@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Loopback ADB (wireless debugging) for the settings
+         page's phantom-limit lift; no mDNS, ports are typed in. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:label="PaxVM"
         android:theme="@android:style/Theme.Holo">
@@ -12,6 +16,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false" />
     </application>
 
 </manifest>
