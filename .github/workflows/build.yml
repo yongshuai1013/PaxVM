@@ -360,7 +360,7 @@ jobs:
         run: |
           set -euo pipefail
           cat exp-assets/s2part.0 exp-assets/s2part.1 exp-assets/s2part.2 exp-assets/s2part.3 exp-assets/s2part.4 > s2system.zip
-          echo "ca497c8d0eb8ea4319ac2e068226f64c22f2a3d9a2432e0584e6ee37f6ac3ff3  s2system.zip" | sha256sum -c -
+          echo "deb97fa7cdb8a142e0e8d05bf37f6a8a1b5369351b91cb328a262641ccd12109  s2system.zip" | sha256sum -c -
           mkdir -p gbsys
           python3 -c "import zipfile; zipfile.ZipFile('s2system.zip').extractall('gbsys')"
           test -f gbsys/bin/servicemanager
