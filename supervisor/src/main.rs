@@ -5103,22 +5103,49 @@ fn selinux_ctx(pid: i32) -> String {
 /// manager's clean exit(0) after serving flushed work in
 /// the 0.9.26 device run; this names which one it ate.
 fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
-    if st.mgr_arena.as_deref() != Some(arena) {
-        return;
-    }
+    let _ = (st, arena);
     let mut cmds: Vec<String> = Vec::new();
     let mut off = 0usize;
-    while off + 4 <= bytes.len() && cmds.len() < 8 {
+    while off + 4 <= bytes.len() && cmds.len() < 10 {
         let c = u32_at(bytes, off);
-        cmds.push(format!("{c:#010x}"));
-        off += match c {
-            BR_TRANSACTION | BR_REPLY => 44,
-            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
-            _ => 4,
-        };
+        match c {
+            BR_TRANSACTION | BR_REPLY => {
+                if off + 44 <= bytes.len() {
+                    cmds.push(format!(
+                        "TXN code={} ds={} os={}",
+                        u32_at(bytes, off + 12),
+                        u32_at(bytes, off + 28),
+                        u32_at(bytes, off + 32)
+                    ));
+                } else {
+                    cmds.push("TXN?".into());
+                }
+                off += 44;
+            }
+            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => {
+                if off + 12 <= bytes.len() {
+                    cmds.push(format!(
+                        "REF {c:#x} a=0x{:x} b=0x{:x}",
+                        u32_at(bytes, off + 4),
+                        u32_at(bytes, off + 8)
+                    ));
+                } else {
+                    cmds.push("REF?".into());
+                }
+                off += 12;
+            }
+            BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => {
+                cmds.push(format!("{c:#010x}"));
+                off += 8;
+            }
+            _ => {
+                cmds.push(format!("{c:#010x}"));
+                off += 4;
+            }
+        }
     }
     bsup!(
-        "binder: mgr read for pid={pid}: {}B cmds=[{}]",
+        "binder: read for pid={pid}: {}B cmds=[{}]",
         bytes.len(),
         cmds.join(", ")
     );
