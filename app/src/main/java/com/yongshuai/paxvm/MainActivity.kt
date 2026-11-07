@@ -231,6 +231,7 @@ class MainActivity : Activity() {
         "    start vold",
         "    start netd",
         "    start installd",
+        "    start media",
         "    start surfaceflinger",
         "    start zygote",
         "    start bootanimation",
@@ -326,6 +327,27 @@ class MainActivity : Activity() {
         "",
         "service installd /system/bin/installd",
         "    socket installd stream 600 system system",
+        "",
+        // S9 (0.9.86): mediaserver, stock lines. The
+        // service march's Audio Service step blocks in
+        // waitForService("media.audio_policy") until
+        // mediaserver publishes the audio policy and
+        // flinger services (0.9.85 field: 172 waits,
+        // march parked there for the rest of the
+        // session). Its ioprio line is survivable now
+        // that the supervisor fakes ioprio_set.
+        "service media /system/bin/mediaserver",
+        "    user media",
+        "    group system audio camera graphics inet net_bt net_bt_admin net_raw",
+        "    ioprio rt 4",
+        "",
+        // Stock boot-completion trigger, adapted to
+        // our animation service's name: when the
+        // framework reports boot finished, init stops
+        // the boot animation (on hardware the service
+        // is called bootanim; ours is bootanimation).
+        "on property:service.bootanim.exit=1",
+        "    stop bootanimation",
         "",
     ).joinToString("\n")
 
