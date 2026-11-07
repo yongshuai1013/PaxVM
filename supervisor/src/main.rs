@@ -7255,6 +7255,30 @@ fn tracer_loop(ctx: TracerCtx) {
                     dirty = true;
                 } else {
                     // P class and unlisted: pass, log first occurrence.
+                    // 0.9.63 telemetry: kill-family calls
+                    // always log their arguments -- a
+                    // pass-through kill is otherwise
+                    // invisible, and 0.9.62's field run
+                    // lost every SurfaceFlinger on W2 to
+                    // an unexplained realtime signal (35).
+                    let killfam = if proc.compat {
+                        matches!(nr, 37 | 238 | 270)
+                    } else {
+                        matches!(nr, 129 | 130 | 131)
+                    };
+                    if killfam {
+                        let (target, signum) =
+                            if nr == 270 || nr == 131 {
+                                (regs.arg(1), regs.arg(2))
+                            } else {
+                                (regs.arg(0), regs.arg(1))
+                            };
+                        sys!(
+                            "{}({}) killfam pid={pid} target={target} sig={signum} (pass)",
+                            nr_name(proc.compat, nr),
+                            nr
+                        );
+                    }
                     *counts.entry((proc.compat, nr)).or_insert(0) += 1;
                     if seen.insert((proc.compat, nr)) {
                         sys!(
@@ -7527,6 +7551,17 @@ fn tracer_loop(ctx: TracerCtx) {
             // exit stop, that exit stop still follows, and the exit
             // path already tolerates a missing record.
             let mut deliver = sig;
+            if sig >= 32 {
+                // 0.9.63 telemetry: realtime-range
+                // signals are rare in the guests and
+                // are never part of the funnel's own
+                // machinery. 0.9.62's field run lost
+                // every SurfaceFlinger incarnation on
+                // W2 to sig=35 with no sender visible;
+                // record every arrival in that range
+                // and the reinjection decision.
+                sup!("signal stop pid={pid} sig={sig} (realtime range) -> reinject");
+            }
             if matches!(sig, 4 | 6 | 7 | 8 | 11) {
                 // Fatal-signal forensics (purely additive): a
                 // genuine guest crash (SIGSEGV and friends) is
