@@ -81,4 +81,10 @@ dependencies {
     // own key-agreement tests), so no ADB/SPAKE2 library is
     // pulled in.
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    // Bundled Conscrypt: the ADB pairing needs the TLS
+    // exported key material, which the platform
+    // Conscrypt cannot serve from an app classloader
+    // (0.9.69 field failure); our own provider's
+    // sockets + static export call can.
+    implementation("org.conscrypt:conscrypt-android:2.5.2")
 }

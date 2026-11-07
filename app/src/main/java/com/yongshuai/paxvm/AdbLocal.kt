@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Base64
 import org.bouncycastle.crypto.digests.SHA256Digest
+import org.conscrypt.Conscrypt
 import org.bouncycastle.crypto.generators.HKDFBytesGenerator
 import org.bouncycastle.crypto.params.HKDFParameters
 import java.io.ByteArrayOutputStream
@@ -717,11 +718,22 @@ class AdbLocal(
     }
 
     private fun newSslContext(): SSLContext {
+        // The bundled Conscrypt provider, not the
+        // platform one: SPAKE2 needs the TLS exported
+        // key material, and the platform Conscrypt
+        // classes cannot serve that call from an app
+        // classloader (0.9.69 field run on Android 12:
+        // the platform shim's delegation to
+        // org.conscrypt.Conscrypt searched the app's
+        // own dex path and failed). With the library
+        // in our dex, its sockets and the static
+        // export call below are both ours.
+        val provider = Conscrypt.newProvider()
         val (ctx, protoName) = try {
-            SSLContext.getInstance("TLSv1.3") to "TLSv1.3"
+            SSLContext.getInstance("TLSv1.3", provider) to "TLSv1.3"
         } catch (e: Exception) {
             log("TLSv1.3 SSLContext 不可用（${e.message}），改用 TLS")
-            SSLContext.getInstance("TLS") to "TLS"
+            SSLContext.getInstance("TLS", provider) to "TLS"
         }
         val trustAll = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
@@ -750,33 +762,26 @@ class AdbLocal(
 
     /**
      * TLS exported keying material, 64 bytes (libadb
-     * PairingConnectionCtx.exportKeyingMaterial): reflective
-     * call into Conscrypt — the platform class on API 29+, the
-     * standalone class name as fallback. The exported material
-     * is appended to the pairing code to form the SPAKE2
-     * password, binding the PAKE to this TLS connection.
+     * PairingConnectionCtx.exportKeyingMaterial): direct
+     * call into the bundled Conscrypt library. The exported
+     * material is appended to the pairing code to form the
+     * SPAKE2 password, binding the PAKE to this TLS
+     * connection.
      */
     private fun exportKeyingMaterial(ssl: SSLSocket, length: Int): ByteArray {
         if (Build.VERSION.SDK_INT < 29) {
             throw SSLException("TLSv1.3 isn't supported on your platform (API < 29)")
         }
-        val errors = mutableListOf<String>()
-        for (className in listOf("com.android.org.conscrypt.Conscrypt", "org.conscrypt.Conscrypt")) {
-            try {
-                val cls = Class.forName(className)
-                val method = cls.getMethod(
-                    "exportKeyingMaterial",
-                    SSLSocket::class.java,
-                    String::class.java,
-                    ByteArray::class.java,
-                    Integer.TYPE,
-                )
-                return method.invoke(null, ssl, EXPORTED_KEY_LABEL, null, length) as ByteArray
-            } catch (e: Exception) {
-                errors.add("$className: ${e.cause?.message ?: e.message}")
-            }
+        // Direct call into the bundled Conscrypt (the
+        // socket came from its provider, see
+        // newSslContext) -- the previous reflective
+        // route into the platform class failed in the
+        // field (see newSslContext's note).
+        try {
+            return Conscrypt.exportKeyingMaterial(ssl, EXPORTED_KEY_LABEL, null, length)
+        } catch (e: Exception) {
+            throw SSLException("exportKeyingMaterial failed: ${e.message}", e)
         }
-        throw SSLException("exportKeyingMaterial failed: ${errors.joinToString(" | ")}")
     }
 
     // ----- pairing (PairingConnectionCtx wire layout) -----
