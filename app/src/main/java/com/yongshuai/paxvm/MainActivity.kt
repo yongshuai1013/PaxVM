@@ -229,17 +229,21 @@ class MainActivity : Activity() {
         "    group graphics",
         "    oneshot",
         "",
-        // S7 gun 1: the real zygote, standing alone. No
-        // --start-system-server yet (system_server is S8:
-        // if it dies, GB's zygote takes itself down with
-        // it, which would muddy this gun's verdict). The
+        // S7 gun 1: the real zygote, standing alone. The
         // socket line makes the stock init create
         // /dev/socket/zygote and hand app_process the fd,
         // exactly as on hardware. No user line: root, as
         // in the stock rc. The stock onrestart /sys writes
         // are omitted -- this guest has no real sysfs for
         // them to land on.
-        "service zygote /system/bin/app_process -Xzygote /system/bin --zygote",
+        // S8 gun 1 (2026-11-07): --start-system-server.
+        // Zygote forks system_server (no exec: the child
+        // stays in zygote's shard, W3); GB semantics say
+        // a system_server death takes zygote down with
+        // it, so zygote restart loops in the log are the
+        // amplified failure signal. Spec:
+        // vm-engine-research/s8-system-server-spec.md.
+        "service zygote /system/bin/app_process -Xzygote /system/bin --zygote --start-system-server",
         "    socket zygote stream 666",
         "",
     ).joinToString("\n")
