@@ -7431,6 +7431,32 @@ fn tracer_loop(ctx: TracerCtx) {
                         nr
                     ));
                     dirty = true;
+                } else if proc.compat && nr == 294
+                    && regs.arg(1) == libc::SOL_SOCKET as u64
+                    && matches!(regs.arg(2), 32 | 33)
+                {
+                    // setsockopt(SOL_SOCKET, SO_SNDBUF-
+                    // FORCE / SO_RCVBUFFORCE): the FORCE
+                    // variants exist for root daemons --
+                    // they bypass the net buffer sysctls
+                    // and demand CAP_NET_ADMIN, which the
+                    // host app does not hold (0.9.84 field:
+                    // netd and vold both died every tenure
+                    // on "Unable to set uevent socket
+                    // SO_RCVBUFFORCE option: Operation not
+                    // permitted" right after the uevent
+                    // socket substitution let them start).
+                    // The forced size is advisory -- the
+                    // receive buffer governs uevent burst
+                    // absorption, and the virtual uevent
+                    // socket never delivers at all. Answer
+                    // success without the kernel.
+                    skip_syscall(pid, &mut regs, &mut pend, 0);
+                    pend.desc = Some(
+                        "setsockopt(294) BUFFORCE FAKED -> 0 (virtual caps)"
+                            .to_string(),
+                    );
+                    dirty = true;
                 } else if is_ioprio(proc.compat, nr) {
                     // I/O priority (see is_ioprio): the
                     // host seccomp filter traps this call

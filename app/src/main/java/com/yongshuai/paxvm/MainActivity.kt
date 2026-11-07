@@ -1138,6 +1138,36 @@ class MainActivity : Activity() {
         // guest can open and write pids into.
         File(rootfs, "acct/uid/0").mkdirs()
         writeFresh(File(rootfs, "acct/uid/0/tasks"), "")
+        // Fake battery surface (S9, 0.9.85): GB's
+        // BatteryService JNI registration opendir()s
+        // /sys/class/power_supply and returns -1 --
+        // skipping RegisterNatives entirely -- when
+        // the directory cannot be opened; on hardware
+        // the sysfs mount always provides it, here the
+        // skeleton must. Without it the 0.9.84 field's
+        // system_server died 28 tenures in a row on
+        // UnsatisfiedLinkError: native_update at the
+        // Battery Service checkpoint. Provide a static
+        // battery plus mains/usb stubs with era-plain
+        // values; the JNI discovers the supplies by
+        // reading each subdirectory's "type" file and
+        // probes the value files with access(R_OK).
+        val ps = "sys/class/power_supply"
+        File(rootfs, "$ps/ac").mkdirs()
+        File(rootfs, "$ps/usb").mkdirs()
+        File(rootfs, "$ps/battery").mkdirs()
+        writeFresh(File(rootfs, "$ps/ac/type"), "Mains\n")
+        writeFresh(File(rootfs, "$ps/ac/online"), "0\n")
+        writeFresh(File(rootfs, "$ps/usb/type"), "USB\n")
+        writeFresh(File(rootfs, "$ps/usb/online"), "0\n")
+        writeFresh(File(rootfs, "$ps/battery/type"), "Battery\n")
+        writeFresh(File(rootfs, "$ps/battery/status"), "Discharging\n")
+        writeFresh(File(rootfs, "$ps/battery/health"), "Good\n")
+        writeFresh(File(rootfs, "$ps/battery/present"), "1\n")
+        writeFresh(File(rootfs, "$ps/battery/capacity"), "50\n")
+        writeFresh(File(rootfs, "$ps/battery/voltage_now"), "3700000\n")
+        writeFresh(File(rootfs, "$ps/battery/temp"), "250\n")
+        writeFresh(File(rootfs, "$ps/battery/technology"), "Li-ion\n")
         // Virtual framebuffer backing (S6): two 480x800x32
         // pages, zeroed per session, plus the visible-page
         // note the supervisor's fb ioctl handler maintains.
