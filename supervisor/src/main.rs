@@ -2052,7 +2052,12 @@ impl BinderState {
             cookie,
             dead: false,
         });
-        self.nodes.len() - 1
+        let id = self.nodes.len() - 1;
+        bsup!(
+            "binder: node#{} registered owner={} ptr=0x{:x} cookie=0x{:x}",
+            id, owner, ptr, cookie
+        );
+        id
     }
     fn handle_for(&mut self, arena: &str, node: usize) -> u32 {
         // Never panic: the supervisor dying takes the whole
@@ -4064,6 +4069,10 @@ fn binder_write_obj(st: &mut BinderState, to: &str, node: usize, weak: bool, out
         (n.owner.clone(), n.ptr, n.cookie)
     };
     if owner == to {
+        bsup!(
+            "binder: obj BINDER node#{} -> owner arena {} ptr=0x{:x} cookie=0x{:x} weak={}",
+            node, to, nptr, ncookie, weak
+        );
         put_u32(out, off, if weak { OBJ_WEAK_BINDER } else { OBJ_BINDER });
         put_u32(out, off + 8, nptr);
         put_u32(out, off + 12, ncookie);
