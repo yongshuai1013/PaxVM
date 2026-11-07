@@ -188,6 +188,38 @@ class MainActivity : Activity() {
         "    setprop pax.stage fs",
         "",
         "on boot",
+        // S8 gun 3: the stock OOM-adjustment properties
+        // (AOSP 2.3.7 rootdir/init.rc `on boot`). Our
+        // trimmed rc never set them, and
+        // ActivityManagerService's static initializer
+        // parses every one of them as an integer --
+        // SystemProperties.get returns "" for a missing
+        // property, Integer.valueOf("") throws, and the
+        // resulting ExceptionInInitializerError is a
+        // FATAL EXCEPTION IN SYSTEM PROCESS: with the
+        // capset abort fixed (0.9.79), system_server
+        // entered, started its first services, and died
+        // on exactly this, 19 zygote tenures in a row.
+        // The stock rc sets them at `on boot` before any
+        // service starts; same placement here.
+        "    setprop ro.FOREGROUND_APP_ADJ 0",
+        "    setprop ro.VISIBLE_APP_ADJ 1",
+        "    setprop ro.PERCEPTIBLE_APP_ADJ 2",
+        "    setprop ro.HEAVY_WEIGHT_APP_ADJ 3",
+        "    setprop ro.SECONDARY_SERVER_ADJ 4",
+        "    setprop ro.BACKUP_APP_ADJ 5",
+        "    setprop ro.HOME_APP_ADJ 6",
+        "    setprop ro.HIDDEN_APP_MIN_ADJ 7",
+        "    setprop ro.EMPTY_APP_ADJ 15",
+        "    setprop ro.FOREGROUND_APP_MEM 2048",
+        "    setprop ro.VISIBLE_APP_MEM 3072",
+        "    setprop ro.PERCEPTIBLE_APP_MEM 4096",
+        "    setprop ro.HEAVY_WEIGHT_APP_MEM 4096",
+        "    setprop ro.SECONDARY_SERVER_MEM 6144",
+        "    setprop ro.BACKUP_APP_MEM 6144",
+        "    setprop ro.HOME_APP_MEM 6144",
+        "    setprop ro.HIDDEN_APP_MEM 7168",
+        "    setprop ro.EMPTY_APP_MEM 8192",
         "    setprop pax.stage boot",
         "    start servicemanager",
         "    start surfaceflinger",
