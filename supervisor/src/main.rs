@@ -343,26 +343,51 @@ static OUT: Mutex<Option<OutState>> = Mutex::new(None);
 /// once per process before its first emit.
 static WID: AtomicU32 = AtomicU32::new(0);
 
-/// 0.9.61: directory of the direct mirror logs. The
-/// shell's session log dies with the app -- twice in
-/// the 0.9.59/0.9.60 field runs the crashed session's
-/// record was trapped behind the reopened app's
-/// rotation stub and could not be downloaded. Each
-/// tracer therefore mirrors its own emitted lines to
-/// supervisor-direct-w<wid>.log in the vm directory
-/// (set from the rootfs parent at startup; W0 rotates
-/// the previous session's mirrors to *-prev.log
-/// first). The shell folds these files into every
-/// log download, so the record survives app death.
+/// Direct mirror logs. The shell's session log dies
+/// with the app -- twice in the 0.9.59/0.9.60 field
+/// runs the crashed session's record was trapped
+/// behind the reopened app's rotation stub and could
+/// not be downloaded. Each tracer therefore mirrors
+/// its own emitted lines to
+/// supervisor-direct-w<wid>.log (W0 rotates the
+/// previous session's mirrors to *-prev.log first).
+/// 0.9.61: the directory was the vm directory (the
+/// rootfs parent). 0.9.78: the shell passes
+/// --logdir <path> pointing at this launch's
+/// directory in the app's external files dir
+/// (Android/data/...), a real path these native
+/// processes can write and the user can read without
+/// the app -- the Download folder proper is
+/// MediaStore-only and unreachable from here -- so
+/// the mirrors are written live, next to the session
+/// log's directory name, as the session runs. Without
+/// --logdir the vm directory is used as before.
 static DIRECT_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The --logdir override, scanned from argv on every
+/// call: the coordinator and the shard workers are
+/// forked from W0 and inherit its argv, so no extra
+/// plumbing is needed to carry it to them.
+fn logdir_override() -> Option<String> {
+    let argv: Vec<String> = std::env::args().collect();
+    match argv.iter().position(|a| a == "--logdir") {
+        Some(i) if i + 1 < argv.len() && argv[i + 1] != "--" => {
+            Some(argv[i + 1].clone())
+        }
+        _ => None,
+    }
+}
+
 fn set_direct_log_dir(rootfs: &str, rotate: bool) {
-    let dir = match rootfs.rfind('/') {
-        Some(i) if i > 0 => rootfs[..i].to_string(),
-        _ => return,
+    let dir = match logdir_override() {
+        Some(d) => d,
+        None => match rootfs.rfind('/') {
+            Some(i) if i > 0 => rootfs[..i].to_string(),
+            _ => return,
+        },
     };
     if rotate {
-        for w in 0..=4u32 {
+        for w in 0..=6u32 {
             let cur = format!("{dir}/supervisor-direct-w{w}.log");
             let prev = format!("{dir}/supervisor-direct-w{w}-prev.log");
             if std::path::Path::new(&cur).exists() {

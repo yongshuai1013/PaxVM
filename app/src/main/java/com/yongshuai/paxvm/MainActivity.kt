@@ -73,7 +73,7 @@ class MainActivity : Activity() {
     // launch's file is rotated to previous-session-log.txt
     // and 下載日誌 serves it when this launch has not run
     // a session yet (the force-stop-and-reopen recovery).
-    private var logFileOut: FileOutputStream? = null
+    private var logFileOut: OutputStream? = null
     // 0.9.54 batching: pending session-log text (guarded
     // by logFileLock, flushed at 64 KB / 250 ms) and
     // pending on-screen text (same lock, flushed to the
@@ -84,6 +84,19 @@ class MainActivity : Activity() {
     private val logFileLock = Object()
     private var previousLogFile: File? = null
     private var sessionLogFileRef: File? = null
+    // 0.9.78 live log locations: the session log streams
+    // into Download/PaxVM-logs-<launch time>/ through the
+    // MediaStore uri below (null in the private-file
+    // fallback), and the supervisor's direct mirror logs
+    // stream into the same-named directory under the
+    // app's external files dir (Android/data), which the
+    // shell passes to the supervisor as --logdir.
+    @Volatile
+    private var liveLogUri: android.net.Uri? = null
+    @Volatile
+    private var liveLogDirName: String? = null
+    @Volatile
+    private var mirrorLogDir: File? = null
     private var sessionRan = false
 
     // On-screen log flood guards (0.9.23): exact-repeat
@@ -369,22 +382,104 @@ class MainActivity : Activity() {
         if (prev != null && prev.exists() && prev.length() > 0) {
             appendLog("[shell] 上一場的日誌已保留（${prev.length()} 位元組）；本場未啟動前按「下載日誌」可取得")
         }
+        val liveDir = liveLogDirName
+        if (liveDir != null) {
+            appendLog("[shell] 本場日誌即時寫入 Download/$liveDir/session-log.txt；監督器鏡像即時寫入 Android/data 的同名目錄")
+        }
     }
 
-    /** Rotate the session log files and open this
-     * launch's writer. Never throws: logging must not be
-     * able to take the app down. */
+    /** Open this launch's session log writer. Since
+     * 0.9.78 the session log is written LIVE into its
+     * own directory under Download
+     * (Download/PaxVM-logs-<launch time>/session-log.txt,
+     * through a MediaStore stream), so the record is
+     * already where the user can reach it while the
+     * session runs, and an app death cannot trap it
+     * behind a reopened app's export step. The
+     * supervisor's direct mirrors cannot use MediaStore
+     * (native processes, no Java API), so they are
+     * written live to the same-named directory in the
+     * app's external files dir instead (Android/data;
+     * see setupMirrorDir). If the Download stream
+     * cannot be opened, or the device predates the
+     * MediaStore Downloads collection, logging falls
+     * back to the pre-0.9.78 private files with their
+     * rotation, unchanged. Never throws: logging must
+     * not be able to take the app down. */
     private fun initLogFiles() {
         try {
-            val cur = File(filesDir, "session-log.txt")
-            val prev = File(filesDir, "previous-session-log.txt")
-            if (cur.exists() && cur.length() > 0) {
-                if (prev.exists()) prev.delete()
-                cur.renameTo(prev)
-                previousLogFile = prev
+            val stamp = SimpleDateFormat(
+                "yyyyMMdd-HHmmss", Locale.US,
+            ).format(Date())
+            val dirName = "PaxVM-logs-$stamp"
+            var live = false
+            if (Build.VERSION.SDK_INT >= 29) {
+                try {
+                    val values = ContentValues().apply {
+                        put(
+                            MediaStore.Downloads.DISPLAY_NAME,
+                            "session-log.txt",
+                        )
+                        put(
+                            MediaStore.Downloads.MIME_TYPE,
+                            "text/plain",
+                        )
+                        put(
+                            MediaStore.Downloads.RELATIVE_PATH,
+                            Environment.DIRECTORY_DOWNLOADS +
+                                "/" + dirName,
+                        )
+                    }
+                    val uri = contentResolver.insert(
+                        MediaStore.Downloads
+                            .EXTERNAL_CONTENT_URI,
+                        values,
+                    )
+                    val out = if (uri != null) {
+                        contentResolver.openOutputStream(
+                            uri, "w",
+                        )
+                    } else {
+                        null
+                    }
+                    if (uri != null && out != null) {
+                        liveLogUri = uri
+                        liveLogDirName = dirName
+                        logFileOut = out
+                        live = true
+                    }
+                } catch (e: Exception) {
+                    // Fall through to the private file.
+                }
             }
-            sessionLogFileRef = cur
-            logFileOut = FileOutputStream(cur, true)
+            if (!live) {
+                val cur = File(filesDir, "session-log.txt")
+                val prev = File(
+                    filesDir, "previous-session-log.txt",
+                )
+                if (cur.exists() && cur.length() > 0) {
+                    if (prev.exists()) prev.delete()
+                    cur.renameTo(prev)
+                    previousLogFile = prev
+                }
+                sessionLogFileRef = cur
+                logFileOut = FileOutputStream(cur, true)
+            } else {
+                // Freeze the legacy private logs: the old
+                // rotation would overwrite the previous
+                // session here, and it may still hold
+                // unretrieved crash evidence. They are
+                // copied into this launch's Download
+                // directory instead (migrateLegacyLogs).
+                val prev = File(
+                    filesDir, "previous-session-log.txt",
+                )
+                if (prev.exists() && prev.length() > 0) {
+                    previousLogFile = prev
+                }
+                migrateLegacyLogs(dirName)
+            }
+            setupMirrorDir(dirName)
             // The 0.9.54 batching flusher: lands buffered
             // session-log lines every 250 ms so the file
             // trails reality by at most a quarter second
@@ -431,6 +526,92 @@ class MainActivity : Activity() {
         }
     }
 
+
+    /** One-time copy of the pre-0.9.78 private session
+     * logs into this launch's Download log directory.
+     * Live mode freezes the private files (the old
+     * rotation would destroy the previous session, which
+     * may still hold unretrieved crash evidence), so the
+     * frozen pair travels as legacy-session-log.txt and
+     * legacy-previous-session-log.txt instead. Copies
+     * are streamed; a source is renamed to
+     * <name>.migrated only after its copy has landed, so
+     * a failed copy is retried on the next launch and
+     * the original never disappears first. */
+    private fun migrateLegacyLogs(dirName: String) {
+        thread(name = "log-migrate", isDaemon = true) {
+            val pairs = listOf(
+                "legacy-session-log.txt" to
+                    File(filesDir, "session-log.txt"),
+                "legacy-previous-session-log.txt" to
+                    File(filesDir, "previous-session-log.txt"),
+            )
+            for ((name, src) in pairs) {
+                if (!src.exists() || src.length() == 0L) {
+                    continue
+                }
+                try {
+                    val values = ContentValues().apply {
+                        put(
+                            MediaStore.Downloads.DISPLAY_NAME,
+                            name,
+                        )
+                        put(
+                            MediaStore.Downloads.MIME_TYPE,
+                            "text/plain",
+                        )
+                        put(
+                            MediaStore.Downloads.RELATIVE_PATH,
+                            Environment.DIRECTORY_DOWNLOADS +
+                                "/" + dirName,
+                        )
+                    }
+                    val uri = contentResolver.insert(
+                        MediaStore.Downloads
+                            .EXTERNAL_CONTENT_URI,
+                        values,
+                    ) ?: continue
+                    val out = contentResolver
+                        .openOutputStream(uri) ?: continue
+                    out.use { o ->
+                        src.inputStream().use {
+                            it.copyTo(o, 64 * 1024)
+                        }
+                    }
+                    src.renameTo(
+                        File(filesDir, src.name + ".migrated"),
+                    )
+                } catch (e: Exception) {
+                    // Retried on the next launch.
+                }
+            }
+        }
+    }
+
+    /** The supervisor's direct mirror logs are written
+     * by the native supervisor processes, which have no
+     * MediaStore: their live directory is the same-named
+     * folder in the app's external files dir
+     * (Android/data/com.yongshuai.paxvm/files/), a real
+     * path this app's processes can write natively and
+     * the user can read directly. Writability is probed
+     * here; when external storage is unavailable the
+     * supervisor starts without --logdir and the mirrors
+     * stay in the vm directory as before. */
+    private fun setupMirrorDir(dirName: String) {
+        try {
+            val ext = getExternalFilesDir(null) ?: return
+            val d = File(ext, dirName)
+            d.mkdirs()
+            val probe = File(d, ".probe")
+            FileOutputStream(probe).use { it.write(1) }
+            if (!probe.delete()) probe.deleteOnExit()
+            mirrorLogDir = d
+        } catch (e: Exception) {
+            mirrorLogDir = null
+        }
+    }
+
     /** This process's resident size in KB, from procfs. */
     private fun selfRssKb(): Long {
         return try {
@@ -466,12 +647,25 @@ class MainActivity : Activity() {
                 val heapKb = (rt.totalMemory() - rt.freeMemory()) / 1024
                 val text = "[crash] uncaught in thread ${thread.name} " +
                     "heapKB=$heapKb rssKB=${selfRssKb()}:\n$sw\n"
-                val f = sessionLogFileRef
-                if (f != null) {
-                    java.io.FileOutputStream(f, true).use { out ->
+                val uri = liveLogUri
+                if (uri != null) {
+                    // Live mode: append straight into the
+                    // Download session log (0.9.78).
+                    contentResolver.openOutputStream(
+                        uri, "wa",
+                    )?.use { out ->
                         out.write(text.toByteArray())
                         out.flush()
-                        out.fd.sync()
+                    }
+                } else {
+                    val f = sessionLogFileRef
+                    if (f != null) {
+                        java.io.FileOutputStream(f, true)
+                            .use { out ->
+                                out.write(text.toByteArray())
+                                out.flush()
+                                out.fd.sync()
+                            }
                     }
                 }
             } catch (e: Exception) {
@@ -572,8 +766,29 @@ class MainActivity : Activity() {
             out.write(
                 pendingLogText.toString().toByteArray(Charsets.UTF_8),
             )
+            out.flush()
         } catch (e: Exception) {
             // A dead log file must not break the session.
+            // If the live Download stream died mid-session
+            // (folder removed, provider hiccup), continue
+            // the record in the private session file
+            // instead of dropping lines from here on; the
+            // crash recorder follows liveLogUri, so it
+            // switches over with the flusher.
+            if (liveLogUri != null) {
+                liveLogUri = null
+                try {
+                    val f = File(filesDir, "session-log.txt")
+                    sessionLogFileRef = f
+                    val fb = FileOutputStream(f, true)
+                    logFileOut = fb
+                    fb.write(
+                        pendingLogText.toString()
+                            .toByteArray(Charsets.UTF_8),
+                    )
+                } catch (e2: Exception) {
+                }
+            }
         }
         pendingLogText.setLength(0)
     }
@@ -964,7 +1179,11 @@ class MainActivity : Activity() {
         val stamp = SimpleDateFormat(
             "yyyyMMdd-HHmmss", Locale.US,
         ).format(Date())
-        val dirName = "PaxVM-logs-$stamp"
+        // When this launch logs live, the collected
+        // files join the session log in its own Download
+        // directory; in the private-file fallback the
+        // export makes a fresh directory, as 0.9.77 did.
+        val dirName = liveLogDirName ?: "PaxVM-logs-$stamp"
         val legacyDir: File? =
             if (Build.VERSION.SDK_INT >= 29) null else {
                 val d = File(
@@ -1023,13 +1242,20 @@ class MainActivity : Activity() {
                 // One bad file must not lose the rest.
             }
         }
-        copyFile(
-            "session-log.txt",
-            File(filesDir, "session-log.txt"),
-        )
-        val prev = previousLogFile
-        if (prev != null) {
-            copyFile("previous-session-log.txt", prev)
+        if (liveLogDirName == null) {
+            // Fallback launches keep the session record
+            // in the private files; live launches already
+            // have session-log.txt in the target directory
+            // (it is being written there), and inserting a
+            // second copy would only rename-duplicate it.
+            copyFile(
+                "session-log.txt",
+                File(filesDir, "session-log.txt"),
+            )
+            val prev = previousLogFile
+            if (prev != null) {
+                copyFile("previous-session-log.txt", prev)
+            }
         }
         // Supervisor direct mirrors (written by the
         // supervisor processes themselves, so they
@@ -1240,6 +1466,15 @@ class MainActivity : Activity() {
         if (loaderLib != null) {
             cmd.add("--loader")
             cmd.add("$libDir/$loaderLib")
+        }
+        // 0.9.78: the supervisor's direct mirror logs go
+        // live to this launch's directory in the app's
+        // external files dir (Android/data) when one was
+        // set up; without it they stay in the vm dir.
+        val md = mirrorLogDir
+        if (md != null) {
+            cmd.add("--logdir")
+            cmd.add(md.absolutePath)
         }
         cmd.add("--")
         cmd.addAll(guestArgs)
