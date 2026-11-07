@@ -8273,6 +8273,55 @@ fn tracer_loop(ctx: TracerCtx) {
                                         .to_string();
                                     ranges.push((lo, hi, name));
                                 }
+                                // Also name the raw map line
+                                // for each stack word, pathname
+                                // or not: which mapping a wild
+                                // pointer lives in (arena file,
+                                // ashmem substitute, anonymous)
+                                // is often the whole diagnosis.
+                                let mut seen_lines: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                for i in 0..8 {
+                                    let w = u32::from_le_bytes(
+                                        words[i * 4..i * 4 + 4]
+                                            .try_into()
+                                            .unwrap(),
+                                    ) as u64;
+                                    if w < 0x10000 {
+                                        continue;
+                                    }
+                                    for line in maps.lines() {
+                                        let mut it =
+                                            line.split_whitespace();
+                                        let Some(range) = it.next()
+                                        else {
+                                            continue;
+                                        };
+                                        let Some((lo, hi)) =
+                                            range.split_once('-')
+                                        else {
+                                            continue;
+                                        };
+                                        let lo = u64::from_str_radix(
+                                            lo, 16,
+                                        )
+                                        .unwrap_or(0);
+                                        let hi = u64::from_str_radix(
+                                            hi, 16,
+                                        )
+                                        .unwrap_or(0);
+                                        if w >= lo && w < hi {
+                                            if seen_lines
+                                                .insert(line.to_string())
+                                            {
+                                                sup!(
+                                                    "FATAL mapline 0x{w:x}: {line}"
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
                                 for i in 0..8 {
                                     let w = u32::from_le_bytes(
                                         words[i * 4..i * 4 + 4]
