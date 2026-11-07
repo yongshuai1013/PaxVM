@@ -182,6 +182,12 @@ class MainActivity : Activity() {
         "    mkdir /data/data",
         "    mkdir /data/app",
         "    mkdir /data/local",
+        // Freeze forensics (0.9.81): Dalvik writes its
+        // ANR / SIGQUIT stack traces under /data/anr
+        // (the stock rc creates the directory too);
+        // without it the dump the overflow menu can ask
+        // for has nowhere to land.
+        "    mkdir /data/anr 0771",
         "    setprop pax.stage init",
         "",
         "on fs",
@@ -937,6 +943,7 @@ class MainActivity : Activity() {
     // which the user rightly called out as wrong.
     override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
         menu.add("設定")
+        menu.add("傾印客體堆疊")
         return true
     }
 
@@ -947,7 +954,57 @@ class MainActivity : Activity() {
             )
             return true
         }
+        if (item.title == "傾印客體堆疊") {
+            requestGuestStackDump()
+            return true
+        }
         return super.onOptionsItemSelected(item)
+    }
+
+    /** Freeze forensics (0.9.81): ask the supervisor
+     * to make the guest's system_server dump all its
+     * Java thread stacks. The shell cannot speak the
+     * supervisor's coordinator protocol, so the
+     * request rides a signal: W0 leaves its pid in
+     * vm0/supervisor.pid at startup, and SIGUSR2
+     * (signal 12 on Android) is its request line --
+     * W0 relays it through the coordinator to the
+     * worker tracing zygote, which SIGQUITs
+     * system_server, and GB Dalvik's signal catcher
+     * answers with the dump (guest /data/anr/traces.txt
+     * and the guest log) without killing anything. The
+     * dump rides the next 「下載日誌」 export like any
+     * other guest evidence. A missing or stale pid
+     * file means no supervisor is running to ask. */
+    private fun requestGuestStackDump() {
+        val pid = try {
+            File(File(filesDir, "vm0"), "supervisor.pid")
+                .readText().trim().toInt()
+        } catch (e: Exception) {
+            -1
+        }
+        if (pid <= 0) {
+            android.widget.Toast.makeText(
+                this,
+                "監督器未執行或 pid 檔缺失",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        try {
+            android.os.Process.sendSignal(pid, 12)
+            android.widget.Toast.makeText(
+                this,
+                "已請求傾印 system_server 堆疊（看 Download 日誌）",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+        } catch (e: Exception) {
+            android.widget.Toast.makeText(
+                this,
+                "監督器未執行或 pid 檔缺失",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+        }
     }
 
     /** Delete-then-write for shell-owned guest files. A guest
@@ -1117,7 +1174,7 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v18")
+        val marker = File(sysDir, ".gbsystem-v19")
         if (!marker.exists()) {
             try {
                 assets.open("gbsystem.zip").use { ins ->
@@ -1308,6 +1365,23 @@ class MainActivity : Activity() {
                 "log-$ch",
                 File(rootfsGBDir, ".logs/log-$ch"),
             )
+        }
+        // Guest ANR traces (0.9.81): the stack dumps
+        // the overflow menu can ask Dalvik for land in
+        // the guest's /data/anr as traces*.txt; collect
+        // them with the rest of the guest evidence.
+        // This flow is shared by live and fallback
+        // launches, so both modes pick them up.
+        val anrDir = File(rootfsGBDir, "data/anr")
+        val anrFiles = anrDir.listFiles()
+            ?.filter {
+                it.isFile && it.name.startsWith("traces") &&
+                    it.name.endsWith(".txt")
+            }
+            ?.sortedBy { it.name }
+            ?: emptyList()
+        for (f in anrFiles) {
+            copyFile(f.name, f)
         }
         // Readable rendering of the guest channels.
         val gout = sink("guest-log.txt")

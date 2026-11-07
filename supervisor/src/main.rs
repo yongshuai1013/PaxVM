@@ -453,6 +453,34 @@ macro_rules! bsup {
     ($($a:tt)*) => { cap_log("sup", &format!($($a)*)) };
 }
 
+/// Freeze forensics (0.9.81): leave W0's pid where
+/// the shell can find it -- supervisor.pid in the vm
+/// directory. The vm directory is the rootfs's
+/// parent, deliberately NOT the --logdir override
+/// directory: that one belongs to this launch's log
+/// mirrors, while the pid file is a property of the
+/// vm slot itself. The shell's stack-dump menu entry
+/// reads the pid and sends SIGUSR2 (see on_sigusr2).
+/// Written once at startup; the pid is W0's own, so
+/// no plumbing carries it anywhere. A failed write
+/// costs the menu entry, not the run.
+fn write_supervisor_pid(rootfs: &str) {
+    let dir = match rootfs.rfind('/') {
+        Some(i) if i > 0 => &rootfs[..i],
+        _ => {
+            sup!("supervisor.pid: rootfs {rootfs} has no parent; dump menu unavailable");
+            return;
+        }
+    };
+    let path = format!("{dir}/supervisor.pid");
+    match std::fs::write(&path, format!("{}", std::process::id())) {
+        Ok(()) => sup!("supervisor pid recorded at {path}"),
+        Err(e) => {
+            sup!("supervisor.pid write failed ({path}): {e}; dump menu unavailable")
+        }
+    }
+}
+
 // ---- errno / ptrace primitives ----
 fn errno() -> i32 {
     // Bionic exposes the thread-local errno cell as __errno().
@@ -948,6 +976,44 @@ extern "C" fn on_sigterm(_sig: i32) {
         unsafe { libc::kill(p, libc::SIGKILL) };
     }
     unsafe { libc::_exit(128 + 15) };
+}
+
+// ---- Freeze forensics (0.9.81): the shell's guest
+// stack-dump request. The shell cannot speak the
+// coordinator protocol, so it signals W0 with
+// SIGUSR2 (W0's pid is left in the vm directory's
+// supervisor.pid for it to find). The handler's whole
+// job is setting this flag -- async-signal-safe: no
+// allocation, no locking, no I/O. W0's event loop
+// notices it at its coordinator-service point
+// (next_stop) and relays the request over the
+// coordinator socket like any other oneway. The
+// handler is installed with no SA_RESTART for the
+// same reason as the SIGCHLD self-pipe's handler
+// below: the loop sleeps in poll, and during a guest
+// freeze nothing else may arrive to wake it -- the
+// signal itself has to interrupt the poll, and the
+// loop treats the resulting EINTR as a free pass.
+static DUMP_REQ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_sigusr2(_sig: i32) {
+    DUMP_REQ.store(true, Ordering::Relaxed);
+}
+
+/// Install the SIGUSR2 handler. Called from main on
+/// W0's parent path only, after the coordinator, the
+/// workers and the guest root have all been forked:
+/// none of them inherits the handler, and the flag is
+/// only ever checked in W0's loop besides.
+fn install_dump_signal() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigusr2 as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+    }
 }
 
 // ---- per-process tracing state (M1 spec section 1) ----
@@ -2085,9 +2151,14 @@ const MSG_ONEWAY_WAKE_ROUTE: u8 = 28;
 const MSG_ONEWAY_VCRED_PUBLISH: u8 = 29;
 const MSG_ONEWAY_ADOPT_ACK: u8 = 30;
 const MSG_HELLO: u8 = 31;
+// Freeze forensics (0.9.81): W0 relays the shell's
+// SIGUSR2 stack-dump request; the coordinator
+// broadcasts it to the workers as a push.
+const MSG_ONEWAY_DUMP_REQ: u8 = 32;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
+const MSG_PUSH_DUMP_STACKS: u8 = 43;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
@@ -2420,7 +2491,9 @@ fn learned_entries(
 /// A frame the coordinator pushes to a tracer outside
 /// any request/response pair (S2): a wake for a parked
 /// pid this tracer owns, an adopted tracee to attach,
-/// or the verdict on a handoff this tracer offered.
+/// the verdict on a handoff this tracer offered, or a
+/// stack-dump request for whichever tracer holds a
+/// system_server candidate.
 // S2 also moves guest pid -> worker routing and the
 // global credential book into the coordinator; the
 // pushes are how its decisions reach other tracers.
@@ -2443,6 +2516,11 @@ enum Push {
         pid: i32,
         ok: bool,
     },
+    /// Freeze forensics (0.9.81): broadcast to every
+    /// worker; only the one holding a system_server
+    /// candidate acts (SIGQUIT, see tracer_loop's
+    /// candidate bookkeeping), the rest drop it.
+    DumpStacks,
 }
 
 /// The tracer's end of the coordinator channel. Every
@@ -2584,6 +2662,9 @@ impl CoordClient {
                     let pid = d.i32();
                     let ok = d.bool();
                     self.inbox.push_back(Push::AdoptAck { pid, ok });
+                }
+                MSG_PUSH_DUMP_STACKS => {
+                    self.inbox.push_back(Push::DumpStacks);
                 }
                 _ => self.queue.push_back((kind, payload)),
             }
@@ -2908,6 +2989,18 @@ impl CoordClient {
         let mut e = Enc::new();
         e.i32(pid);
         self.send(MSG_ONEWAY_WAKE_ROUTE, &e.0);
+    }
+
+    /// Freeze forensics (0.9.81): W0 relays the
+    /// shell's stack-dump request (it arrived as
+    /// SIGUSR2; the handler only set a flag, and W0's
+    /// event loop calls this at its next coordinator
+    /// service point). The coordinator broadcasts it
+    /// to the workers as MSG_PUSH_DUMP_STACKS. No
+    /// payload: the request carries nothing but
+    /// itself.
+    fn dump_req(&mut self) {
+        self.send(MSG_ONEWAY_DUMP_REQ, &[]);
     }
 
     /// S2 handoff offer: the offering tracer has
@@ -3351,6 +3444,21 @@ impl CoordServer {
         self.send_to(ci, MSG_PUSH_ADOPT_ACK, &e.0);
     }
 
+    /// Freeze forensics (0.9.81): broadcast the
+    /// shell's stack-dump request to every worker.
+    /// Exactly one of them can hold a system_server
+    /// candidate; the rest drop the push. W0 is
+    /// skipped: it traces the guest root's shard and
+    /// never adopts a root, so it can never hold a
+    /// candidate.
+    fn push_dump_stacks(&mut self) {
+        for ci in 0..self.conns.len() {
+            if self.conns[ci].wid.map_or(false, |w| w != 0) {
+                self.send_to(ci, MSG_PUSH_DUMP_STACKS, &[]);
+            }
+        }
+    }
+
     /// A connection died: drop its routes (its
     /// tracees are being EXITKILLed with it). W0's
     /// death ends the run: exit, and every worker
@@ -3685,6 +3793,9 @@ impl CoordServer {
             MSG_ONEWAY_WAKE_ROUTE => {
                 let pid = d.i32();
                 self.push_wake(pid);
+            }
+            MSG_ONEWAY_DUMP_REQ => {
+                self.push_dump_stacks();
             }
             MSG_ONEWAY_HANDOFF => {
                 let pid = d.i32();
@@ -6254,6 +6365,19 @@ struct TracerCtx {
     /// first one; unused on W0, whose root is the
     /// guest root itself.
     shard_root: i32,
+    /// Freeze forensics (0.9.81): this worker's
+    /// system_server candidate -- the earliest living
+    /// fork/vfork child of the shard root that has
+    /// never exec'd. system_server is zygote's first
+    /// fork child and the only child of any root that
+    /// never execs: app children exec at once (and are
+    /// handed off), threads arrive as CLONE births and
+    /// never enter the running. Maintained at the
+    /// birth/exec/exit sites in tracer_loop; consumed
+    /// by the Push::DumpStacks arm in next_stop. None
+    /// until a candidate is born, and on W0 forever
+    /// (it never adopts a root).
+    dump_candidate: Option<i32>,
 }
 
 /// The shard table: which worker takes which guest
@@ -6348,6 +6472,7 @@ fn worker_main(
         // children, to the kin worker.
         kin_target: if wid == 2 { Some(6) } else { None },
         shard_root: 0,
+        dump_candidate: None,
     };
     tracer_loop(ctx);
     sup!("worker W{wid} done");
@@ -6405,6 +6530,7 @@ fn next_stop(
     procs: &mut HashMap<i32, ProcState>,
     vcreds: &mut HashMap<i32, (u32, u32)>,
     shard_root: &mut i32,
+    dump_candidate: &mut Option<i32>,
     selfpipe_rd: i32,
 ) -> NextStop {
     loop {
@@ -6431,8 +6557,22 @@ fn next_stop(
             // each service back.
         }
         // 2) Coordinator pushes: an adoption rebuilds a
-        // tracee here; a wake completes a parked ioctl.
+        // tracee here; a wake completes a parked ioctl;
+        // a dump request SIGQUITs the system_server
+        // candidate.
         coord.pump();
+        // Freeze forensics relay (W0 only, 0.9.81):
+        // the shell's dump request arrived as SIGUSR2,
+        // whose handler only set DUMP_REQ. Forward it
+        // to the coordinator here, at the loop's
+        // coordinator-service point; the coordinator
+        // broadcasts it to the workers. The handler is
+        // installed after every fork, so no other
+        // tracer process can see the signal, and the
+        // flag is only ever checked on this line.
+        if wid == 0 && DUMP_REQ.swap(false, Ordering::Relaxed) {
+            coord.dump_req();
+        }
         let mut acted = false;
         while let Some(push) = coord.inbox.pop_front() {
             acted = true;
@@ -6450,16 +6590,55 @@ fn next_stop(
                     creds,
                     root,
                 } => {
+                    let prev_root = *shard_root;
                     adopt_tracee(
                         pid, &vcwd, compat, sigmask, creds, root, procs, vcreds, coord,
                         shard_root,
                     );
+                    // A replaced shard root orphans the
+                    // old root's dump candidate: it was
+                    // the old zygote's child, and the new
+                    // root's own system_server earns the
+                    // slot when it is born (the old one's
+                    // exit clears it too, but a restarted
+                    // service must not leave a stale pid
+                    // armed in the meantime).
+                    if root && *shard_root != prev_root {
+                        *dump_candidate = None;
+                    }
                 }
                 Push::AdoptAck { .. } => {
                     // Acks are consumed by do_handoff's
                     // wait; one reaching the loop head is
                     // stale (its handoff already timed out
                     // and was taken back). Drop it.
+                }
+                Push::DumpStacks => {
+                    // Freeze forensics (0.9.81): SIGQUIT
+                    // this worker's system_server
+                    // candidate, if it holds one (the
+                    // broadcast reaches every worker;
+                    // only one can). GB Dalvik's signal
+                    // catcher answers SIGQUIT with a full
+                    // Java stack dump and keeps running --
+                    // that non-lethality is the whole
+                    // point -- and the signal reaches the
+                    // guest by the ordinary reinjection at
+                    // its delivery stop.
+                    if let Some(cpid) = *dump_candidate {
+                        if procs.contains_key(&cpid) {
+                            if unsafe { libc::kill(cpid, libc::SIGQUIT) } == 0 {
+                                sup!(
+                                    "dumpstacks: SIGQUIT -> system_server pid={cpid}"
+                                );
+                            } else {
+                                sup!(
+                                    "dumpstacks: SIGQUIT -> system_server pid={cpid} failed errno={}",
+                                    errno()
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6676,6 +6855,7 @@ fn tracer_loop(ctx: TracerCtx) {
         shard_map,
         kin_target,
         mut shard_root,
+        mut dump_candidate,
     } = ctx;
     let selfpipe_rd = install_sigchld_pipe();
     if selfpipe_rd < 0 {
@@ -6694,6 +6874,7 @@ fn tracer_loop(ctx: TracerCtx) {
             &mut procs,
             &mut vcreds,
             &mut shard_root,
+            &mut dump_candidate,
             selfpipe_rd,
         ) {
             NextStop::Stop(p, s) => (p, s),
@@ -6723,6 +6904,13 @@ fn tracer_loop(ctx: TracerCtx) {
             }
             procs.remove(&pid);
             vcreds.remove(&pid);
+            // Freeze forensics (0.9.81): a dead dump
+            // candidate gives up its slot; a later
+            // zygote tenure's system_server re-earns it
+            // at its own birth.
+            if dump_candidate == Some(pid) {
+                dump_candidate = None;
+            }
             // S5c: if that was the arena's last thread,
             // run the driver's death processing; it may
             // wake parked tracees (death notices, dead
@@ -7636,6 +7824,16 @@ fn tracer_loop(ctx: TracerCtx) {
             // The exec event stop sits between the execve entry and
             // exit stops; surface the entry's description here and
             // clear it so the exit stop stays silent (M0 pairing).
+            // Freeze forensics (0.9.81): whatever execs
+            // is not system_server -- it never execs --
+            // so a candidate reaching its exec gives up
+            // the slot. This is what keeps zygote's app
+            // children (fork, then exec at once) out of
+            // the slot the fork site provisionally
+            // filled.
+            if dump_candidate == Some(pid) {
+                dump_candidate = None;
+            }
             if let Some(p) = procs.get_mut(&pid) {
                 if let Some(pend) = &mut p.pending {
                     if let Some(d) = pend.desc.take() {
@@ -7698,6 +7896,25 @@ fn tracer_loop(ctx: TracerCtx) {
                     _ => "clone",
                 };
                 sup!("tracee born: parent={pid} child={child} ({ev_name})");
+                // Freeze forensics (0.9.81): a fork or
+                // vfork child of this worker's shard root
+                // becomes the system_server candidate if
+                // the slot is free; the earliest living
+                // one keeps it. Only FORK/VFORK births
+                // count: threads arrive as CLONE events
+                // (zygote spawns its own threads long
+                // before it forks system_server, and a
+                // thread's tid is not a dump target), and
+                // app children surrender the slot again at
+                // their exec. On W0 shard_root stays 0 and
+                // no guest parent ever equals it, so the
+                // slot never fills there.
+                if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK)
+                    && pid == shard_root
+                    && dump_candidate.is_none()
+                {
+                    dump_candidate = Some(child);
+                }
             }
             cont_syscall(pid, 0);
         } else if sig == SIGTRAP {
@@ -8005,6 +8222,7 @@ fn main() {
     // and the guest root exist, for the same inheritance
     // reasons.
     set_direct_log_dir(&rootfs, true);
+    write_supervisor_pid(&rootfs);
     let coord_sock = format!("{rootfs}/.coord.sock");
     spawn_coordinator(&coord_sock);
     let mut coord = CoordClient::connect(&coord_sock, 0, "w0");
@@ -8121,7 +8339,16 @@ fn main() {
         shard_map,
         kin_target: None,
         shard_root: 0,
+        dump_candidate: None,
     };
+    // Freeze forensics (0.9.81): take the shell's
+    // SIGUSR2 stack-dump requests from here on. Every
+    // fork this process will ever make (coordinator,
+    // workers, the guest root) has already happened,
+    // so none of them inherits the handler; the guest
+    // tree in particular must never see our request
+    // line as its own disposition.
+    install_dump_signal();
     tracer_loop(ctx);
 
     let _ = reader.join();

@@ -446,6 +446,29 @@ jobs:
           test -s gbsys/usr/icu/icudt44l.dat || { echo "missing icudt44l.dat" >&2; exit 1; }
           test -s gbsys/fonts/DroidSans.ttf || { echo "missing DroidSans.ttf" >&2; exit 1; }
           test -s gbsys/etc/hosts || { echo "missing etc/hosts" >&2; exit 1; }
+          # S9 (0.9.81): complete the root tree. /app was
+          # absent entirely until now -- PMS scanned an
+          # empty directory, installSystemProviders had no
+          # SettingsProvider to install, and no HOME app
+          # existed for the end of the service march --
+          # while /bin, /framework and /media were partial
+          # enumerations (no mediaserver or installd for
+          # the services that connect to them). Ship the
+          # donor's remaining directories wholesale, staged
+          # and merged the same way /lib is above, since
+          # rdump refuses a target directory that exists.
+          # This lands before the framework-res recolor
+          # below, which therefore still applies.
+          for d in app bin framework media xbin; do
+            rm -rf /tmp/gbtree && mkdir -p /tmp/gbtree
+            debugfs -R "rdump /$d /tmp/gbtree" armeabi-v7a/system.img 2>/dev/null
+            mkdir -p "gbsys/$d"
+            cp -a "/tmp/gbtree/$d/." "gbsys/$d/"
+          done
+          test -s gbsys/app/Launcher2.apk || { echo "missing Launcher2.apk" >&2; exit 1; }
+          test -s gbsys/app/SettingsProvider.apk || { echo "missing SettingsProvider.apk" >&2; exit 1; }
+          test -s gbsys/bin/mediaserver || { echo "missing mediaserver" >&2; exit 1; }
+          test -s gbsys/bin/installd || { echo "missing installd" >&2; exit 1; }
           # Optional: the stock boot animation archive. The
           # SDK image may not carry one; bootanimation then
           # falls back to its built-in logo animation.
