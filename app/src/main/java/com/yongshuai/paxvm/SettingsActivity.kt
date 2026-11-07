@@ -3,15 +3,17 @@ package com.yongshuai.paxvm
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
-import android.view.Gravity
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.preference.Preference
+import android.preference.PreferenceFragment
 
 /**
- * Settings page: a plain list of entries, one row per
- * destination page (the user asked for a list, not one
- * long scrolling form). Tapping a row opens that page.
- * First entry: 系統限制 (SystemLimitActivity).
+ * Settings page: the platform's own preference list
+ * (the user asked for the native layout over the
+ * hand-rolled rows). Each Preference carries its
+ * destination as an intent -- the native settings
+ * behaviour, with native row height, typography,
+ * dividers and press states. First entry: 系統限制
+ * (SystemLimitActivity).
  */
 class SettingsActivity : Activity() {
 
@@ -25,7 +27,9 @@ class SettingsActivity : Activity() {
             setDisplayShowHomeEnabled(false)
             setDisplayShowTitleEnabled(false)
         }
-        buildUi()
+        fragmentManager.beginTransaction()
+            .replace(android.R.id.content, SettingsFragment())
+            .commit()
     }
 
     override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
@@ -36,59 +40,16 @@ class SettingsActivity : Activity() {
         return super.onOptionsItemSelected(item)
     }
 
-    private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24, 24, 24, 24)
+    class SettingsFragment : PreferenceFragment() {
+        override fun onCreate(savedInstanceState: Bundle?) {
+            super.onCreate(savedInstanceState)
+            val screen = preferenceManager.createPreferenceScreen(activity)
+            val limits = Preference(activity)
+            limits.title = "系統限制"
+            limits.summary = "phantom 監控與子行程上限"
+            limits.intent = Intent(activity, SystemLimitActivity::class.java)
+            screen.addPreference(limits)
+            preferenceScreen = screen
         }
-
-        root.addView(
-            entryRow("系統限制", "phantom 監控與子行程上限") {
-                startActivity(Intent(this, SystemLimitActivity::class.java))
-            },
-        )
-
-        setContentView(root)
-    }
-
-    /** One list row: name + subtitle on the left, a
-     * chevron on the right; the whole row is the tap
-     * target. */
-    private fun entryRow(
-        name: String,
-        subtitle: String,
-        onClick: () -> Unit,
-    ): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(8, 28, 8, 28)
-            isClickable = true
-            setOnClickListener { onClick() }
-        }
-        val texts = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        texts.addView(TextView(this).apply {
-            text = name
-            textSize = 16f
-        })
-        texts.addView(TextView(this).apply {
-            text = subtitle
-            textSize = 12f
-        })
-        row.addView(
-            texts,
-            LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f,
-            ),
-        )
-        row.addView(TextView(this).apply {
-            text = "›"
-            textSize = 20f
-        })
-        return row
     }
 }
