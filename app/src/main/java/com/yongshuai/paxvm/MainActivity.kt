@@ -873,7 +873,47 @@ class MainActivity : Activity() {
                 }
             }
         }
-        val outText = text + guestLogs.toString()
+        // 0.9.61: when this launch's session file holds
+        // only the rotation stub (the app died last
+        // launch and was reopened), the crashed session
+        // sits in the previous file and the cur-first
+        // rule above would never serve it -- append it
+        // in full so a crash can always be diagnosed
+        // from the next download.
+        var fullText = text
+        if (cur.length() in 1..4096 && prev != null &&
+            prev.exists() && prev.length() > 4096
+        ) {
+            try {
+                fullText +=
+                    "\n===== previous session (preserved) =====\n" +
+                    prev.readText()
+            } catch (e: Exception) {
+            }
+        }
+        // 0.9.61: the supervisor's direct mirror logs
+        // (written by the supervisor processes
+        // themselves, so they survive the app dying);
+        // fold current then previous, W0 first.
+        val directLogs = StringBuilder()
+        val vmDir = File(filesDir, "vm0")
+        for (w in 0..4) {
+            for (suffix in listOf("", "-prev")) {
+                val f = File(vmDir, "supervisor-direct-w$w$suffix.log")
+                if (f.exists() && f.length() > 0) {
+                    try {
+                        directLogs
+                            .append(
+                                "\n===== supervisor direct W$w$suffix =====\n",
+                            )
+                            .append(f.readText())
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+        }
+        val outText = fullText + guestLogs.toString() +
+            directLogs.toString()
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val name = "paxvm-log-$stamp.txt"
         try {
