@@ -1,9 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Loopback ADB (wireless debugging) for the settings
-         page's phantom-limit lift; no mDNS, ports are typed in. -->
+    <!-- Wireless-debugging ADB for the settings page's
+         phantom-limit lift: pairing/connect ports are found
+         over mDNS (AdbMdns), and the pairing code is typed
+         into a notification reply (PairingFlow). -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Reliable mDNS discovery on devices that gate multicast
+         reception behind a WifiManager multicast lock. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Only needed on Android 13+ (runtime permission) for the
+         pairing notification; harmless on older versions. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="PaxVM"
@@ -21,6 +29,16 @@
             android:exported="false" />
         <activity
             android:name=".SystemLimitActivity"
+            android:exported="false" />
+        <receiver
+            android:name=".PairReplyReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.yongshuai.paxvm.PAIR_CODE" />
+            </intent-filter>
+        </receiver>
+        <service
+            android:name=".PairingService"
             android:exported="false" />
     </application>
 

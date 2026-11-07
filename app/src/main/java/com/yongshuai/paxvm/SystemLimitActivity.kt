@@ -1,15 +1,16 @@
 package com.yongshuai.paxvm
 
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.text.InputType
 import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
 import java.io.IOException
 import kotlin.concurrent.thread
 
@@ -17,31 +18,40 @@ import kotlin.concurrent.thread
  * 系統限制 page (reached from the settings list). Android 12's
  * phantom process monitor can kill the whole supervisor
  * process group (the supervisors are child processes of the
- * app); this page pairs and connects to the device's own
- * wireless-debugging adbd via AdbLocal and turns the monitor
- * off plus raises the process cap, then reads both values
- * back. Every step lands verbatim in the on-page record view.
- * The page itself does not scroll; only the record view has
- * its own fixed-height scroll.
+ * app); this page turns the monitor off plus raises the
+ * process cap through the device's own wireless-debugging
+ * adbd, then reads both values back.
+ *
+ * Pairing is notification-based: the "發出配對通知" button
+ * posts a notification whose reply field takes the 6-digit
+ * code while the system's pairing dialog stays open behind
+ * the shade (see PairingFlow). All endpoints are discovered
+ * over mDNS (AdbMdns) -- no port numbers are typed anywhere
+ * on this page. The pairing outcome file is folded into the
+ * record on resume. Every step lands verbatim in the on-page
+ * record view. The page itself does not scroll; only the
+ * record view has its own fixed-height scroll.
  */
 class SystemLimitActivity : Activity() {
 
     private lateinit var statusView: TextView
-    private lateinit var pairCodeInput: EditText
-    private lateinit var pairPortInput: EditText
-    private lateinit var connPortInput: EditText
     private lateinit var recordView: TextView
 
     private var adb: AdbLocal? = null
 
-    // Serializes pairing / connect / lift / restore so two
-    // operations never share the socket at once.
+    // Serializes connect / lift / restore so two operations
+    // never share the socket at once.
     @Volatile
     private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        consumePairResult()
     }
 
     override fun onDestroy() {
@@ -74,7 +84,7 @@ class SystemLimitActivity : Activity() {
         val desc = TextView(this).apply {
             text = "解除 Android 對 App 子行程的 phantom 監控與數量上限：" +
                 "監督器群是 App 的子行程，監控開啟時可能被系統整組清掉。" +
-                "透過無線偵錯以本機 ADB 寫入系統設定，主機固定 127.0.0.1。"
+                "透過無線偵錯以本機 ADB 寫入系統設定，配對與連接埠皆以 mDNS 自動發現。"
             textSize = 12f
         }
         root.addView(desc)
@@ -86,42 +96,17 @@ class SystemLimitActivity : Activity() {
         root.addView(statusView)
 
         val pairHint = TextView(this).apply {
-            text = "配對：先到「開發者選項 → 無線偵錯 → 使用配對碼配對裝置」取得配對碼與配對埠。"
+            text = "配對：按「發出配對通知」後，到「開發者選項 → 無線偵錯 → 使用配對碼配對裝置」" +
+                "打開配對碼畫面，下拉通知欄、在通知裡輸入 6 位配對碼（配對畫面要保持開著）。" +
+                "配對結果會帶回本頁的操作紀錄。"
             textSize = 12f
         }
         root.addView(pairHint)
-
-        pairCodeInput = EditText(this).apply {
-            hint = "配對碼（6 位）"
-            inputType = InputType.TYPE_CLASS_NUMBER
+        val notifyButton = Button(this).apply {
+            text = "發出配對通知"
+            setOnClickListener { onPairNotifyClicked() }
         }
-        root.addView(pairCodeInput)
-        pairPortInput = EditText(this).apply {
-            hint = "配對埠"
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(pairPortInput)
-        val pairButton = Button(this).apply {
-            text = "配對"
-            setOnClickListener { onPairClicked() }
-        }
-        root.addView(pairButton)
-
-        val connHint = TextView(this).apply {
-            text = "連接埠在無線偵錯主頁顯示。"
-            textSize = 12f
-        }
-        root.addView(connHint)
-        connPortInput = EditText(this).apply {
-            hint = "連接埠"
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(connPortInput)
-        val connButton = Button(this).apply {
-            text = "連接"
-            setOnClickListener { onConnectClicked() }
-        }
-        root.addView(connButton)
+        root.addView(notifyButton)
 
         val liftButton = Button(this).apply {
             text = "解除限制"
@@ -154,6 +139,37 @@ class SystemLimitActivity : Activity() {
         )
 
         setContentView(root)
+    }
+
+    // ----- pairing result file -----
+
+    /**
+     * Folds a fresh filesDir/pair-result.txt (written by
+     * PairingService) into the record once, then renames it to
+     * the consumed name so later resumes do not append it again;
+     * the service always writes the plain name, so a new result
+     * is picked up the same way.
+     */
+    private fun consumePairResult() {
+        try {
+            val file = File(filesDir, PairingFlow.RESULT_FILE)
+            if (!file.exists()) return
+            val text = file.readText().trim()
+            if (text.isNotEmpty()) {
+                record("—— 通知配對結果 ——")
+                text.lineSequence().forEach { record(it) }
+                if (text.contains("配對成功")) {
+                    setStatus("已配對（待連接）")
+                }
+            }
+            val consumed = File(filesDir, PairingFlow.RESULT_FILE_CONSUMED)
+            if (consumed.exists()) consumed.delete()
+            if (!file.renameTo(consumed)) {
+                record("注意：配對結果檔改名失敗，下次進頁可能重複顯示")
+            }
+        } catch (e: Exception) {
+            record("讀取配對結果檔失敗：" + errorText(e))
+        }
     }
 
     // ----- record / status helpers -----
@@ -191,42 +207,23 @@ class SystemLimitActivity : Activity() {
         }
     }
 
-    private fun parsePort(raw: String, what: String): Int {
-        val port = raw.trim().toIntOrNull()
-        if (port == null || port !in 1..65535) {
-            throw IOException("$what 未填或不是有效的埠號：'$raw'")
-        }
-        return port
-    }
-
     // ----- actions -----
 
-    private fun onPairClicked() {
-        val code = pairCodeInput.text.toString().trim()
-        val portRaw = pairPortInput.text.toString()
-        runOp("配對") {
-            if (code.isEmpty()) throw IOException("配對碼未填")
-            val port = parsePort(portRaw, "配對埠")
-            record("配對開始：127.0.0.1:$port")
-            ensureAdb().pair(HOST, port, code)
-            record("配對完成（之後請按「連接」）")
+    private fun onPairNotifyClicked() {
+        // Android 13+ needs the notification runtime permission;
+        // ask here on the tap (never from the service) and let
+        // the user tap again once granted.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(POST_NOTIFICATIONS_PERMISSION) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(POST_NOTIFICATIONS_PERMISSION), REQUEST_NOTIFICATIONS)
+            record("Android 13+ 需要通知權限，已請求授權；授權後請再按一次「發出配對通知」")
+            return
         }
-    }
-
-    private fun onConnectClicked() {
-        val portRaw = connPortInput.text.toString()
-        runOp("連接") {
-            val port = parsePort(portRaw, "連接埠")
-            val client = ensureAdb()
-            try {
-                client.connect(HOST, port)
-            } catch (e: Exception) {
-                client.close()
-                throw e
-            }
-            setStatus("已連接")
-            record("連接完成")
-        }
+        PairingFlow.postPairingNotification(this) { msg -> record(msg) }
+        record("步驟：① 到開發者選項的無線偵錯打開「使用配對碼配對裝置」畫面")
+        record("步驟：② 下拉通知欄，在「PaxVM 配對」通知裡輸入 6 位配對碼（配對畫面保持開著）")
+        record("步驟：③ 回到本頁，配對結果會出現在這裡")
     }
 
     private fun shellLogged(client: AdbLocal, command: String): String {
@@ -238,14 +235,19 @@ class SystemLimitActivity : Activity() {
 
     private fun onLiftClicked(restore: Boolean) {
         val name = if (restore) "還原" else "解除限制"
-        val portRaw = connPortInput.text.toString()
         runOp(name) {
             val client = ensureAdb()
             if (!client.isConnected) {
-                val port = parsePort(portRaw, "連接埠")
-                record("尚未連接，先自動連接 127.0.0.1:$port")
+                record("尚未連接，先以 mDNS 發現連接服務（逾時 15 秒）")
+                val target = AdbMdns.discover(
+                    this@SystemLimitActivity,
+                    AdbMdns.TYPE_CONNECT,
+                    15_000,
+                ) { msg -> record(msg) }
+                    ?: throw IOException("mDNS 找不到連接服務（逾時）：請確認無線偵錯已開啟、且在同一個 Wi-Fi")
+                record("連接：${target.first}:${target.second}")
                 try {
-                    client.connect(HOST, port)
+                    client.connect(target.first, target.second)
                 } catch (e: Exception) {
                     client.close()
                     throw e
@@ -279,6 +281,7 @@ class SystemLimitActivity : Activity() {
     }
 
     companion object {
-        private const val HOST = "127.0.0.1"
+        private const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
+        private const val REQUEST_NOTIFICATIONS = 1001
     }
 }
