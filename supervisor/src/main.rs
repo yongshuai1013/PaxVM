@@ -8199,6 +8199,36 @@ fn tracer_loop(ctx: TracerCtx) {
                             }
                         }
                         sup!("{line}");
+                        // Follow the first stack words one
+                        // level: a heap object's first word
+                        // is its vtable, and the vtable's
+                        // home library names the class. This
+                        // turns "some RefBase with a bad
+                        // mRefs" into a named object.
+                        if let Some(swords) =
+                            read_mem_vec(pid, r.sp(), 8)
+                        {
+                            for i in 0..2 {
+                                let w = u32::from_le_bytes(
+                                    swords[i * 4..i * 4 + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                ) as u64;
+                                if w <= 0x10000 {
+                                    continue;
+                                }
+                                if let Some(vb) =
+                                    read_mem_vec(pid, w, 4)
+                                {
+                                    let v = u32::from_le_bytes(
+                                        vb.try_into().unwrap(),
+                                    ) as u64;
+                                    sup!(
+                                        "FATAL ptr stk[{i}]=0x{w:x} -> 0x{v:x}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 // Name the guest library the crash pc lives
