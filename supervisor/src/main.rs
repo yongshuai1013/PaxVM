@@ -5149,6 +5149,17 @@ fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
         bytes.len(),
         cmds.join(", ")
     );
+    let nw = bytes.len() / 4;
+    let show = nw.min(128);
+    let mut words: Vec<String> = Vec::with_capacity(show);
+    for i in 0..show {
+        words.push(format!("{:08x}", u32_at(bytes, i * 4)));
+    }
+    bsup!(
+        "binder: hex for pid={pid}: w=[{}]{}",
+        words.join(" "),
+        if nw > show { " .." } else { "" }
+    );
 }
 
 /// Finish a parked binder ioctl now that its arena has bytes:
