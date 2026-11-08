@@ -4783,6 +4783,43 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             "binder: raw txn pid={pid} arena={arena} reply={is_reply} code={code} slots{}",
             slot_dump(&data, &offs)
         );
+        // 0.9.109 forensics: an out-of-bounds object offset
+        // in the sender's array is a landmine for the
+        // receiver (Parcel::scanForFds dereferences
+        // mData + offset unchecked; the 0.9.108 field's
+        // tenure-killing libbinder deaths trace to raw
+        // OOB slots on scheduleLaunchActivity, three with
+        // the identical word 0xae20e2b8 across tenures).
+        // Capture the addressing facts while the sender
+        // is still stopped: where the offsets pointer
+        // aimed relative to the data, whether a re-read
+        // agrees, and what sits just past the data (where
+        // a contiguous offsets array would live).
+        for i in 0..(offs.len() / 4) {
+            let o = u32_at(&offs, i * 4);
+            if (o as usize) + 20 > data.len() {
+                let head: Vec<String> = (0..8)
+                    .filter(|&k| (k + 1) * 4 <= data.len())
+                    .map(|k| format!("{:08x}", u32_at(&data, k * 4)))
+                    .collect();
+                let reread = rd(pid, oaddr as u64, osize)
+                    .map(|v| {
+                        (0..(v.len() / 4))
+                            .map(|k| format!("{:08x}", u32_at(&v, k * 4)))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_else(|| "<unreadable>".to_string());
+                let past = rd(pid, (daddr as u64) + (dsize as u64), 4)
+                    .map(|v| format!("0x{:08x}", u32_at(&v, 0)))
+                    .unwrap_or_else(|| "<unreadable>".to_string());
+                bsup!(
+                    "binder: OOB slot forensics pid={pid} reply={is_reply} code={code} daddr=0x{daddr:x} oaddr=0x{oaddr:x} dsize={dsize} osize={osize} bad_off=0x{o:x} data_head=[{}] offs_reread=[{reread}] past_data_word={past}",
+                    head.join(" ")
+                );
+                break;
+            }
+        }
     }
     if is_reply {
         // 0.9.100 telemetry: the waiter queue is FIFO per
