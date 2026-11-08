@@ -2019,6 +2019,11 @@ struct BinderState {
     /// the real driver notifies once per new reference
     /// holder, not once per parcel (S5c)
     ref_notified: HashSet<(usize, String)>,
+    /// 0.9.100 experiment counter: binder_notify_ref calls
+    /// suppressed (see the note in binder_notify_ref).
+    /// Reported at arena death alongside the free counters
+    /// so a field can prove the notices really were off.
+    notify_suppressed: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -4194,6 +4199,26 @@ fn binder_notify_ref(
     weak: bool,
     actions: &mut Vec<BAction>,
 ) {
+    // 0.9.100 EXPERIMENT: reference notices suppressed.
+    // Every post-ready death of the RefBase family happens
+    // inside executeCommand's BR_INCREFS / BR_ACQUIRE
+    // handling, yet seven telemetry builds (0.9.92-0.9.99)
+    // proved every byte we deliver is exactly what we
+    // meant to send. The notices are the one input class
+    // whose *timing and target thread* differ from the
+    // real driver (queued into a shared stream, drained by
+    // whichever looper wakes first) -- and libbinder ran
+    // the full S5 probe suite before this mechanism
+    // existed (pre-0.6.9). Suppress them for one field:
+    // if the deaths stop, the poison is in this path; if
+    // they persist unchanged, it is innocent and the hunt
+    // moves to the wake state machine. Death notices
+    // (watchers / BR_DEAD_BINDER) are a separate mechanism
+    // and stay live.
+    st.notify_suppressed += 1;
+    return;
+    #[allow(unreachable_code)]
+    {
     let (owner, nptr, ncookie, dead) = {
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie, n.dead)
@@ -4216,6 +4241,7 @@ fn binder_notify_ref(
     }
     binder_maybe_wake(st, &owner, actions);
     st.note("ref notice queued to object owner");
+    }
 }
 
 /// Compact dump of a parcel's object slots for telemetry:
@@ -4712,6 +4738,21 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         );
     }
     if is_reply {
+        // 0.9.100 telemetry: the waiter queue is FIFO per
+        // serving arena (the real driver routes a reply to
+        // the exact thread that sent the request). Only log
+        // when a reply is paired while more than one waiter
+        // is outstanding -- the only case where FIFO can
+        // cross two callers.
+        if let Some(v) = st.waiters.get(arena) {
+            if v.len() > 1 {
+                bsup!(
+                    "binder: reply pairing under concurrency: arena={arena} replier pid={pid} outstanding={} popped waiter pid={}",
+                    v.len(),
+                    v[0].sender_pid
+                );
+            }
+        }
         let w = st
             .waiters
             .get_mut(arena)
@@ -5547,11 +5588,12 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_suppressed={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
-            bp.parcels.len()
+            bp.parcels.len(),
+            st.notify_suppressed
         );
     }
     // Queued manager transactions from this arena's
