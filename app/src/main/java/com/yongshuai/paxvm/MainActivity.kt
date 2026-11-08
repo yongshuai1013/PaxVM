@@ -1521,6 +1521,17 @@ class MainActivity : Activity() {
      * byte on a bad length, so starting mid-stream is
      * safe. Falls back to a bounded printable-strings
      * extraction when no entry parses. */
+    /** 0.9.102: the strings fallback applies the same
+     * masking as the structured path -- pixelflinger's
+     * per-draw "Needs:" spam (previously it only got
+     * dropped when entries parsed, so a torn channel
+     * still flooded the export). */
+    private fun keepRun(r: StringBuilder): Boolean {
+        val s = r.toString()
+        return !s.contains("pixelflinger") &&
+            !s.contains("Needs: n=0x")
+    }
+
     private fun renderGuestChannel(ch: String): String {
         val f = File(rootfsGBDir, ".logs/log-$ch")
         if (!f.exists() || f.length() == 0L) return ""
@@ -1588,7 +1599,28 @@ class MainActivity : Activity() {
             off += 20 + len
         }
         if (entries.isNotEmpty()) {
-            return entries.joinToString("\n")
+            // 0.9.102: fold consecutive repeats (a guest
+            // service logging the same error in a loop) so
+            // the readable log shows one line per anomaly
+            // with a count, not a wall of copies.
+            val folded = ArrayList<String>()
+            var last: String? = null
+            var run = 0
+            fun flushRun() {
+                val l = last ?: return
+                folded.add(if (run > 1) "$l (×$run)" else l)
+            }
+            for (e in entries) {
+                if (e == last) {
+                    run++
+                } else {
+                    flushRun()
+                    last = e
+                    run = 1
+                }
+            }
+            flushRun()
+            return folded.joinToString("\n")
         }
         // Fallback: printable-strings, bounded output.
         val sb = StringBuilder()
@@ -1599,13 +1631,13 @@ class MainActivity : Activity() {
             if (c in ' '..'~' || c == '\n' || c == '\t') {
                 run.append(c)
             } else {
-                if (run.length >= 6) {
+                if (run.length >= 6 && keepRun(run)) {
                     sb.append(run).append('\n')
                 }
                 run = StringBuilder()
             }
         }
-        if (run.length >= 6 && sb.length <= 24000) {
+        if (run.length >= 6 && sb.length <= 24000 && keepRun(run)) {
             sb.append(run).append('\n')
         }
         return sb.toString()

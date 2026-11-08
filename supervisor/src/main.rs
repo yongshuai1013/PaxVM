@@ -1071,6 +1071,13 @@ struct ProcState {
     /// True once the initial stop has been consumed and the process
     /// has been continued for the first time.
     started: bool,
+    /// 0.9.102 forensics: this thread's most recent binder
+    /// read fill (guest read_buf addr, fill length), recorded
+    /// on both fill paths. At a FATAL the buffer is dumped
+    /// from the stopped tracee (FATAL minbuf) so the exact
+    /// bytes the guest was consuming can be compared against
+    /// the batches the supervisor assembled.
+    last_binder_read: Option<(u32, u32)>,
     /// True once a syscall-entry stop has been processed. Until
     /// then no translation has used this process's vcwd, so a late
     /// fork event may still correct it from the parent.
@@ -1130,6 +1137,7 @@ impl ProcState {
             exec_blocked: false,
             shard_decided: false,
             exec_armed: false,
+            last_binder_read: None,
         }
     }
 }
@@ -4121,10 +4129,24 @@ fn exec_binder_actions(
     coord: &mut CoordClient,
     actions: Vec<BAction>,
     wakes: &mut Vec<i32>,
-) {
+) -> Option<(u32, u32)> {
+    // 0.9.102: spot this call's binder read fill among the
+    // writes so the caller can record it as the thread's
+    // last_binder_read. A fill is identifiable exactly: the
+    // action list pairs the batch WriteMem with a 4-byte
+    // WriteMem whose value is the batch length (the
+    // read_consumed writeback at bwr+16).
+    let mut writes: Vec<(u64, usize, u32)> = Vec::new();
+    let mut fill: Option<(u32, u32)> = None;
     for a in actions {
         match a {
             BAction::WriteMem { addr, bytes } => {
+                let head = if bytes.len() >= 4 {
+                    u32::from_le_bytes(bytes[0..4].try_into().unwrap())
+                } else {
+                    0
+                };
+                writes.push((addr, bytes.len(), head));
                 let _ = write_mem(pid, addr, &bytes);
             }
             BAction::SkipSyscall(v) => skip_syscall(pid, regs, pend, v),
@@ -4159,6 +4181,18 @@ fn exec_binder_actions(
             }
         }
     }
+    for (waddr, wlen, wval) in &writes {
+        if *wlen == 4 && *wval >= 4 {
+            let hits: Vec<&(u64, usize, u32)> = writes
+                .iter()
+                .filter(|(a, l, _)| *l == *wval as usize && a != waddr)
+                .collect();
+            if hits.len() == 1 {
+                fill = Some((hits[0].0 as u32, *wval));
+            }
+        }
+    }
+    fill
 }
 
 /// Rewrite one flat_binder_object slot in a parcel being
@@ -5527,6 +5561,9 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
+    if let Some(p) = procs.get_mut(&pid) {
+        p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
+    }
     let _ = write_mem(pid, park.read_buf as u64, &bytes);
     let _ = write_mem(pid, (park.bwr + 4) as u64, &park.write_consumed.to_le_bytes());
     let _ = write_mem(pid, (park.bwr + 16) as u64, &(bytes.len() as u32).to_le_bytes());
@@ -7957,7 +7994,7 @@ fn tracer_loop(ctx: TracerCtx) {
                                 coord.set_context_mgr(pid, &arena);
                             replay_logs(logs);
                             if ok && total > 0 {
-                                exec_binder_actions(
+                                let _ = exec_binder_actions(
                                     pid,
                                     proc.compat,
                                     &mut regs,
@@ -8030,7 +8067,7 @@ fn tracer_loop(ctx: TracerCtx) {
                                 stream,
                             );
                             replay_logs(logs);
-                            exec_binder_actions(
+                            if let Some(f) = exec_binder_actions(
                                 pid,
                                 proc.compat,
                                 &mut regs,
@@ -8038,7 +8075,9 @@ fn tracer_loop(ctx: TracerCtx) {
                                 &mut coord,
                                 actions,
                                 &mut wakes,
-                            );
+                            ) {
+                                proc.last_binder_read = Some(f);
+                            }
                             pend.desc = Some(desc);
                         }
                         req => {
@@ -8496,6 +8535,35 @@ fn tracer_loop(ctx: TracerCtx) {
                     );
                 } else {
                     sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo){regdump}");
+                }
+                // 0.9.102: dump the tracee's binder input
+                // buffer (its most recent read fill) verbatim.
+                // Compared offline against the batches the
+                // supervisor assembled for this pid, this is
+                // the ground truth of what the guest was
+                // consuming when it died -- the splice /
+                // stale-buffer check the stream-side telemetry
+                // could never settle.
+                if let Some((rb, flen)) =
+                    procs.get(&pid).and_then(|p| p.last_binder_read)
+                {
+                    let n = ((flen as usize) + 128).min(512);
+                    if let Some(mem) = read_mem_vec(pid, rb as u64, n) {
+                        let words: Vec<String> = mem
+                            .chunks_exact(4)
+                            .take(64)
+                            .map(|c| {
+                                format!(
+                                    "0x{:08x}",
+                                    u32::from_le_bytes(c.try_into().unwrap())
+                                )
+                            })
+                            .collect();
+                        sup!(
+                            "FATAL minbuf pid={pid} rb=0x{rb:x} filled={flen} w=[{}]",
+                            words.join(", ")
+                        );
+                    }
                 }
                 // Memory around the crash (0.9.24): on this
                 // device GETSIGINFO fails, so the fault
