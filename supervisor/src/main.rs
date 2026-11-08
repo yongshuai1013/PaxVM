@@ -4708,22 +4708,47 @@ fn materialize_ref_notices(st: &mut BinderState, arena: &str) {
             continue;
         }
         let (want_weak, want_strong) = binder_remote_wants(n);
-        let notice = if want_weak
+        // Upward conversions are emitted as one atomic run in this
+        // pass: INCREFS first, then ACQUIRE in the SAME owner read
+        // batch. The one-conversion-per-pass chain (0.9.114) forced
+        // ACQUIRE at least one full guest read turn behind INCREFS;
+        // owners whose Bn object lives only for the scope of the
+        // transaction that published it (mediaserver's startup
+        // burst) drop the object inside that turn, and the delayed
+        // ACQUIRE then incStrong()s freed heap -- deterministically,
+        // on the first ACQUIRE batch of every incarnation. The
+        // kernel's read loop likewise keeps converting the same
+        // node within one read while conversions are owed.
+        let mut emitted_up = false;
+        if want_weak
             && !n.ref_weak_told
             && !n.ref_weak_pending
             && !n.ref_weak_queued
             && !n.ref_weak_dropped
         {
-            Some(BR_INCREFS)
-        } else if want_strong
+            pairs.extend_from_slice(&BR_INCREFS.to_le_bytes());
+            pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_weak_queued = true;
+            emitted_up = true;
+        }
+        if want_strong
             && !n.ref_strong_told
             && !n.ref_strong_pending
             && !n.ref_strong_queued
             && !n.ref_strong_dropped
-            && n.ref_weak_told
+            && (n.ref_weak_told || n.ref_weak_queued)
         {
-            Some(BR_ACQUIRE)
-        } else if !want_strong
+            pairs.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_strong_queued = true;
+            emitted_up = true;
+        }
+        if emitted_up {
+            continue;
+        }
+        let notice = if !want_strong
             && n.ref_strong_told
             && !n.ref_strong_pending
             && !n.ref_strong_queued
@@ -4745,8 +4770,8 @@ fn materialize_ref_notices(st: &mut BinderState, arena: &str) {
             pairs.extend_from_slice(&n.ptr.to_le_bytes());
             pairs.extend_from_slice(&n.cookie.to_le_bytes());
             match cmd {
-                BR_INCREFS | BR_DECREFS => n.ref_weak_queued = true,
-                BR_ACQUIRE | BR_RELEASE => n.ref_strong_queued = true,
+                BR_DECREFS => n.ref_weak_queued = true,
+                BR_RELEASE => n.ref_strong_queued = true,
                 _ => {}
             }
         }
