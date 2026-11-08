@@ -1470,6 +1470,24 @@ const BINDER_ARENA_CAP: u32 = 8 * 1024 * 1024;
 fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
+
+/// Plain bitwise CRC32 (0.9.99 parcel fingerprints; the
+/// inputs are a few hundred bytes at a time, so the naive
+/// loop is fast enough and needs no table).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
 fn put_u32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
@@ -1854,6 +1872,18 @@ fn entry_fb_ioctl(
     }
 }
 
+/// What binder_deliver wrote into an arena buffer, kept
+/// until the buffer is freed (0.9.99): a CRC32 of the file
+/// image (data, zero padding, offsets) with fd-fixup words
+/// zeroed -- fixups legitimately rewrite those words
+/// before the guest reads the parcel.
+struct ParcelPrint {
+    crc: u32,
+    total: u32,
+    mask: Vec<u32>,
+    head: Vec<u32>,
+}
+
 struct BinderProc {
     file: std::fs::File,
     /// thread pid -> guest address of this arena's mmap
@@ -1865,6 +1895,22 @@ struct BinderProc {
     bump: u32,
     free: Vec<(u32, u32)>,
     used: HashMap<u32, u32>,
+    /// Delivery fingerprints of live parcels (0.9.99):
+    /// arena offset -> what binder_deliver wrote there.
+    /// Re-verified when the batch handing the parcel to
+    /// its reader is assembled (dump_mgr_read): a parcel
+    /// rewritten in flight -- a stray fd fixup, a double
+    /// allocation, a wild write -- shows up here as a
+    /// fingerprint mismatch instead of surfacing in the
+    /// guest as a crash on a pointer no stream carried.
+    parcels: HashMap<u32, ParcelPrint>,
+    /// BC_FREE_BUFFER outcome counters (0.9.99), reported
+    /// when the arena dies: hit = recycled, nobase = the
+    /// freeing thread had no registered base (the free was
+    /// dropped), stale = offset was not in the used table.
+    free_hit: u32,
+    free_nobase: u32,
+    free_stale: u32,
     /// handle -> node index (handle 0 is the context manager
     /// in every process and is never stored here)
     handles: HashMap<u32, usize>,
@@ -3206,6 +3252,10 @@ fn binder_open_arena(
                 bump: 0,
                 free: Vec::new(),
                 used: HashMap::new(),
+                parcels: HashMap::new(),
+                free_hit: 0,
+                free_nobase: 0,
+                free_stale: 0,
                 handles: HashMap::new(),
                 next_handle: 1,
                 inbound: Vec::new(),
@@ -4237,7 +4287,9 @@ fn binder_translate(
                         binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off);
                         binder_notify_ref(st, n, to, ty == OBJ_WEAK_HANDLE, actions);
                     }
-                    None => st.note("parcel carried an unknown handle; left untranslated"),
+                    None => bsup!(
+                        "binder: unknown handle 0x{ptr:x} in parcel {from} -> {to}; left untranslated"
+                    ),
                 }
             }
             OBJ_FD => {
@@ -4297,6 +4349,31 @@ fn binder_deliver(
         || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
     {
         return Err("arena file write failed");
+    }
+    {
+        // 0.9.99: fingerprint the parcel image exactly as
+        // it now lies in the arena file, so dump_mgr_read
+        // can call out any in-flight rewrite when the
+        // batch carrying this parcel is handed over.
+        let mut img = vec![0u8; total as usize];
+        img[..data.len()].copy_from_slice(data);
+        let offs_at = ((data.len() as u32 + 3) & !3) as usize;
+        img[offs_at..offs_at + offs.len()].copy_from_slice(offs);
+        let mut mask: Vec<u32> = fd_fixups.iter().map(|(rel, _)| (*rel / 4) as u32).collect();
+        mask.sort_unstable();
+        mask.dedup();
+        for &w in &mask {
+            let at = (w as usize) * 4;
+            if at + 4 <= img.len() {
+                img[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+        let head: Vec<u32> = (0..8)
+            .filter(|&i| (i + 1) * 4 <= img.len())
+            .map(|i| u32_at(&img, i * 4))
+            .collect();
+        let crc = crc32(&img);
+        bp.parcels.insert(off, ParcelPrint { crc, total, mask, head });
     }
     if !offs.is_empty() {
         let bases: Vec<String> = bp
@@ -4498,10 +4575,19 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 let ptr = u32_at(stream, cur);
                 cur += 4;
                 if let Some(bp) = st.procs.get_mut(arena) {
-                    if let Some(&base) = bp.base.get(&pid) {
-                        let off = ptr.wrapping_sub(base);
-                        if let Some(sz) = bp.used.remove(&off) {
-                            bp.free.push((off, sz));
+                    match bp.base.get(&pid) {
+                        Some(&base) => {
+                            let off = ptr.wrapping_sub(base);
+                            if let Some(sz) = bp.used.remove(&off) {
+                                bp.free.push((off, sz));
+                                bp.parcels.remove(&off);
+                                bp.free_hit += 1;
+                            } else {
+                                bp.free_stale += 1;
+                            }
+                        }
+                        None => {
+                            bp.free_nobase += 1;
                         }
                     }
                 }
@@ -5103,7 +5189,6 @@ fn selinux_ctx(pid: i32) -> String {
 /// manager's clean exit(0) after serving flushed work in
 /// the 0.9.26 device run; this names which one it ate.
 fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
-    let _ = (st, arena);
     let mut cmds: Vec<String> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= bytes.len() && cmds.len() < 10 {
@@ -5160,6 +5245,61 @@ fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
         words.join(" "),
         if nw > show { " .." } else { "" }
     );
+    // 0.9.99 parcel fingerprint verification: for every
+    // transaction this batch hands to the reader, re-read
+    // the parcel from the arena file and compare it with
+    // the fingerprint taken at delivery. A mismatch means
+    // the parcel changed in flight -- the class of fault
+    // that surfaces in the guest as a crash on a pointer
+    // no byte stream ever carried.
+    let Some(bp) = st.procs.get(arena) else { return };
+    let Some(base) = bp
+        .base
+        .get(&pid)
+        .copied()
+        .or_else(|| bp.base.values().next().copied())
+    else {
+        return;
+    };
+    let mut voff = 0usize;
+    while voff + 4 <= bytes.len() {
+        let c = u32_at(bytes, voff);
+        let step = match c {
+            BR_TRANSACTION | BR_REPLY => 44,
+            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
+            BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => 8,
+            _ => 4,
+        };
+        if (c == BR_TRANSACTION || c == BR_REPLY) && voff + 44 <= bytes.len() {
+            let aoff = u32_at(bytes, voff + 36).wrapping_sub(base);
+            if let Some(pp) = bp.parcels.get(&aoff) {
+                use std::os::unix::fs::FileExt;
+                let mut img = vec![0u8; pp.total as usize];
+                if bp.file.read_exact_at(&mut img, aoff as u64).is_ok() {
+                    for &w in &pp.mask {
+                        let at = (w as usize) * 4;
+                        if at + 4 <= img.len() {
+                            img[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+                        }
+                    }
+                    if crc32(&img) != pp.crc {
+                        let now_head: Vec<String> = (0..8)
+                            .filter(|&i| (i + 1) * 4 <= img.len())
+                            .map(|i| format!("{:08x}", u32_at(&img, i * 4)))
+                            .collect();
+                        let old_head: Vec<String> =
+                            pp.head.iter().map(|w| format!("{w:08x}")).collect();
+                        bsup!(
+                            "binder: CLOBBER pid={pid} arena={arena} off={aoff} stored_head=[{}] now_head=[{}]",
+                            old_head.join(" "),
+                            now_head.join(" ")
+                        );
+                    }
+                }
+            }
+        }
+        voff += step;
+    }
 }
 
 /// Finish a parked binder ioctl now that its arena has bytes:
@@ -5404,6 +5544,15 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
 fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) {
     if st.thread_arena.values().any(|a| a == arena) {
         return; // sibling threads still hold this arena
+    }
+    if let Some(bp) = st.procs.get(arena) {
+        bsup!(
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={}",
+            bp.free_hit,
+            bp.free_nobase,
+            bp.free_stale,
+            bp.parcels.len()
+        );
     }
     // Queued manager transactions from this arena's
     // senders die with it (0.9.24).
