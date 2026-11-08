@@ -4134,23 +4134,55 @@ fn exec_binder_actions(
     actions: Vec<BAction>,
     wakes: &mut Vec<i32>,
 ) -> Option<(u32, u32)> {
-    // 0.9.102: spot this call's binder read fill among the
-    // writes so the caller can record it as the thread's
-    // last_binder_read. A fill is identifiable exactly: the
-    // action list pairs the batch WriteMem with a 4-byte
-    // WriteMem whose value is the batch length (the
-    // read_consumed writeback at bwr+16).
-    let mut writes: Vec<(u64, usize, u32)> = Vec::new();
+    // 0.9.104: pre-filter any batch WriteMem through
+    // shield_live_pairs BEFORE the actions run, fixing the
+    // paired writeback struct (24B, batch length at +16)
+    // to the filtered length -- a stale read_consumed
+    // would make the guest read past the batch into old
+    // buffer content. The identified fill is also the
+    // thread's last_binder_read for FATAL minbuf.
+    let mut actions = actions;
     let mut fill: Option<(u32, u32)> = None;
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..actions.len() {
+        let ilen = match &actions[i] {
+            BAction::WriteMem { bytes, .. } if ref_batch_qualifies(bytes) => {
+                bytes.len()
+            }
+            _ => continue,
+        };
+        for j in 0..actions.len() {
+            if i == j {
+                continue;
+            }
+            if let BAction::WriteMem { bytes, .. } = &actions[j] {
+                if bytes.len() == 24
+                    && u32::from_le_bytes(bytes[16..20].try_into().unwrap())
+                        as usize
+                        == ilen
+                {
+                    pairs.push((i, j));
+                }
+            }
+        }
+    }
+    for (i, j) in pairs {
+        let (baddr, newlen) = match &mut actions[i] {
+            BAction::WriteMem { addr, bytes } => {
+                let filtered = shield_live_pairs(pid, std::mem::take(bytes));
+                *bytes = filtered;
+                (*addr, bytes.len() as u32)
+            }
+            _ => continue,
+        };
+        fill = Some((baddr as u32, newlen));
+        if let BAction::WriteMem { bytes, .. } = &mut actions[j] {
+            bytes[16..20].copy_from_slice(&newlen.to_le_bytes());
+        }
+    }
     for a in actions {
         match a {
             BAction::WriteMem { addr, bytes } => {
-                let head = if bytes.len() >= 4 {
-                    u32::from_le_bytes(bytes[0..4].try_into().unwrap())
-                } else {
-                    0
-                };
-                writes.push((addr, bytes.len(), head));
                 let _ = write_mem(pid, addr, &bytes);
             }
             BAction::SkipSyscall(v) => skip_syscall(pid, regs, pend, v),
@@ -4182,17 +4214,6 @@ fn exec_binder_actions(
                         pend.applied = true;
                     }
                 }
-            }
-        }
-    }
-    for (waddr, wlen, wval) in &writes {
-        if *wlen == 4 && *wval >= 4 {
-            let hits: Vec<&(u64, usize, u32)> = writes
-                .iter()
-                .filter(|(a, l, _)| *l == *wval as usize && a != waddr)
-                .collect();
-            if hits.len() == 1 {
-                fill = Some((hits[0].0 as u32, *wval));
             }
         }
     }
@@ -5210,6 +5231,91 @@ fn shield_ref_pairs(
     out
 }
 
+/// 0.9.104 shield, second layer (worker side, at the two
+/// fill applications): the 0.9.103 field proved with
+/// FATAL minbuf ground truth that the killing pairs are
+/// well-formed, registry-valid pairs whose OBJECT HAS
+/// ALREADY DIED in the owner before the notice is
+/// drained -- the pair is right, the referent is gone.
+/// So validate the referent itself, with the guest's own
+/// invariant: GB's executeCommand asserts
+/// refs->refBase() == obj before incStrong, i.e. the
+/// word at refs+12 (weakref_impl::mBase) must equal the
+/// obj word. Read it from the stopped receiver; a pair
+/// that fails (or whose refs are unmapped) is cut from
+/// the batch whole and logged. Qualification is strict:
+/// the buffer must walk end-to-end on known BR opcodes
+/// only and contain at least one REF pair, so non-batch
+/// writes pass through untouched.
+/// Strict batch shape check for shield_live_pairs: the
+/// buffer walks end-to-end on known BR opcodes only and
+/// contains at least one REF pair.
+fn ref_batch_qualifies(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let mut off = 0usize;
+    let mut has_ref = false;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        match cmd {
+            BR_TRANSACTION
+            | BR_REPLY
+            | BR_INCREFS
+            | BR_ACQUIRE
+            | 0x8008_7209
+            | 0x8008_720a
+            | BR_DEAD_BINDER
+            | BR_CLEAR_DEATH_NOTIFICATION_DONE
+            | 0x8000_7200
+            | BR_DEAD_REPLY
+            | BR_TRANSACTION_COMPLETE => {}
+            _ => return false,
+        }
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            has_ref = true;
+        }
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            return false;
+        }
+        off += len;
+    }
+    off == bytes.len() && has_ref
+}
+
+fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
+    if !ref_batch_qualifies(&bytes) {
+        return bytes;
+    }
+    // Liveness walk.
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(&bytes, off);
+        let len = br_one_len(cmd);
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            let a = u32_at(&bytes, off + 4);
+            let b = u32_at(&bytes, off + 8);
+            let mbase = read_mem_vec(pid, (a as u64) + 12, 4)
+                .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()));
+            if mbase != Some(b) {
+                sup!(
+                    "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={}",
+                    mbase
+                        .map(|m| format!("0x{m:x}"))
+                        .unwrap_or_else(|| "<unmapped>".to_string())
+                );
+                off += len;
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes[off..off + len]);
+        off += len;
+    }
+    out
+}
+
 /// One-shot latch for the success-side VMA sample.
 static MPROT_OK_SAMPLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -5638,6 +5744,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
+    let bytes = shield_live_pairs(pid, bytes);
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
     }
