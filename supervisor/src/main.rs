@@ -1210,6 +1210,9 @@ fn entry_translate(
             if guest_abs(vcwd, &p) == "/dev/ashmem" {
                 return entry_open_ashmem(pid, rootfs, compat, nr, regs, coord);
             }
+            if guest_abs(vcwd, &p) == "/dev/ump" {
+                return entry_open_ump(pid, rootfs, compat, nr, regs);
+            }
         }
     }
     // (arg index of path, arg index of its dirfd or -1 for cwd semantics)
@@ -1981,6 +1984,15 @@ struct BinderState {
     /// file per open, ioctls answered from this table.
     ashmem: HashMap<String, AshmemRec>,
     ashmem_seq: u64,
+    /// Virtual UMP (S2 experiment, s2exp4): secure_id ->
+    /// allocation record. Samsung's gralloc drives
+    /// /dev/ump through libMali's UMP userspace; the
+    /// host has no such device, so the supervisor serves
+    /// it: allocations are plain shared files under
+    /// {rootfs}/.ump and this table is the secure-id
+    /// ledger (ump-virtualization-spec.md).
+    ump: HashMap<u32, UmpAlloc>,
+    ump_seq: u32,
     /// FD translation (S6 gun 4): parcels already delivered
     /// into an arena whose flat FD objects still carry the
     /// *sender's* fd numbers. A fixup names the arena-file
@@ -2026,6 +2038,27 @@ struct AshmemRec {
     size: u64,
     name: String,
     prot: u64,
+}
+
+/// One virtual-UMP allocation (coordinator side).
+struct UmpAlloc {
+    /// Page-aligned size in bytes.
+    size: u64,
+    /// Driver-side reference count: 1 at ALLOCATE,
+    /// dropped by RELEASE ioctls. An allocation is
+    /// reaped only when this reaches <= 0 AND no
+    /// process holds a live mapping -- the libump
+    /// flow releases the initial reference right after
+    /// mapping, so refs alone do not own the lifetime.
+    refs: i32,
+    /// Pids that have mapped this allocation (via the
+    /// supervisor's mmap rewrite); entries are removed
+    /// when the pid exits (munmap is not intercepted).
+    mapped_by: std::collections::HashSet<i32>,
+    /// Host backing file ({rootfs}/.ump/<id>), kept
+    /// here because the table is keyed by secure_id,
+    /// not by path the way ashmem's is.
+    path: String,
 }
 
 struct FdFixup {
@@ -2149,6 +2182,7 @@ const MSG_ONEWAY_ASHMEM_SET_SIZE: u8 = 23;
 const MSG_ONEWAY_ASHMEM_SET_PROT: u8 = 24;
 // S2 (sharding): routing, credential book and handoff.
 const MSG_REQ_VCRED: u8 = 8;
+const MSG_REQ_UMP: u8 = 9;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -2160,11 +2194,13 @@ const MSG_HELLO: u8 = 31;
 // SIGUSR2 stack-dump request; the coordinator
 // broadcasts it to the workers as a push.
 const MSG_ONEWAY_DUMP_REQ: u8 = 32;
+const MSG_ONEWAY_UMP: u8 = 33;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
 const MSG_PUSH_DUMP_STACKS: u8 = 43;
 const MSG_RESP_VCRED: u8 = 108;
+const MSG_RESP_UMP: u8 = 109;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -2174,6 +2210,16 @@ const MSG_RESP_OPEN_ASHMEM: u8 = 106;
 const MSG_RESP_ASHMEM_GET: u8 = 107;
 const MSG_REV_READ: u8 = 120;
 const MSG_REV_READ_RESP: u8 = 121;
+
+/// Sub-operations on MSG_REQ_UMP (first payload byte).
+const UMP_REQ_ALLOC: u8 = 1;
+const UMP_REQ_SIZE_GET: u8 = 2;
+const UMP_REQ_VERSION: u8 = 3;
+const UMP_REQ_QUERY: u8 = 4;
+
+/// Sub-operations on MSG_ONEWAY_UMP (first payload byte).
+const UMP_OW_RELEASE: u8 = 1;
+const UMP_OW_MAP: u8 = 2;
 
 /// Decision-side log capture. In coordinator mode the
 /// binder family must not emit: its lines belong in the
@@ -2943,6 +2989,86 @@ impl CoordClient {
         self.send(MSG_ONEWAY_ASHMEM_SET_PROT, &e.0);
     }
 
+    /// Virtual UMP: ask the coordinator to allocate a
+    /// shared buffer of `size` bytes for `pid`; returns
+    /// the secure_id (from 1), or None if the backing
+    /// file could not be created.
+    fn ump_alloc(&mut self, pid: i32, rootfs: &str, size: u64) -> Option<u32> {
+        let mut e = Enc::new();
+        e.u8(UMP_REQ_ALLOC);
+        e.i32(pid);
+        e.string(rootfs);
+        e.u64(size);
+        let p = self.rpc(MSG_REQ_UMP, &e.0, MSG_RESP_UMP);
+        let mut d = Dec::new(&p);
+        if d.bool() {
+            Some(d.u32())
+        } else {
+            None
+        }
+    }
+
+    /// Virtual UMP: the recorded (page-aligned) size
+    /// of allocation `id`, or None if unknown.
+    fn ump_size_get(&mut self, id: u32) -> Option<u64> {
+        let mut e = Enc::new();
+        e.u8(UMP_REQ_SIZE_GET);
+        e.u32(id);
+        let p = self.rpc(MSG_REQ_UMP, &e.0, MSG_RESP_UMP);
+        let mut d = Dec::new(&p);
+        if d.bool() {
+            Some(d.u64())
+        } else {
+            None
+        }
+    }
+
+    /// Virtual UMP: whether allocation `id` exists
+    /// (the mmap path's lookup; the backing path is
+    /// deterministic, {rootfs}/.ump/<id>).
+    fn ump_query(&mut self, id: u32) -> bool {
+        let mut e = Enc::new();
+        e.u8(UMP_REQ_QUERY);
+        e.u32(id);
+        let p = self.rpc(MSG_REQ_UMP, &e.0, MSG_RESP_UMP);
+        Dec::new(&p).bool()
+    }
+
+    /// Virtual UMP: the version word the VERSION
+    /// ioctl answers (0x00010001: major 1 == minor 1,
+    /// the equality libump's open handshake checks).
+    fn ump_version(&mut self) -> u32 {
+        let mut e = Enc::new();
+        e.u8(UMP_REQ_VERSION);
+        let p = self.rpc(MSG_REQ_UMP, &e.0, MSG_RESP_UMP);
+        let mut d = Dec::new(&p);
+        if d.bool() {
+            d.u32()
+        } else {
+            0x0001_0001
+        }
+    }
+
+    /// Virtual UMP: drop one driver-side reference
+    /// to allocation `id` (RELEASE ioctl).
+    fn oneway_ump_release(&mut self, pid: i32, id: u32) {
+        let mut e = Enc::new();
+        e.u8(UMP_OW_RELEASE);
+        e.i32(pid);
+        e.u32(id);
+        self.send(MSG_ONEWAY_UMP, &e.0);
+    }
+
+    /// Virtual UMP: register that `pid` now holds a
+    /// live mapping of allocation `id`.
+    fn oneway_ump_map(&mut self, pid: i32, id: u32) {
+        let mut e = Enc::new();
+        e.u8(UMP_OW_MAP);
+        e.i32(pid);
+        e.u32(id);
+        self.send(MSG_ONEWAY_UMP, &e.0);
+    }
+
     /// S2 routing: this tracer now owns `pid`, with
     /// these virtual credentials (seeds the coordinator's
     /// global credential book too).
@@ -3265,6 +3391,67 @@ fn ashmem_open_region(pid: i32, rootfs: &str, st: &mut BinderState) -> String {
         },
     );
     raw
+}
+
+/// The state half of a virtual-UMP ALLOCATE,
+/// coordinator side: create the backing file
+/// {rootfs}/.ump/<secure_id> at the page-aligned
+/// size, register the record, and report the new
+/// secure_id (ids start at 1; 0 is UMP's invalid id).
+fn ump_allocate(rootfs: &str, size: u64, st: &mut BinderState) -> Option<u32> {
+    let aligned = size.checked_add(4095)? & !4095u64;
+    st.ump_seq += 1;
+    let id = st.ump_seq;
+    let dir = format!("{rootfs}/.ump");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = format!("{dir}/{id}");
+    let f = std::fs::File::create(&path).ok()?;
+    f.set_len(aligned).ok()?;
+    st.ump.insert(
+        id,
+        UmpAlloc {
+            size: aligned,
+            refs: 1,
+            mapped_by: std::collections::HashSet::new(),
+            path,
+        },
+    );
+    Some(id)
+}
+
+/// Reap every UMP allocation whose driver-side
+/// references are spent and which no process maps
+/// any more: delete the backing file and drop the
+/// record. Called after RELEASE and after a process
+/// exit has scrubbed the mapped_by sets.
+fn ump_reap(st: &mut BinderState) {
+    let dead: Vec<u32> = st
+        .ump
+        .iter()
+        .filter(|(_, a)| a.refs <= 0 && a.mapped_by.is_empty())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in dead {
+        if let Some(a) = st.ump.remove(&id) {
+            let _ = std::fs::remove_file(&a.path);
+            bsup!("ump: reaped id={id} size={} (refs spent, unmapped)", a.size);
+        }
+    }
+}
+
+/// A traced process exited: drop it from every
+/// allocation's mapping set, then reap whatever
+/// that orphaned. Mirrors the binder death path's
+/// placement (the MSG_REQ_THREAD_EXIT handler runs
+/// it for every dying pid, arena holder or not).
+fn ump_on_proc_exit(pid: i32, st: &mut BinderState) {
+    if st.ump.is_empty() {
+        return;
+    }
+    for a in st.ump.values_mut() {
+        a.mapped_by.remove(&pid);
+    }
+    ump_reap(st);
 }
 
 /// The state half of completing a parked WRITE_READ,
@@ -3662,6 +3849,7 @@ impl CoordServer {
             MSG_REQ_THREAD_EXIT => {
                 let pid = d.i32();
                 cap_clear();
+                ump_on_proc_exit(pid, &mut self.st);
                 match binder_thread_exit(pid, &mut self.st) {
                     Some(dwakes) => {
                         let mut e = Enc::new();
@@ -3732,6 +3920,40 @@ impl CoordServer {
                     None => e.bool(false),
                 }
                 self.send_to(ci, MSG_RESP_ASHMEM_GET, &e.0);
+            }
+            MSG_REQ_UMP => {
+                let op = d.u8();
+                let mut e = Enc::new();
+                match op {
+                    UMP_REQ_ALLOC => {
+                        let _pid = d.i32();
+                        let rootfs = d.string();
+                        let size = d.u64();
+                        match ump_allocate(&rootfs, size, &mut self.st) {
+                            Some(id) => {
+                                e.bool(true);
+                                e.u32(id);
+                            }
+                            None => e.bool(false),
+                        }
+                    }
+                    UMP_REQ_SIZE_GET | UMP_REQ_QUERY => {
+                        let id = d.u32();
+                        match self.st.ump.get(&id) {
+                            Some(a) => {
+                                e.bool(true);
+                                e.u64(a.size);
+                            }
+                            None => e.bool(false),
+                        }
+                    }
+                    UMP_REQ_VERSION => {
+                        e.bool(true);
+                        e.u32(0x0001_0001);
+                    }
+                    _ => e.bool(false),
+                }
+                self.send_to(ci, MSG_RESP_UMP, &e.0);
             }
             MSG_REQ_VCRED => {
                 let pid = d.i32();
@@ -3831,6 +4053,27 @@ impl CoordServer {
                 let key = d.string();
                 let prot = d.u64();
                 self.st.ashmem.entry(key).or_insert_with(default_ashmem_rec).prot = prot;
+            }
+            MSG_ONEWAY_UMP => {
+                let op = d.u8();
+                match op {
+                    UMP_OW_RELEASE => {
+                        let _pid = d.i32();
+                        let id = d.u32();
+                        if let Some(a) = self.st.ump.get_mut(&id) {
+                            a.refs -= 1;
+                        }
+                        ump_reap(&mut self.st);
+                    }
+                    UMP_OW_MAP => {
+                        let pid = d.i32();
+                        let id = d.u32();
+                        if let Some(a) = self.st.ump.get_mut(&id) {
+                            a.mapped_by.insert(pid);
+                        }
+                    }
+                    _ => {}
+                }
             }
             MSG_ONEWAY_REGISTER_PID => {
                 let pid = d.i32();
@@ -5540,6 +5783,52 @@ fn fd_ashmem(pid: i32, fd: i32) -> Option<String> {
     }
 }
 
+/// Open /dev/ump, supervisor-served (S2 experiment,
+/// ump-virtualization-spec.md): rewrite the guest's
+/// path to the placeholder file {rootfs}/.ump/dev,
+/// created on the spot. UMP keeps no per-open state
+/// (allocations are the state, and they live with the
+/// coordinator), so unlike opening ashmem this side
+/// needs no coordinator round trip -- /dev/ump is a
+/// doorbell, not a region. The guest's open then
+/// succeeds on an ordinary file; its ioctls and
+/// mmaps on the fd are intercepted by fd identity
+/// (fd_ump), never by the placeholder.
+fn entry_open_ump(
+    _pid: i32,
+    rootfs: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+) -> String {
+    let path_arg = if (compat && nr == 322) || (!compat && nr == 56) {
+        1
+    } else {
+        0
+    };
+    let raw = format!("{rootfs}/.ump/dev");
+    let _ = std::fs::create_dir_all(format!("{rootfs}/.ump"));
+    let _ = std::fs::File::create(&raw);
+    let mut cursor = regs.sp().saturating_sub(256);
+    match scratch_write(_pid, &mut cursor, &raw) {
+        Some(addr) => {
+            regs.set_arg(path_arg, addr);
+            "open '/dev/ump' -> virtual UMP device (supervisor-served)".to_string()
+        }
+        None => "open '/dev/ump' (scratch write failed)".to_string(),
+    }
+}
+
+fn fd_ump(pid: i32, fd: i32) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    let s = target.to_string_lossy().into_owned();
+    if s.contains("/.ump/") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 // Ashmem ioctls, guest-era numbering (bionic 2.3.7
 // linux/ashmem.h, __ASHMEMIOC 0x77). SET_SIZE and
 // SET_PROT_MASK take their value BY VALUE in arg (see
@@ -5646,6 +5935,232 @@ fn entry_ashmem_ioctl(
             "ashmem ioctl (accepted)".to_string()
         }
     }
+}
+
+// UMP ioctls (libMali's uku layer, GB era; numbers
+// from the disassembly recorded in
+// ump-virtualization-spec.md section 2). Every uku
+// request struct starts with the device fd itself at
+// +0 -- a kernel-side field the core ignores -- so
+// the payload fields begin at +4.
+const UMP_VERSION_IOC: u32 = 0x800c_9001;
+const UMP_ALLOCATE_IOC: u32 = 0xc010_9002;
+const UMP_RELEASE_IOC: u32 = 0x8008_9003;
+const UMP_SIZE_GET_IOC: u32 = 0xc00c_9004;
+const UMP_MSYNC_IOC: u32 = 0x400c_9007;
+
+fn entry_ump_ioctl(
+    pid: i32,
+    rootfs: &str,
+    req: u32,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    coord: &mut CoordClient,
+) -> String {
+    let arg = regs.arg(2);
+    let mut buf = [0u8; 16];
+    let _ = read_mem(pid, arg, &mut buf);
+    match req {
+        UMP_VERSION_IOC => {
+            // {fd, 0x00020002, version_out}: libump
+            // demands version_out's high half == its
+            // low half == 1 (its "1.1" check), or the
+            // whole open fails.
+            let v = coord.ump_version();
+            let _ = write_mem(pid, arg + 8, &v.to_le_bytes());
+            skip_syscall(pid, regs, pend, 0);
+            sup!("ump: version handshake pid={pid}");
+            "ump VERSION".to_string()
+        }
+        UMP_ALLOCATE_IOC => {
+            // {fd, secure_id_out, size_in, constraints_in}
+            let size = u32_at(&buf, 8) as u64;
+            match coord.ump_alloc(pid, rootfs, size) {
+                Some(id) => {
+                    let _ = write_mem(pid, arg + 4, &id.to_le_bytes());
+                    skip_syscall(pid, regs, pend, 0);
+                    sup!("ump: alloc pid={pid} id={id} size={size}");
+                    format!("ump ALLOC id={id} size={size}")
+                }
+                None => {
+                    skip_syscall(pid, regs, pend, -12);
+                    "ump ALLOC -> -ENOMEM (coordinator)".to_string()
+                }
+            }
+        }
+        UMP_SIZE_GET_IOC => {
+            // {fd, secure_id, size_out}
+            let id = u32_at(&buf, 4);
+            match coord.ump_size_get(id) {
+                Some(size) => {
+                    let _ = write_mem(pid, arg + 8, &(size as u32).to_le_bytes());
+                    skip_syscall(pid, regs, pend, 0);
+                    format!("ump SIZE_GET id={id} -> {size}")
+                }
+                None => {
+                    skip_syscall(pid, regs, pend, -22);
+                    format!("ump SIZE_GET id={id} -> -EINVAL")
+                }
+            }
+        }
+        UMP_RELEASE_IOC => {
+            // {fd, secure_id}: one-way bookkeeping;
+            // the allocation dies only when its refs
+            // are spent AND no mapping survives.
+            let id = u32_at(&buf, 4);
+            coord.oneway_ump_release(pid, id);
+            skip_syscall(pid, regs, pend, 0);
+            format!("ump RELEASE id={id}")
+        }
+        UMP_MSYNC_IOC => {
+            // Our buffers are ordinary shared files:
+            // always coherent, nothing to flush.
+            skip_syscall(pid, regs, pend, 0);
+            "ump MSYNC (no-op)".to_string()
+        }
+        _ => {
+            skip_syscall(pid, regs, pend, -25);
+            format!("ump ioctl {req:#010x} -> -ENOTTY")
+        }
+    }
+}
+
+/// Ride a file-backed mmap on a tracee that has
+/// already spent one injection ride (its PC must be
+/// rewound to the entry svc, so this consumes an
+/// entry stop and then the exit stop -- inject_openat's
+/// rewind path, generalized from inject_mmap's
+/// anonymous-only form to an arbitrary fd and offset).
+fn inject_mmap_file(
+    pid: i32,
+    compat: bool,
+    entry_pc: u64,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+    regs: &mut Regs,
+) -> i64 {
+    regs.set_pc(entry_pc);
+    let nr_mmap: u64 = if compat { 192 } else { 222 };
+    regs.set_nr(nr_mmap);
+    regs.set_arg(0, addr);
+    regs.set_arg(1, len);
+    regs.set_arg(2, prot);
+    regs.set_arg(3, flags);
+    regs.set_arg(4, fd as i64 as u64);
+    regs.set_arg(5, 0);
+    if !set_regs(pid, regs) {
+        return -1;
+    }
+    if !set_syscallno(pid, nr_mmap as i32) {
+        return -1;
+    }
+    cont_syscall(pid, 0);
+    let mut stops_needed = 2;
+    loop {
+        match wait_one_syscall_stop(pid) {
+            Some(()) => {
+                stops_needed -= 1;
+                if stops_needed == 0 {
+                    match get_regs(pid, compat) {
+                        Some(r) => {
+                            *regs = r;
+                            return r.retval();
+                        }
+                        None => return -1,
+                    }
+                }
+                cont_syscall(pid, 0);
+            }
+            None => return -1,
+        }
+    }
+}
+
+/// mmap on a UMP fd, served at the entry stop
+/// (ump-virtualization-spec.md section 3.3): libump
+/// encodes the allocation as offset = secure_id *
+/// page_size into the device. Rewrite it into a real
+/// mmap of the allocation's backing file: ride an
+/// openat of {rootfs}/.ump/<id> inside the guest,
+/// then ride the mmap itself with fd = the new fd,
+/// offset 0, and MAP_PRIVATE forced to MAP_SHARED --
+/// UMP buffers exist to be shared between processes,
+/// and a private mapping would hide the writer's
+/// pixels from every reader. Settlement follows the
+/// pixelflinger mprotect precedent: the rides consume
+/// this entry stop's transition, so the result is
+/// applied here and the pending record marked
+/// applied. An unknown secure_id fails with -ENODEV
+/// before any ride.
+fn entry_ump_mmap(
+    pid: i32,
+    rootfs: &str,
+    compat: bool,
+    regs: &mut Regs,
+    pend: &mut Pending,
+    coord: &mut CoordClient,
+) -> String {
+    let addr = regs.arg(0);
+    let len = regs.arg(1);
+    let prot = regs.arg(2);
+    let flags = regs.arg(3);
+    let off_arg = regs.arg(5);
+    // mmap2 (compat) counts its offset in pages;
+    // native mmap counts bytes. Either way the
+    // secure_id is the page index.
+    let offset_bytes = if compat {
+        off_arg.wrapping_mul(4096)
+    } else {
+        off_arg
+    };
+    let id = (offset_bytes / 4096) as u32;
+    if !coord.ump_query(id) {
+        skip_syscall(pid, regs, pend, -19);
+        return format!("ump mmap id={id} -> -ENODEV (unknown secure id)");
+    }
+    let path = format!("{rootfs}/.ump/{id}");
+    let entry_pc = regs.pc();
+    skip_syscall(pid, regs, pend, 0);
+    let mut cursor = regs.sp().saturating_sub(256);
+    let newfd = match scratch_write(pid, &mut cursor, &path) {
+        Some(a) => inject_openat(pid, compat, a, entry_pc, false, regs),
+        None => -1,
+    };
+    if newfd < 0 {
+        pend.inject = Some(-19);
+        regs.set_retval(-19);
+        if set_regs(pid, regs) {
+            pend.applied = true;
+        }
+        sup!("ump: map pid={pid} id={id} FAILED (backing open)");
+        return format!("ump mmap id={id} -> -ENODEV (backing open failed)");
+    }
+    let shared_flags = (flags & !2) | 1;
+    let r = inject_mmap_file(
+        pid,
+        compat,
+        entry_pc,
+        addr,
+        len,
+        prot,
+        shared_flags,
+        newfd as i32,
+        regs,
+    );
+    let r32 = r as u32;
+    if r32 != 0 && r32 < 0xFFFF_F001 {
+        coord.oneway_ump_map(pid, id);
+        sup!("ump: map pid={pid} id={id} len={len}");
+    }
+    pend.inject = Some(r);
+    regs.set_retval(r);
+    if set_regs(pid, regs) {
+        pend.applied = true;
+    }
+    format!("ump mmap id={id} len={len} -> {r:#x}")
 }
 
 fn is_setid_emulated(compat: bool, nr: u64) -> bool {
@@ -7647,6 +8162,22 @@ fn tracer_loop(ctx: TracerCtx) {
                     ));
                     dirty = true;
                 } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
+                    && fd_ump(pid, regs.arg(4) as i32).is_some()
+                {
+                    // mmap on the virtual UMP device (S2
+                    // experiment): the offset encodes a
+                    // secure_id -- serve the mapping from
+                    // the allocation's backing file.
+                    pend.desc = Some(entry_ump_mmap(
+                        pid,
+                        &rootfs,
+                        proc.compat,
+                        &mut regs,
+                        &mut pend,
+                        &mut coord,
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 192) || (!proc.compat && nr == 222))
                     && regs.arg(2) & 4 != 0
                 {
                     // Telemetry only: any executable mapping.
@@ -7718,6 +8249,23 @@ fn tracer_loop(ctx: TracerCtx) {
                     pend.desc = Some(entry_ashmem_ioctl(
                         pid,
                         &key,
+                        regs.arg(1) as u32,
+                        &mut regs,
+                        &mut pend,
+                        &mut coord,
+                    ));
+                    dirty = true;
+                } else if ((proc.compat && nr == 54) || (!proc.compat && nr == 29))
+                    && fd_ump(pid, regs.arg(0) as i32).is_some()
+                {
+                    // Virtual UMP ioctls (S2 experiment).
+                    // Gated on the fd alone: every request
+                    // on a UMP fd is ours to answer, and
+                    // the unknown ones get -ENOTTY inside
+                    // (ump-virtualization-spec.md 3.3).
+                    pend.desc = Some(entry_ump_ioctl(
+                        pid,
+                        &rootfs,
                         regs.arg(1) as u32,
                         &mut regs,
                         &mut pend,
