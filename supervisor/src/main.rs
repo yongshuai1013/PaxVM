@@ -1467,6 +1467,8 @@ const BR_FAILED_REPLY: u32 = 0x7211;
 const BR_DEAD_BINDER: u32 = 0x8004_720f;
 const BR_INCREFS: u32 = 0x8008_7207;
 const BR_ACQUIRE: u32 = 0x8008_7208;
+const BR_RELEASE: u32 = 0x8008_7209;
+const BR_DECREFS: u32 = 0x8008_720a;
 const BINDER_WRITE_READ: u32 = 0xC018_6201;
 const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
 const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
@@ -2000,6 +2002,26 @@ struct BinderNode {
     /// outstanding handles to it dead-reply, and a fresh
     /// registration creates a new node (S5c)
     dead: bool,
+    /// Arenas currently holding a remote reference to
+    /// this node, tracked the way binder.c tracks them:
+    /// a receiver arena enters remote_weak when the
+    /// object crosses into it (and on its own
+    /// BC_INCREFS / BC_ACQUIRE), remote_strong on strong
+    /// crossings / BC_ACQUIRE, and leaves on BC_RELEASE /
+    /// BC_DECREFS or when its arena dies.
+    remote_strong: HashSet<String>,
+    remote_weak: HashSet<String>,
+    /// What the owner has actually been told it holds
+    /// (the kernel's has_strong_ref / has_weak_ref): set
+    /// when a notice pair passes delivery
+    /// (shield_ref_pairs), not when it is queued.
+    ref_strong_told: bool,
+    ref_weak_told: bool,
+    /// A pair for the pending transition is already
+    /// materialized in the owner's inbound stream and
+    /// not yet delivered.
+    ref_strong_queued: bool,
+    ref_weak_queued: bool,
 }
 
 struct ParkedIoctl {
@@ -2029,11 +2051,6 @@ struct BinderState {
     watchers: HashMap<usize, Vec<(String, u32)>>,
     thread_arena: HashMap<i32, String>,
     noted: HashSet<String>,
-    /// (node, receiver arena) pairs already sent a
-    /// BR_INCREFS(/BR_ACQUIRE) notice to the node's owner:
-    /// the real driver notifies once per new reference
-    /// holder, not once per parcel (S5c)
-    ref_notified: HashSet<(usize, String)>,
     /// Count of reference notices actually queued to an
     /// owner (0.9.100's suppression experiment counted the
     /// suppressed calls here; 0.9.101 restored the notices
@@ -2121,6 +2138,12 @@ impl BinderState {
             ptr,
             cookie,
             dead: false,
+            remote_strong: HashSet::new(),
+            remote_weak: HashSet::new(),
+            ref_strong_told: false,
+            ref_weak_told: false,
+            ref_strong_queued: false,
+            ref_weak_queued: false,
         });
         let id = self.nodes.len() - 1;
         bsup!(
@@ -3358,6 +3381,10 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let Some(arena) = st.thread_arena.get(&pid).cloned() else {
         return ParkedOutcome::Nothing;
     };
+    // Kernel-faithful ref notices are computed now, at
+    // fill time, from current state -- not when the
+    // reference crossed (materialize_ref_notices).
+    materialize_ref_notices(st, &arena);
     let (bytes, from_inbound) = {
         let Some(bp) = st.procs.get_mut(&arena) else {
             return ParkedOutcome::Nothing;
@@ -4252,13 +4279,16 @@ fn binder_write_obj(st: &mut BinderState, to: &str, node: usize, weak: bool, out
     }
 }
 
-/// Tell a node's owner that a new arena now holds a
-/// reference to it, the way the real driver does when an
-/// object crosses into another process: BR_INCREFS always,
-/// BR_ACQUIRE as well for a strong object. Once per
-/// (node, receiver) pair. Guests whose parse skips these
-/// (stock binder.c) are unaffected; libbinder owners use
-/// them for local object lifetime tracking (S5c).
+/// Record that a new arena now holds a reference to
+/// this node, the way binder.c's binder_inc_ref records
+/// it: state only, no bytes, no wake. The BR_INCREFS /
+/// BR_ACQUIRE (or the reverse BR_DECREFS / BR_RELEASE)
+/// the owner eventually reads are materialized from
+/// this state at fill time (materialize_ref_notices),
+/// so a notice can never be delivered for a reference
+/// that has already gone away again -- the byte-queued
+/// version could, and owners incStrong'd objects that
+/// were already freed on exactly that (S5c, S9).
 fn binder_notify_ref(
     st: &mut BinderState,
     node: usize,
@@ -4266,29 +4296,91 @@ fn binder_notify_ref(
     weak: bool,
     actions: &mut Vec<BAction>,
 ) {
-    let (owner, nptr, ncookie, dead) = {
+    let (owner, dead) = {
         let n = &st.nodes[node];
-        (n.owner.clone(), n.ptr, n.cookie, n.dead)
+        (n.owner.clone(), n.dead)
     };
     if dead || owner == to {
         return;
     }
-    if !st.ref_notified.insert((node, to.to_string())) {
+    st.notify_queued += 1;
+    let n = &mut st.nodes[node];
+    n.remote_weak.insert(to.to_string());
+    if !weak {
+        n.remote_strong.insert(to.to_string());
+    }
+    st.note("ref notice recorded for object owner");
+    // The kernel wakes the owner's wait queue when node
+    // work lands on its todo; without a wake here the
+    // recorded transition would only materialize at the
+    // owner's next incidental fill -- the drain lag this
+    // state machine exists to close. Materialize now so
+    // the wake candidates can see the pair in inbound;
+    // the ref_*_queued flags keep the fill-time
+    // materialization from duplicating it.
+    materialize_ref_notices(st, &owner);
+    binder_maybe_wake(st, &owner, actions);
+}
+
+/// Materialize one arena's pending reference notices
+/// into the front of its inbound stream, from the
+/// per-node state: for each live node the arena owns,
+/// compare what remote arenas currently hold
+/// (remote_weak / remote_strong) with what the owner
+/// has been told (ref_*_told) and queue the single pair
+/// that closes the gap, at most one per slot, marked
+/// ref_*_queued so a later fill does not duplicate it
+/// before delivery updates *_told (shield_ref_pairs).
+/// Running this at fill time, not at crossing time, is
+/// what makes the stream kernel-faithful: a reference
+/// that came and went between fills produces no pair
+/// at all, instead of a stale BR_ACQUIRE delivered
+/// after the object was freed.
+fn materialize_ref_notices(st: &mut BinderState, arena: &str) {
+    if !st.procs.contains_key(arena) {
         return;
     }
-    st.notify_queued += 1;
-    if let Some(bp) = st.procs.get_mut(&owner) {
-        bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
-        bp.inbound.extend_from_slice(&nptr.to_le_bytes());
-        bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
-        if !weak {
-            bp.inbound.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
-            bp.inbound.extend_from_slice(&nptr.to_le_bytes());
-            bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+    let mut weak_pairs: Vec<u8> = Vec::new();
+    let mut strong_pairs: Vec<u8> = Vec::new();
+    for n in &mut st.nodes {
+        if n.dead || n.owner != arena {
+            continue;
+        }
+        let want_weak = !n.remote_weak.is_empty() || !n.remote_strong.is_empty();
+        let want_strong = !n.remote_strong.is_empty();
+        if want_weak && !n.ref_weak_told && !n.ref_weak_queued {
+            weak_pairs.extend_from_slice(&BR_INCREFS.to_le_bytes());
+            weak_pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            weak_pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_weak_queued = true;
+        } else if !want_weak && n.ref_weak_told && !n.ref_weak_queued {
+            weak_pairs.extend_from_slice(&BR_DECREFS.to_le_bytes());
+            weak_pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            weak_pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_weak_queued = true;
+        }
+        if want_strong && !n.ref_strong_told && !n.ref_strong_queued {
+            strong_pairs.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            strong_pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            strong_pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_strong_queued = true;
+        } else if !want_strong && n.ref_strong_told && !n.ref_strong_queued {
+            strong_pairs.extend_from_slice(&BR_RELEASE.to_le_bytes());
+            strong_pairs.extend_from_slice(&n.ptr.to_le_bytes());
+            strong_pairs.extend_from_slice(&n.cookie.to_le_bytes());
+            n.ref_strong_queued = true;
         }
     }
-    binder_maybe_wake(st, &owner, actions);
-    st.note("ref notice queued to object owner");
+    if weak_pairs.is_empty() && strong_pairs.is_empty() {
+        return;
+    }
+    if let Some(bp) = st.procs.get_mut(arena) {
+        let mut block = weak_pairs;
+        block.extend_from_slice(&strong_pairs);
+        block.extend_from_slice(&bp.inbound);
+        bp.inbound = block;
+        st.note("ref notices materialized at fill");
+    }
 }
 
 /// Compact dump of a parcel's object slots for telemetry:
@@ -4669,8 +4761,42 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 if cur + 4 > stream.len() {
                     break;
                 }
+                let h = u32_at(stream, cur);
                 cur += 4;
-                st.note("refcount BC consumed (v1 no-op)");
+                // The guest's own reference bookkeeping,
+                // applied to the per-node remote sets the
+                // owner notices are materialized from --
+                // the v1 no-op left remote_* to parcel
+                // crossings alone, so a reference the guest
+                // took or dropped purely by handle (its
+                // BpBinder incStrong/decStrong traffic) was
+                // invisible to the state machine. Handle 0
+                // is the context manager: skip silently.
+                if h != 0 {
+                    let node = st
+                        .procs
+                        .get(arena)
+                        .and_then(|p| p.handles.get(&h).copied());
+                    if let Some(ni) = node {
+                        let n = &mut st.nodes[ni];
+                        match cmd {
+                            BC_INCREFS => {
+                                n.remote_weak.insert(arena.to_string());
+                            }
+                            BC_ACQUIRE => {
+                                n.remote_weak.insert(arena.to_string());
+                                n.remote_strong.insert(arena.to_string());
+                            }
+                            BC_RELEASE => {
+                                n.remote_strong.remove(arena);
+                            }
+                            _ => {
+                                n.remote_weak.remove(arena);
+                            }
+                        }
+                        st.note("refcount BC applied");
+                    }
+                }
             }
             BC_INCREFS_DONE | BC_ACQUIRE_DONE => {
                 if cur + 8 > stream.len() {
@@ -5115,6 +5241,10 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         put_u32(&mut b, 20, rb);
         b
     };
+    // Same fill-time ref-notice materialization as the
+    // parked path (materialize_ref_notices), before the
+    // readable computation below consults the queues.
+    materialize_ref_notices(st, &arena);
     let queue_len = st
         .procs
         .get(&arena)
@@ -5307,6 +5437,40 @@ fn shield_ref_pairs(
             }
         }
         out.extend_from_slice(&bytes[off..off + len]);
+        // A REF pair that passes here is being delivered:
+        // settle the node's told/queued state to match
+        // (materialize_ref_notices queued the pair; the
+        // owner now believes it holds -- or no longer
+        // holds -- the reference). Dropped pairs never
+        // reach this point and leave the flags alone.
+        if len == 12 && matches!(cmd, BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS) {
+            let a = u32_at(&bytes, off + 4);
+            let b = u32_at(&bytes, off + 8);
+            if let Some(n) = st
+                .nodes
+                .iter_mut()
+                .find(|n| n.owner == arena && n.ptr == a && n.cookie == b)
+            {
+                match cmd {
+                    BR_INCREFS => {
+                        n.ref_weak_told = true;
+                        n.ref_weak_queued = false;
+                    }
+                    BR_ACQUIRE => {
+                        n.ref_strong_told = true;
+                        n.ref_strong_queued = false;
+                    }
+                    BR_RELEASE => {
+                        n.ref_strong_told = false;
+                        n.ref_strong_queued = false;
+                    }
+                    _ => {
+                        n.ref_weak_told = false;
+                        n.ref_weak_queued = false;
+                    }
+                }
+            }
+        }
         off += len;
     }
     if off < bytes.len() {
@@ -5919,6 +6083,15 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     for v in st.waiters.values_mut() {
         v.retain(|w| w.sender_arena != arena);
+    }
+    // The dying arena's remote references vanish with
+    // it: drop it from every node's remote sets, so the
+    // owners' next fill-time materialization queues the
+    // matching BR_RELEASE / BR_DECREFS instead of the
+    // owner going on believing a dead holder holds refs.
+    for n in &mut st.nodes {
+        n.remote_strong.remove(arena);
+        n.remote_weak.remove(arena);
     }
     let mut dead_nodes: Vec<usize> = Vec::new();
     for (i, n) in st.nodes.iter_mut().enumerate() {
