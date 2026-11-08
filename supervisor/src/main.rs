@@ -2033,6 +2033,9 @@ struct BinderState {
     /// and counts the queued ones). Reported at arena
     /// death alongside the free counters.
     notify_queued: u64,
+    /// 0.9.103: cumulative shield drops (see
+    /// shield_ref_pairs). Reported at arena death.
+    shield_drops: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -3359,6 +3362,7 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         let n = br_prefix_len(&peek, park.read_size as usize);
         bp.drain_for(pid, n)
     };
+    let bytes = shield_ref_pairs(st, &arena, pid, bytes);
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -5031,6 +5035,7 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             .get_mut(&arena)
             .map(|bp| bp.drain_for(pid, fill_n).0)
             .unwrap_or_default();
+        let bytes = shield_ref_pairs(st, &arena, pid, bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
         let filled = bytes.len();
         actions.push(BAction::WriteMem {
@@ -5115,22 +5120,94 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
 /// manager's clean exit(0) after serving flushed work
 /// (0.9.26/0.9.29 device runs). Deliveries must be
 /// cut only between commands.
+fn br_one_len(cmd: u32) -> usize {
+    match cmd {
+        BR_TRANSACTION | BR_REPLY => 44,
+        BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
+        BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => 8,
+        _ => 4,
+    }
+}
+
 fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
     let mut off = 0usize;
     while off + 4 <= bytes.len() {
         let cmd = u32_at(bytes, off);
-        let len = match cmd {
-            BR_TRANSACTION | BR_REPLY => 44,
-            BR_INCREFS | BR_ACQUIRE | 0x8008_7209 | 0x8008_720a => 12,
-            BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE | 0x8000_7200 => 8,
-            _ => 4,
-        };
+        let len = br_one_len(cmd);
         if off + len > cap || off + len > bytes.len() {
             break;
         }
         off += len;
     }
     off
+}
+
+/// 0.9.103 shield (user's call: intercept the bad
+/// reference before the receiver can consume it).
+/// Validate every BR_INCREFS / BR_ACQUIRE pair in an
+/// assembled batch against the node registry: a pair is
+/// deliverable only if it names a LIVE node owned by the
+/// batch's own arena -- exactly the (ptr, obj) words
+/// binder_notify_ref queued it from. Anything else
+/// (unknown pair, or a dead node's pair: delivering it
+/// makes the guest incStrong freed memory, the crash
+/// shape itself) is cut out of the batch whole -- 12B
+/// command units, so the stream stays aligned -- and
+/// logged. The walk uses the same length table as
+/// br_prefix_len; a truncated tail is delivered as-is.
+fn shield_ref_pairs(
+    st: &mut BinderState,
+    arena: &str,
+    pid: i32,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    if bytes.len() < 12 {
+        return bytes;
+    }
+    let mut live: std::collections::HashSet<(u32, u32)> =
+        std::collections::HashSet::new();
+    let mut known: std::collections::HashSet<(u32, u32)> =
+        std::collections::HashSet::new();
+    for n in &st.nodes {
+        if n.owner == arena {
+            known.insert((n.ptr, n.cookie));
+            if !n.dead {
+                live.insert((n.ptr, n.cookie));
+            }
+        }
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(&bytes, off);
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            break;
+        }
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            let a = u32_at(&bytes, off + 4);
+            let b = u32_at(&bytes, off + 8);
+            if !live.contains(&(a, b)) {
+                let why = if known.contains(&(a, b)) {
+                    "dead node"
+                } else {
+                    "no such node"
+                };
+                st.shield_drops += 1;
+                bsup!(
+                    "binder: shield dropped ref pair for pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} ({why})"
+                );
+                off += len;
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes[off..off + len]);
+        off += len;
+    }
+    if off < bytes.len() {
+        out.extend_from_slice(&bytes[off..]);
+    }
+    out
 }
 
 /// One-shot latch for the success-side VMA sample.
@@ -5606,12 +5683,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
             bp.parcels.len(),
-            st.notify_queued
+            st.notify_queued,
+            st.shield_drops
         );
     }
     // Queued manager transactions from this arena's
