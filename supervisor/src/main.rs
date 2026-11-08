@@ -1078,6 +1078,12 @@ struct ProcState {
     /// bytes the guest was consuming can be compared against
     /// the batches the supervisor assembled.
     last_binder_read: Option<(u32, u32)>,
+    /// 0.9.108: consecutive pre-entry SIGSYS swallows for
+    /// this tracee (reset when an entry stop assigns a
+    /// fresh pending record). A cap keeps a pathological
+    /// trap from livelocking: past it the signal is
+    /// delivered as before.
+    sigsys_preentry: u32,
     /// True once a syscall-entry stop has been processed. Until
     /// then no translation has used this process's vcwd, so a late
     /// fork event may still correct it from the parent.
@@ -1138,6 +1144,7 @@ impl ProcState {
             shard_decided: false,
             exec_armed: false,
             last_binder_read: None,
+            sigsys_preentry: 0,
         }
     }
 }
@@ -8355,6 +8362,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 // result (pend.applied): the next stop is a
                 // fresh entry stop, not this call's exit.
                 let transition_consumed = pend.applied;
+                proc.sigsys_preentry = 0;
                 proc.pending = Some(pend);
                 proc.expect_exit = !transition_consumed;
                 if !parked {
@@ -8461,7 +8469,8 @@ fn tracer_loop(ctx: TracerCtx) {
                         // record is still here. The record is never
                         // consulted again otherwise: the next entry
                         // stop for this pid overwrites it.
-                        proc.pending = Some(pend);
+                        proc.sigsys_preentry = 0;
+                proc.pending = Some(pend);
                     }
                 }
                 proc.expect_exit = false;
@@ -9001,6 +9010,42 @@ fn tracer_loop(ctx: TracerCtx) {
                         );
                         proc.pending = None;
                         deliver = 0;
+                    }
+                }
+                if deliver != 0 {
+                    // 0.9.108: the seccomp trap stop raced
+                    // ahead of the syscall-entry stop. The
+                    // entry stop normally runs first and
+                    // arms the pending record (the "late
+                    // SIGSYS" rescue above); occasionally
+                    // the trap is reported first, when no
+                    // record exists yet -- and delivering
+                    // the signal then kills the whole guest
+                    // process (the 0.9.107 long field: 81
+                    // system_server tenures in 11 minutes,
+                    // dying process-wide by SIGSYS; the
+                    // proven culprit stop had nr_reg intact
+                    // at 0x10d = utimes). A fresh trap is
+                    // recognisable exactly: the syscall
+                    // number register still holds a real
+                    // number (a late trap reads -1 after
+                    // cancellation). Swallow the signal and
+                    // continue: the pending entry stop for
+                    // the same call lands next and handles
+                    // it through the normal path.
+                    if let Some(proc) = procs.get_mut(&pid) {
+                        let nr = get_regs(pid, proc.compat).map(|r| r.nr());
+                        if let Some(nr) = nr {
+                            if nr >= 0 && nr < 0x10_0000 && proc.sigsys_preentry < 8 {
+                                proc.sigsys_preentry += 1;
+                                sup!(
+                                    "SIGSYS pre-entry pid={pid}: syscall={nr} name={} swallowed (#{}) awaiting entry stop",
+                                    nr_name(proc.compat, nr as u64),
+                                    proc.sigsys_preentry
+                                );
+                                deliver = 0;
+                            }
+                        }
                     }
                 }
             }
