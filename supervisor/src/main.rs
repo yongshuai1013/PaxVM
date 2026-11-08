@@ -5268,18 +5268,25 @@ fn ref_batch_qualifies(bytes: &[u8]) -> bool {
     off == bytes.len() && has_ref
 }
 
-/// 0.9.106 shield, second layer (worker side, at the two
+/// 0.9.107 shield, second layer (worker side, at the two
 /// fill applications): validate each REF pair's referent
-/// with the guest's own invariant -- the word at refs+8
-/// (weakref_impl::mBase) must equal the obj word.
-/// Layout settled from the donor GB libutils.so, not
-/// from memory: attemptIncStrong CASes [this+0] against
-/// INITIAL_STRONG_VALUE (mStrong at +0), incWeak and
-/// getWeakCount use +4 (mWeak), so mBase is +8. (The
-/// 0.9.104 attempt read +12 -- that is mFlags, normally
-/// zero -- and condemned every live pair; removed in
-/// 0.9.105.) A pair that fails, or whose refs are
-/// unmapped, is cut whole and logged.
+/// by the bidirectional RefBase link, the only form of
+/// the invariant that holds for every object layout:
+/// word at refs+8 (weakref_impl::mBase) names the
+/// RefBase subobject, and the word at mBase+4 (the
+/// subobject's mRefs, per getWeakRefs = ldr [r0, #4])
+/// must point back at refs. 0.9.106 compared mBase to
+/// the pair's obj word directly, which is only valid
+/// when the RefBase subobject sits at offset 0 of the
+/// outer object -- BnInterface-style multiple
+/// inheritance (SurfaceFlinger's own service object:
+/// mBase = obj + 0x2dc) failed en masse (120 false
+/// drops). Layout offsets are from the donor GB
+/// libutils.so: mStrong +0, mWeak +4, mBase +8 in
+/// weakref_impl (0.9.104 read +12 = mFlags and killed
+/// everything; that attempt was removed in 0.9.105).
+/// A pair whose link does not close, or whose memory
+/// is unmapped, is cut whole and logged.
 fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
     if !ref_batch_qualifies(&bytes) {
         return bytes;
@@ -5294,10 +5301,17 @@ fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
             let b = u32_at(&bytes, off + 8);
             let mbase = read_mem_vec(pid, (a as u64) + 8, 4)
                 .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()));
-            if mbase != Some(b) {
+            let backref = mbase.and_then(|m| {
+                read_mem_vec(pid, (m as u64) + 4, 4)
+                    .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()))
+            });
+            if backref != Some(a) {
                 sup!(
-                    "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={}",
+                    "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={} backref={}",
                     mbase
+                        .map(|m| format!("0x{m:x}"))
+                        .unwrap_or_else(|| "<unmapped>".to_string()),
+                    backref
                         .map(|m| format!("0x{m:x}"))
                         .unwrap_or_else(|| "<unmapped>".to_string())
                 );
