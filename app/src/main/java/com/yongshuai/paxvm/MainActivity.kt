@@ -1257,6 +1257,17 @@ class MainActivity : Activity() {
         // reach the rootfs -- that cost a whole device run.
         val marker = File(sysDir, ".gbsystem-v19")
         if (!marker.exists()) {
+            // The payload is authoritative: wipe the old tree
+            // before extracting. Overlay extraction never
+            // deletes, so a file removed from a newer zip --
+            // or left behind by an entirely different payload
+            // -- would linger in the tree forever (2026-11-08:
+            // an S2 experiment field silently re-ran the
+            // previous payload's Samsung gralloc because the
+            // bypass build's zip no longer contained it, but
+            // the device tree still did).
+            sysDir.deleteRecursively()
+            sysDir.mkdirs()
             try {
                 assets.open("gbsystem.zip").use { ins ->
                     ZipInputStream(ins).use { zin ->
