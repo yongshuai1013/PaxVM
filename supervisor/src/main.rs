@@ -2019,11 +2019,12 @@ struct BinderState {
     /// the real driver notifies once per new reference
     /// holder, not once per parcel (S5c)
     ref_notified: HashSet<(usize, String)>,
-    /// 0.9.100 experiment counter: binder_notify_ref calls
-    /// suppressed (see the note in binder_notify_ref).
-    /// Reported at arena death alongside the free counters
-    /// so a field can prove the notices really were off.
-    notify_suppressed: u64,
+    /// Count of reference notices actually queued to an
+    /// owner (0.9.100's suppression experiment counted the
+    /// suppressed calls here; 0.9.101 restored the notices
+    /// and counts the queued ones). Reported at arena
+    /// death alongside the free counters.
+    notify_queued: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -4199,26 +4200,6 @@ fn binder_notify_ref(
     weak: bool,
     actions: &mut Vec<BAction>,
 ) {
-    // 0.9.100 EXPERIMENT: reference notices suppressed.
-    // Every post-ready death of the RefBase family happens
-    // inside executeCommand's BR_INCREFS / BR_ACQUIRE
-    // handling, yet seven telemetry builds (0.9.92-0.9.99)
-    // proved every byte we deliver is exactly what we
-    // meant to send. The notices are the one input class
-    // whose *timing and target thread* differ from the
-    // real driver (queued into a shared stream, drained by
-    // whichever looper wakes first) -- and libbinder ran
-    // the full S5 probe suite before this mechanism
-    // existed (pre-0.6.9). Suppress them for one field:
-    // if the deaths stop, the poison is in this path; if
-    // they persist unchanged, it is innocent and the hunt
-    // moves to the wake state machine. Death notices
-    // (watchers / BR_DEAD_BINDER) are a separate mechanism
-    // and stay live.
-    st.notify_suppressed += 1;
-    return;
-    #[allow(unreachable_code)]
-    {
     let (owner, nptr, ncookie, dead) = {
         let n = &st.nodes[node];
         (n.owner.clone(), n.ptr, n.cookie, n.dead)
@@ -4229,6 +4210,7 @@ fn binder_notify_ref(
     if !st.ref_notified.insert((node, to.to_string())) {
         return;
     }
+    st.notify_queued += 1;
     if let Some(bp) = st.procs.get_mut(&owner) {
         bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
         bp.inbound.extend_from_slice(&nptr.to_le_bytes());
@@ -4241,7 +4223,6 @@ fn binder_notify_ref(
     }
     binder_maybe_wake(st, &owner, actions);
     st.note("ref notice queued to object owner");
-    }
 }
 
 /// Compact dump of a parcel's object slots for telemetry:
@@ -5588,12 +5569,12 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_suppressed={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
             bp.parcels.len(),
-            st.notify_suppressed
+            st.notify_queued
         );
     }
     // Queued manager transactions from this arena's
