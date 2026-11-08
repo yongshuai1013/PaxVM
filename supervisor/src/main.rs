@@ -4797,7 +4797,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // a contiguous offsets array would live).
         for i in 0..(offs.len() / 4) {
             let o = u32_at(&offs, i * 4);
-            if (o as usize) + 20 > data.len() {
+            if (o as usize) + 16 > data.len() {
                 let head: Vec<String> = (0..8)
                     .filter(|&k| (k + 1) * 4 <= data.len())
                     .map(|k| format!("{:08x}", u32_at(&data, k * 4)))
@@ -4820,6 +4820,33 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 break;
             }
         }
+    }
+    // 0.9.110 shield, third layer: never deliver a parcel
+    // whose object offsets are out of bounds. Field
+    // evidence (0.9.108/0.9.109): the sender's offsets
+    // array itself arrives poisoned (a pointer-valued
+    // word -- 0xae20e2b8, identical across tenures -- in
+    // place of the offset, on scheduleLaunchActivity),
+    // reads are not torn (a re-read agrees), and the
+    // receiver dies unchecked in Parcel::scanForFds.
+    // The real driver validates offsets during its copy
+    // and fails such a transaction; the faithful mirror
+    // is to fail it too: drop a request outright (the
+    // poisoned ones are one-way; the sender has moved
+    // on) and answer a poisoned reply with FAILED_REPLY
+    // so its waiter unwinds instead of hanging.
+    let oob = (0..(offs.len() / 4)).any(|i| {
+        let o = u32_at(&offs, i * 4) as usize;
+        o + 16 > data.len()
+    });
+    if oob && !is_reply {
+        bsup!(
+            "binder: shield3 dropped OOB txn pid={pid} code={code} dsize={} osize={}",
+            data.len(),
+            offs.len()
+        );
+        notes.push("TRANSACTION with OOB object offset -> dropped (shield3)".to_string());
+        return;
     }
     if is_reply {
         // 0.9.100 telemetry: the waiter queue is FIFO per
@@ -4845,6 +4872,19 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             notes.push("BC_REPLY with no waiter; dropped".to_string());
             return;
         };
+        if oob {
+            bsup!(
+                "binder: shield3 dropped OOB reply pid={pid} dsize={} osize={}",
+                data.len(),
+                offs.len()
+            );
+            if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
+                bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
+            }
+            binder_maybe_wake(st, &w.sender_arena, actions);
+            notes.push("REPLY with OOB object offset -> FAILED_REPLY (shield3)".to_string());
+            return;
+        }
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
         let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, actions, &mut fd_fixups);
         let delivered = binder_deliver(
