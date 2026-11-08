@@ -1940,6 +1940,17 @@ struct BinderProc {
     /// a reply meant for thread B can be drained by thread A
     /// (bootanimation's worker starved exactly this way).
     inbound: Vec<u8>,
+    /// 0.9.111 fast lane: reference notices (BR_INCREFS /
+    /// BR_ACQUIRE for this arena's own objects) live in
+    /// their own stream, ahead of inbound. The kernel
+    /// generates them during the delivery copy itself;
+    /// here they waited behind unrelated inbound traffic
+    /// for a fill, and owners freed objects in the gap
+    /// (the residual RefBase deaths). Any parked thread
+    /// of the arena may read them (GB's executeCommand
+    /// processes REF commands on whichever thread reads),
+    /// so they also wake non-loopers.
+    notices: Vec<u8>,
     queues: HashMap<i32, Vec<u8>>,
     loopers: HashSet<i32>,
 }
@@ -1953,9 +1964,9 @@ impl BinderProc {
     fn readable_for(&self, pid: i32) -> usize {
         let own = self.queues.get(&pid).map_or(0, |q| q.len());
         if self.loopers.contains(&pid) {
-            own + self.inbound.len()
+            own + self.notices.len() + self.inbound.len()
         } else {
-            own
+            own + self.notices.len()
         }
     }
     /// Copies up to `max` bytes of this thread's readable
@@ -1967,6 +1978,10 @@ impl BinderProc {
         if let Some(q) = self.queues.get(&pid) {
             let n = q.len().min(max);
             out.extend_from_slice(&q[..n]);
+        }
+        if out.len() < max {
+            let n = self.notices.len().min(max - out.len());
+            out.extend_from_slice(&self.notices[..n]);
         }
         if out.len() < max && self.loopers.contains(&pid) {
             let n = self.inbound.len().min(max - out.len());
@@ -1981,6 +1996,10 @@ impl BinderProc {
         if let Some(q) = self.queues.get_mut(&pid) {
             let n = q.len().min(max);
             out.extend(q.drain(..n));
+        }
+        if out.len() < max {
+            let n = self.notices.len().min(max - out.len());
+            out.extend(self.notices.drain(..n));
         }
         let mut from_inbound = 0;
         if out.len() < max && self.loopers.contains(&pid) {
@@ -3283,6 +3302,7 @@ fn binder_open_arena(
                 handles: HashMap::new(),
                 next_handle: 1,
                 inbound: Vec::new(),
+                notices: Vec::new(),
                 queues: HashMap::new(),
                 loopers: HashSet::new(),
             });
@@ -4278,13 +4298,13 @@ fn binder_notify_ref(
     }
     st.notify_queued += 1;
     if let Some(bp) = st.procs.get_mut(&owner) {
-        bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
-        bp.inbound.extend_from_slice(&nptr.to_le_bytes());
-        bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+        bp.notices.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bp.notices.extend_from_slice(&nptr.to_le_bytes());
+        bp.notices.extend_from_slice(&ncookie.to_le_bytes());
         if !weak {
-            bp.inbound.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
-            bp.inbound.extend_from_slice(&nptr.to_le_bytes());
-            bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+            bp.notices.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            bp.notices.extend_from_slice(&nptr.to_le_bytes());
+            bp.notices.extend_from_slice(&ncookie.to_le_bytes());
         }
     }
     binder_maybe_wake(st, &owner, actions);
@@ -4487,6 +4507,10 @@ fn binder_deliver(
             // temporaries died exactly this way: mRefs read
             // back as a small integer). Drain the shared
             // stream into the waiting thread's queue first.
+            if !bp.notices.is_empty() {
+                let pending = std::mem::take(&mut bp.notices);
+                bp.push_to(pid, &pending);
+            }
             if !bp.inbound.is_empty() {
                 let pending = std::mem::take(&mut bp.inbound);
                 bp.push_to(pid, &pending);
@@ -4522,6 +4546,10 @@ fn binder_deliver(
                     // whatever the shared stream already
                     // holds for this arena was queued before
                     // this transaction and must be read first.
+                    if !bp.notices.is_empty() {
+                        let pending = std::mem::take(&mut bp.notices);
+                        bp.push_to(p, &pending);
+                    }
                     if !bp.inbound.is_empty() {
                         let pending = std::mem::take(&mut bp.inbound);
                         bp.push_to(p, &pending);
@@ -4563,7 +4591,7 @@ fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
     let Some(bp) = st.procs.get(arena) else {
         return Vec::new();
     };
-    if bp.inbound.is_empty() && bp.queues.values().all(|q| q.is_empty()) {
+    if bp.inbound.is_empty() && bp.notices.is_empty() && bp.queues.values().all(|q| q.is_empty()) {
         return Vec::new();
     }
     // Wake exactly the parked threads that have bytes they
@@ -4580,7 +4608,10 @@ fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
             continue;
         }
         let own = bp.queues.get(pid).map_or(0, |q| q.len());
-        if own > 0 || (!bp.inbound.is_empty() && bp.loopers.contains(pid)) {
+        if own > 0
+            || !bp.notices.is_empty()
+            || (!bp.inbound.is_empty() && bp.loopers.contains(pid))
+        {
             out.push(*pid);
         }
     }
