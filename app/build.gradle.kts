@@ -87,4 +87,5 @@ dependencies {
     // (0.9.69 field failure); our own provider's
     // sockets + static export call can.
     implementation("org.conscrypt:conscrypt-android:2.5.2")
+    testImplementation("junit:junit:4.13.2")
 }

@@ -121,6 +121,8 @@ class MainActivity : Activity() {
     private lateinit var saveButton: Button
 
     private var supervisor: Process? = null
+    @Volatile
+    private var startupDiagnostics: StartupDiagnostics.Session? = null
 
     private val rootfsDir: File
         get() = File(filesDir, "vm0/rootfs")
@@ -1112,9 +1114,12 @@ class MainActivity : Activity() {
      * truncated on every start: init opens it without O_TRUNC,
      * so last session's log would otherwise be overwritten in
      * place and garbled. */
-    private fun prepareGBRootfs(rootfs: File) {
+    private fun prepareGBRootfs(rootfs: File, diagnosticsEnabled: Boolean) {
         for (d in listOf("bin", "dev", "proc", "sys", "system", "data", "data/property", "sbin", "tmp")) {
             File(rootfs, d).mkdirs()
+        }
+        for (stage in listOf("early-init", "init", "fs", "boot")) {
+            File(rootfs, ".pax-stage-$stage").delete()
         }
         // Same busybox placeholder + sh symlink arrangement as
         // the probe rootfs: the exec of /bin/sh is rewritten by
@@ -1215,7 +1220,17 @@ class MainActivity : Activity() {
                 f.deleteRecursively()
             }
         }
-        writeFresh(File(rootfs, "init.rc"), gbInitRc)
+        var initRc = gbInitRc
+        if (diagnosticsEnabled) {
+            for (stage in listOf("early-init", "init", "fs", "boot")) {
+                val action = "on $stage\n"
+                initRc = initRc.replaceFirst(
+                    action,
+                    action + "    write /.pax-stage-$stage reached\n",
+                )
+            }
+        }
+        writeFresh(File(rootfs, "init.rc"), initRc)
         writeFresh(File(rootfs, "probe.sh"), gbProbeScript)
         // The bootanimation init service's wrapper: first
         // wait until the service manager answers and
@@ -1678,11 +1693,20 @@ class MainActivity : Activity() {
         gb: Boolean = false,
     ) {
         if (supervisor != null) return
+        val diagnostics = if (gb && StartupDiagnostics.isEnabled(this)) {
+            StartupDiagnostics.newSession(this, rootfs).also {
+                startupDiagnostics = it
+                it.record("VM rootfs 準備開始。")
+            }
+        } else {
+            null
+        }
         if (gb) {
-            prepareGBRootfs(rootfs)
+            prepareGBRootfs(rootfs, diagnostics != null)
         } else {
             prepareRootfs(rootfs)
         }
+        diagnostics?.startMonitoring(mirrorLogDir)
         val libDir = applicationInfo.nativeLibraryDir
         val cmd = mutableListOf(
             "$libDir/libsupervisor.so",
@@ -1716,6 +1740,8 @@ class MainActivity : Activity() {
             // Do not swallow: packaging/exec problems surface here
             // verbatim (M0 spec risk 7, unchanged in M1).
             appendLog("[shell] failed to start supervisor: $e")
+            diagnostics?.finish("supervisor 啟動失敗：${e.javaClass.simpleName}")
+            startupDiagnostics = null
             runOnUiThread {
                 startButton.isEnabled = true
                 probeButton.isEnabled = true
@@ -1727,6 +1753,7 @@ class MainActivity : Activity() {
         }
         supervisor = proc
         sessionRan = true
+        diagnostics?.record("supervisor process 已啟動。")
         if (gb) {
             startFbPreview(rootfs)
         }
@@ -1742,6 +1769,7 @@ class MainActivity : Activity() {
         thread(name = "supervisor-reader") {
             try {
                 proc.inputStream.bufferedReader().forEachLine { line ->
+                    startupDiagnostics?.onSupervisorLine(line)
                     appendLog(line)
                 }
             } catch (_: Exception) {
@@ -1764,8 +1792,10 @@ class MainActivity : Activity() {
                     lerr.readLines().forEach { appendLog("[loader] $it") }
                 }
             }
+            startupDiagnostics?.finish("supervisor exited with code $code")
             runOnUiThread {
                 supervisor = null
+                startupDiagnostics = null
                 fbSession = null
                 startButton.isEnabled = true
                 probeButton.isEnabled = true

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.preference.Preference
 import android.preference.PreferenceFragment
+import android.preference.SwitchPreference
 
 /**
  * Settings page: the platform's own preference list
@@ -58,6 +59,19 @@ class SettingsActivity : Activity() {
             limits.summary = "phantom 監控與子行程上限"
             limits.intent = Intent(activity, SystemLimitActivity::class.java)
             screen.addPreference(limits)
+            val diagnostics = SwitchPreference(activity).apply {
+                key = StartupDiagnostics.PREF_KEY
+                title = "啟動診斷"
+                summary = "收集 Gingerbread 啟動階段與可用客體日誌；僅存本機、不自動上傳，保留最近 3 次"
+                setDefaultValue(false)
+            }
+            screen.addPreference(diagnostics)
+            val preview = Preference(activity).apply {
+                title = "檢視／匯出啟動診斷"
+                summary = "預覽最近一次記錄；匯出前會顯示隱私提醒"
+                intent = Intent(activity, StartupDiagnosticsActivity::class.java)
+            }
+            screen.addPreference(preview)
             preferenceScreen = screen
         }
     }
