@@ -4134,34 +4134,50 @@ fn exec_binder_actions(
     actions: Vec<BAction>,
     wakes: &mut Vec<i32>,
 ) -> Option<(u32, u32)> {
-    // Identify this call's binder read fill for the
-    // caller's last_binder_read record (FATAL minbuf):
-    // the batch WriteMem paired with the 24B writeback
-    // struct whose word at +16 is the batch length.
-    // (0.9.104's live-pair filtering lived here briefly;
-    // its mBase offset condemned live pairs en masse and
-    // it was removed in 0.9.105 -- see shield_ref_pairs
-    // for the layer that remains.)
+    // Pre-filter any batch WriteMem through
+    // shield_live_pairs BEFORE the actions run, fixing
+    // the paired writeback struct (24B, batch length at
+    // +16) to the filtered length -- a stale read_consumed
+    // would make the guest read past the batch into old
+    // buffer content. The identified fill is also the
+    // thread's last_binder_read for FATAL minbuf.
+    let mut actions = actions;
     let mut fill: Option<(u32, u32)> = None;
-    for a in &actions {
-        let (addr, bytes) = match a {
-            BAction::WriteMem { addr, bytes } => (*addr, bytes),
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..actions.len() {
+        let ilen = match &actions[i] {
+            BAction::WriteMem { bytes, .. } if ref_batch_qualifies(bytes) => {
+                bytes.len()
+            }
             _ => continue,
         };
-        if bytes.len() < 12 {
-            continue;
-        }
-        let paired = actions.iter().any(|b| match b {
-            BAction::WriteMem { bytes: wb, .. } => {
-                wb.len() == 24
-                    && u32::from_le_bytes(wb[16..20].try_into().unwrap())
-                        as usize
-                        == bytes.len()
+        for j in 0..actions.len() {
+            if i == j {
+                continue;
             }
-            _ => false,
-        });
-        if paired {
-            fill = Some((addr as u32, bytes.len() as u32));
+            if let BAction::WriteMem { bytes, .. } = &actions[j] {
+                if bytes.len() == 24
+                    && u32::from_le_bytes(bytes[16..20].try_into().unwrap())
+                        as usize
+                        == ilen
+                {
+                    pairs.push((i, j));
+                }
+            }
+        }
+    }
+    for (i, j) in pairs {
+        let (baddr, newlen) = match &mut actions[i] {
+            BAction::WriteMem { addr, bytes } => {
+                let filtered = shield_live_pairs(pid, std::mem::take(bytes));
+                *bytes = filtered;
+                (*addr, bytes.len() as u32)
+            }
+            _ => continue,
+        };
+        fill = Some((baddr as u32, newlen));
+        if let BAction::WriteMem { bytes, .. } = &mut actions[j] {
+            bytes[16..20].copy_from_slice(&newlen.to_le_bytes());
         }
     }
     for a in actions {
@@ -5215,6 +5231,86 @@ fn shield_ref_pairs(
     out
 }
 
+/// Strict batch shape check for shield_live_pairs: the
+/// buffer walks end-to-end on known BR opcodes only and
+/// contains at least one REF pair.
+fn ref_batch_qualifies(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let mut off = 0usize;
+    let mut has_ref = false;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        match cmd {
+            BR_TRANSACTION
+            | BR_REPLY
+            | BR_INCREFS
+            | BR_ACQUIRE
+            | 0x8008_7209
+            | 0x8008_720a
+            | BR_DEAD_BINDER
+            | BR_CLEAR_DEATH_NOTIFICATION_DONE
+            | 0x8000_7200
+            | BR_DEAD_REPLY
+            | BR_TRANSACTION_COMPLETE => {}
+            _ => return false,
+        }
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            has_ref = true;
+        }
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            return false;
+        }
+        off += len;
+    }
+    off == bytes.len() && has_ref
+}
+
+/// 0.9.106 shield, second layer (worker side, at the two
+/// fill applications): validate each REF pair's referent
+/// with the guest's own invariant -- the word at refs+8
+/// (weakref_impl::mBase) must equal the obj word.
+/// Layout settled from the donor GB libutils.so, not
+/// from memory: attemptIncStrong CASes [this+0] against
+/// INITIAL_STRONG_VALUE (mStrong at +0), incWeak and
+/// getWeakCount use +4 (mWeak), so mBase is +8. (The
+/// 0.9.104 attempt read +12 -- that is mFlags, normally
+/// zero -- and condemned every live pair; removed in
+/// 0.9.105.) A pair that fails, or whose refs are
+/// unmapped, is cut whole and logged.
+fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
+    if !ref_batch_qualifies(&bytes) {
+        return bytes;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(&bytes, off);
+        let len = br_one_len(cmd);
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            let a = u32_at(&bytes, off + 4);
+            let b = u32_at(&bytes, off + 8);
+            let mbase = read_mem_vec(pid, (a as u64) + 8, 4)
+                .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()));
+            if mbase != Some(b) {
+                sup!(
+                    "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={}",
+                    mbase
+                        .map(|m| format!("0x{m:x}"))
+                        .unwrap_or_else(|| "<unmapped>".to_string())
+                );
+                off += len;
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes[off..off + len]);
+        off += len;
+    }
+    out
+}
+
 /// One-shot latch for the success-side VMA sample.
 static MPROT_OK_SAMPLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -5643,6 +5739,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
+    let bytes = shield_live_pairs(pid, bytes);
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
     }
