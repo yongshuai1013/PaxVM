@@ -27,7 +27,7 @@
 
 mod names32;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
@@ -2118,6 +2118,44 @@ impl ServingStack {
     }
 }
 
+/// One large transaction parcel kept in an arena's
+/// ignition evidence ring (0.9.131): the translated
+/// bytes exactly as delivered, capped at 8KB (a longer
+/// parcel is truncated in storage and the dump says
+/// so), with the identity the big-txn dump line
+/// carries -- (sender, code, slot) joins a stored
+/// parcel to that line, which is the delivery's place
+/// in the session log (the supervisor numbers no log
+/// lines of its own).
+struct BigTxnRec {
+    code: u32,
+    sender_pid: i32,
+    full_size: usize,
+    slot: u32,
+    bytes: Vec<u8>,
+}
+
+/// Per-arena ignition evidence (0.9.131, telemetry
+/// only): the last two large transactions delivered
+/// into the arena and the last 24 short event tags
+/// naming what the binder driver did to or for this
+/// arena's process (deliveries, shield3/4 intercepts,
+/// claims, pops, FAILED/DEAD_REPLY answers). Written
+/// by the evidence_* helpers at the delivery /
+/// intercept / claim / pop sites, read only by
+/// binder_ignition_dump, and cleared when the arena
+/// dies (binder_on_proc_exit). An arena is one guest
+/// process in this driver, so the ring is the
+/// process's evidence; the dump trigger names a pid
+/// and resolves its arena through thread_arena.
+/// Worst case per arena: 2 x 8KB of parcel bytes plus
+/// 24 short strings -- about 19KB.
+#[derive(Default)]
+struct PidEvidence {
+    big: VecDeque<BigTxnRec>,
+    tags: VecDeque<String>,
+}
+
 #[derive(Default)]
 struct BinderState {
     procs: HashMap<String, BinderProc>,
@@ -2199,6 +2237,13 @@ struct BinderState {
     /// so a batch's claims can be told apart from a
     /// nested fill's. Telemetry only, like claim_seq.
     fill_seq: u64,
+    /// 0.9.131: per-arena ignition evidence rings (see
+    /// PidEvidence). Telemetry only -- written by the
+    /// evidence_* record helpers, read only by
+    /// binder_ignition_dump, never consulted by any
+    /// pairing, delivery, shield or settlement
+    /// decision.
+    evidence: HashMap<String, PidEvidence>,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -2375,6 +2420,16 @@ const MSG_ONEWAY_ASHMEM_SET_SIZE: u8 = 23;
 const MSG_ONEWAY_ASHMEM_SET_PROT: u8 = 24;
 // S2 (sharding): routing, credential book and handoff.
 const MSG_REQ_VCRED: u8 = 8;
+// 0.9.131: the tracer asks the coordinator to print
+// one pid's ignition evidence ring (trigger B: a
+// FATAL whose pc lands in the dvmAbort range) and
+// replays the captured lines beside the FATAL line.
+// A request (not a oneway) on purpose: oneway-path
+// cap_log lines never reach the log (the next
+// request's cap_clear discards them -- the
+// shield-cookie suspect line is the field proof),
+// while a reply carries its logs in order.
+const MSG_REQ_IGNITION_DUMP: u8 = 9;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -2397,6 +2452,7 @@ const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
 const MSG_PUSH_DUMP_STACKS: u8 = 43;
 const MSG_RESP_VCRED: u8 = 108;
+const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -3057,6 +3113,22 @@ impl CoordClient {
         Some((logs, dwakes))
     }
 
+    /// 0.9.131 ignition forensics, trigger B plumbing:
+    /// ask the coordinator to print one pid's ignition
+    /// evidence ring (the coordinator owns the binder
+    /// state) and hand the captured lines back for
+    /// in-order replay beside the FATAL line, exactly
+    /// like thread_exit. Whether the pc qualifies is
+    /// the caller's judgement (see the FATAL site).
+    fn ignition_dump(&mut self, pid: i32, trigger: &str) -> Vec<(String, String)> {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.string(trigger);
+        let p = self.rpc(MSG_REQ_IGNITION_DUMP, &e.0, MSG_RESP_IGNITION_DUMP);
+        let mut d = Dec::new(&p);
+        d.logs()
+    }
+
     fn set_context_mgr(
         &mut self,
         pid: i32,
@@ -3358,6 +3430,13 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
                 if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                     bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
                 }
+                // 0.9.131: the DEAD_REPLY is an event in
+                // the waiter's evidence ring.
+                evidence_tag(
+                    st,
+                    &w.sender_arena,
+                    format!("dead-reply code={} thread={pid}", w.code),
+                );
                 binder_maybe_wake_pids(st, &w.sender_arena, &mut dwakes);
             }
         }
@@ -4023,6 +4102,15 @@ impl CoordServer {
                     None => e.bool(false),
                 }
                 self.send_to(ci, MSG_RESP_VCRED, &e.0);
+            }
+            MSG_REQ_IGNITION_DUMP => {
+                let pid = d.i32();
+                let trigger = d.string();
+                cap_clear();
+                binder_ignition_dump(&self.st, pid, &trigger);
+                let mut e = Enc::new();
+                e.logs(&cap_take());
+                self.send_to(ci, MSG_RESP_IGNITION_DUMP, &e.0);
             }
             MSG_ONEWAY_PARK => {
                 let pid = d.i32();
@@ -5073,6 +5161,118 @@ fn claim_key_node(st: &BinderState, w: &ReplyWait) -> (u32, u32) {
     }
 }
 
+/// 0.9.131: record one short event tag in an arena's
+/// ignition evidence ring (see PidEvidence). Pure
+/// bookkeeping for the ignition dump; nothing reads
+/// the ring back into any decision.
+fn evidence_tag(st: &mut BinderState, arena: &str, tag: String) {
+    let e = st.evidence.entry(arena.to_string()).or_default();
+    if e.tags.len() >= 24 {
+        e.tags.pop_front();
+    }
+    e.tags.push_back(tag);
+}
+
+/// 0.9.131: keep a large delivered transaction's
+/// parcel in the receiving arena's evidence ring
+/// (bytes capped at 8KB; see BigTxnRec).
+fn evidence_big_txn(
+    st: &mut BinderState,
+    arena: &str,
+    code: u32,
+    sender_pid: i32,
+    slot: u32,
+    tdata: &[u8],
+) {
+    let e = st.evidence.entry(arena.to_string()).or_default();
+    let keep = tdata.len().min(8192);
+    e.big.push_back(BigTxnRec {
+        code,
+        sender_pid,
+        full_size: tdata.len(),
+        slot,
+        bytes: tdata[..keep].to_vec(),
+    });
+    while e.big.len() > 2 {
+        e.big.pop_front();
+    }
+}
+
+/// The dvmAbort pc range for the ignition dump's
+/// trigger B (checked tracer-side at the FATAL site).
+/// The 0.9.130 line-three forensics pinned the field
+/// signature (0.9.126 through 0.9.130) to pc
+/// 0x8004612c, inside libdvm's dvmAbort body (VA
+/// 0x46105, 68 bytes: Dalvik's internal-check failure
+/// path, which deliberately jumps at the 0xdeadd00d
+/// poison address); the range below is that page with
+/// margin. A constant, not a lookup: the guest libdvm
+/// is one fixed build in this rootfs.
+const DVMABORT_PC_LO: u64 = 0x8004_6000;
+const DVMABORT_PC_HI: u64 = 0x8004_7000;
+
+/// 0.9.131 ignition dump: print one guest process's
+/// evidence ring (see PidEvidence) -- the last two
+/// large transactions delivered to it, in full, and
+/// its last 24 event tags. Fired from two triggers:
+/// (A) in binder_send_txn, when the pid sends its
+/// crash report (code 2 on the IActivityManager
+/// interface -- the parcel's own token is the AMS
+/// identity; binder nodes carry no name registry in
+/// this driver), and (B) over MSG_REQ_IGNITION_DUMP,
+/// when the tracer sees a FATAL in the dvmAbort pc
+/// range above. The guest's logcat near-window is
+/// deliberately NOT part of the group: the guest's
+/// /dev/log/* are path-translated files under the
+/// rootfs that the supervisor never parses or
+/// streams, and no channel it owns carries logcat
+/// text (the [guest] channel is the guest console) --
+/// the end line below is the offline anchor the
+/// forensics align the packaged log-*.txt files
+/// against. Volume: a stored parcel prints at most
+/// 3072 of its bytes (96 hex lines), so one trigger
+/// stays under ~230 lines. Log only throughout.
+fn binder_ignition_dump(st: &BinderState, pid: i32, trigger: &str) {
+    let arena = st.thread_arena.get(&pid).cloned();
+    let ev = arena.as_ref().and_then(|a| st.evidence.get(a));
+    bsup!(
+        "binder: ignition dump pid={pid} trigger={trigger} arena={} evidence={}",
+        arena.as_deref().unwrap_or("-"),
+        if ev.is_some() { "yes" } else { "none" }
+    );
+    if let Some(ev) = ev {
+        for (n, rec) in ev.big.iter().enumerate() {
+            bsup!(
+                "binder: ignition bigtxn pid={pid} n={n} code={} from={} size={} slot={} stored={} truncated={}",
+                rec.code,
+                rec.sender_pid,
+                rec.full_size,
+                rec.slot,
+                rec.bytes.len(),
+                rec.full_size > rec.bytes.len()
+            );
+            let show = rec.bytes.len().min(3072);
+            for (i, chunk) in rec.bytes[..show].chunks(32).enumerate() {
+                bsup!(
+                    "binder: ignition hex pid={pid} n={n} off={} {}",
+                    i * 32,
+                    hex_head(chunk, 32)
+                );
+            }
+            if show < rec.bytes.len() {
+                bsup!(
+                    "binder: ignition hex pid={pid} n={n} print-truncated stored={} shown={show}",
+                    rec.bytes.len()
+                );
+            }
+        }
+        for (i, t) in ev.tags.iter().enumerate() {
+            bsup!("binder: ignition tag pid={pid} i={i} {t}");
+        }
+    }
+    bsup!("binder: ignition dump end pid={pid}");
+}
+
 fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -5257,6 +5457,10 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 "binder: reply-pair unmatched sender={pid} size={} dropped",
                 data.len()
             );
+            // 0.9.131: the orphan reply belongs in the
+            // replier's own evidence ring (there is no
+            // waiter's ring to charge it to).
+            evidence_tag(st, arena, format!("unmatched size={}", data.len()));
             notes.push(
                 "BC_REPLY with no claimed waiter; dropped (reply-pair unmatched)"
                     .to_string(),
@@ -5283,6 +5487,13 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 data.len()
             );
         }
+        // 0.9.131: the pop is an event in the replier's
+        // own evidence ring.
+        evidence_tag(
+            st,
+            arena,
+            format!("pop seq={claim_seq} size={} first=0x{first_word:x}", data.len()),
+        );
         // 0.9.129 c1/c2 separation, first half (telemetry
         // only): for large replies, name the guest
         // address the data was copied from. The re-read
@@ -5328,6 +5539,15 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 "binder: shield3 dropped OOB reply pid={pid} dsize={} osize={}",
                 data.len(),
                 offs.len()
+            );
+            // 0.9.131: the intercept is an event in the
+            // waiter's evidence ring (s9-130-swap-verify
+            // Q4's open question (ii): what follows a
+            // shield intercept in the same app).
+            evidence_tag(
+                st,
+                &w.sender_arena,
+                format!("shield3 size={} seq={claim_seq}", data.len()),
             );
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
@@ -5387,6 +5607,15 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 w.sender_pid,
                 data.len()
             );
+            // 0.9.131: same evidence-ring tag as shield3.
+            evidence_tag(
+                st,
+                &w.sender_arena,
+                format!(
+                    "shield4 size={} first=0x{first_word:x} seq={claim_seq}",
+                    data.len()
+                ),
+            );
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
@@ -5418,6 +5647,13 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
+            // 0.9.131: the FAILED_REPLY answer is an
+            // event in the waiter's evidence ring.
+            evidence_tag(
+                st,
+                &w.sender_arena,
+                format!("failed-reply size={} seq={claim_seq}", tdata.len()),
+            );
         }
         binder_maybe_wake(st, &w.sender_arena, actions);
         bsup!(
@@ -5425,6 +5661,17 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             tdata.len(),
             w.sender_pid
         );
+        // 0.9.131: a successful delivery is an event in
+        // the waiter's evidence ring (gated on
+        // delivered_ok -- the line above prints either
+        // way, the ring should not).
+        if delivered_ok {
+            evidence_tag(
+                st,
+                &w.sender_arena,
+                format!("reply size={} seq={claim_seq} from={pid}", tdata.len()),
+            );
+        }
         // 0.9.124 telemetry: photograph any parcel this
         // pairing path actually sent out as a reply whose
         // size falls outside the honest reply set {4, 8,
@@ -5590,6 +5837,22 @@ fn binder_send_txn(
             "binder: txn detail from pid={pid} code={code} flags=0x{flags:x} offs={}B token='{tok}'",
             offs.len()
         );
+        // 0.9.131 ignition forensics, trigger A: a
+        // code-2 transaction on the IActivityManager
+        // interface is a dying app's crash report (the
+        // field census behind s9-130-swap-verify Q2:
+        // every tenure's ignition anchors on one).
+        // Print the sender's evidence ring BEFORE this
+        // transaction is translated or delivered, so
+        // the group shows the bind-family parcels and
+        // intercepts that preceded the crash, not the
+        // report itself. The parcel's own interface
+        // token is the AMS identity here: binder nodes
+        // carry no name registry in this driver, and
+        // the token is what the caller itself declared.
+        if code == 2 && tok == "android.app.IActivityManager" {
+            binder_ignition_dump(st, pid, "crash-report");
+        }
     }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
     let tdata = binder_translate(st, arena, &owner, &data, &offs, actions, &mut fd_fixups);
@@ -5603,6 +5866,13 @@ fn binder_send_txn(
         if let Some(bp) = st.procs.get_mut(arena) {
             bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
+        // 0.9.131: the refusal is part of the sender's
+        // ignition evidence (see PidEvidence).
+        evidence_tag(
+            st,
+            arena,
+            format!("dead-reply code={code} size={}", data.len()),
+        );
         notes.push(format!("TRANSACTION target cannot receive ({why}) -> DEAD_REPLY"));
         return;
     }
@@ -5623,7 +5893,21 @@ fn binder_send_txn(
             delivered_off.unwrap_or(0),
             hex_head(&tdata, 32)
         );
+        // 0.9.131: keep the parcel itself in the
+        // receiving arena's ignition evidence ring --
+        // the bind-family parcels this photographs are
+        // exactly what an ignition dump needs verbatim
+        // (s9-130-swap-verify Q4). Storage only; the
+        // delivery above is already complete.
+        evidence_big_txn(st, owner, code, pid, delivered_off.unwrap_or(0), &tdata);
     }
+    // 0.9.131: every successful delivery leaves a
+    // short tag in the receiving arena's evidence ring.
+    evidence_tag(
+        st,
+        owner,
+        format!("txn code={code} size={} from={pid}", tdata.len()),
+    );
     if flags & TF_ONE_WAY == 0 {
         st.waiters.entry(owner.to_string()).or_default().push(ReplyWait {
             sender_pid: pid,
@@ -5907,7 +6191,7 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // scalars and its frame's claim sequence
             // number, copied out before the wait moves
             // into the frame (claim dump after the push).
-            let mut claimed_key: Option<(u64, i32, u32, u32, u32, u32)> = None;
+            let mut claimed_key: Option<(u64, i32, String, u32, u32, u32, u32)> = None;
             if flags & TF_ONE_WAY == 0 {
                 let sender_arena = st.thread_arena.get(&sender_pid).cloned();
                 let node_idx = st.nodes.iter().position(|n| {
@@ -5978,6 +6262,12 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                         claimed_key = Some((
                             st.claim_seq,
                             w.sender_pid,
+                            // 0.9.131: the waiter's arena,
+                            // carried for the evidence-ring
+                            // tags at the claim dump below
+                            // (telemetry only, like the
+                            // rest of this tuple).
+                            w.sender_arena.clone(),
                             kptr,
                             kcookie,
                             w.code,
@@ -6021,10 +6311,24 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // not be separated (s9-127-big-reply Q5).
             // Log only; the push above is the last state
             // change in this iteration either way.
-            if let Some((seq, wsender, kptr, kcookie, wcode, whandle)) = claimed_key {
+            if let Some((seq, wsender, wsarena, kptr, kcookie, wcode, whandle)) = claimed_key {
                 bsup!(
                     "binder: claim dump claim_seq={seq} fill_id={fid} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
                     stack.depth()
+                );
+                // 0.9.131: the claim is an event in both
+                // parties' evidence rings -- the waiter's
+                // (its call is now being served) and the
+                // reader's (it took the call on).
+                evidence_tag(
+                    st,
+                    &wsarena,
+                    format!("claim code={wcode} seq={seq} by={pid}"),
+                );
+                evidence_tag(
+                    st,
+                    arena,
+                    format!("serve code={wcode} seq={seq} for={wsender}"),
                 );
             }
         }
@@ -6714,6 +7018,10 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     if st.thread_arena.values().any(|a| a == arena) {
         return; // sibling threads still hold this arena
     }
+    // 0.9.131: the arena is really gone (the guard
+    // above held while sibling threads remained); its
+    // ignition evidence ring dies with it.
+    st.evidence.remove(arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
             "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={}",
@@ -10023,6 +10331,21 @@ fn tracer_loop(ctx: TracerCtx) {
                     );
                 } else {
                     sup!("FATAL sig={sig} pid={pid} pc=0x{pc:x} (no siginfo){regdump}");
+                }
+                // 0.9.131 ignition forensics, trigger B:
+                // a SIGSEGV whose pc lands in the
+                // dvmAbort range (see DVMABORT_PC_LO/HI
+                // at binder_ignition_dump: Dalvik's
+                // internal-check suicide, not a wild
+                // pointer) gets the dying pid's binder
+                // evidence ring printed beside this
+                // FATAL line -- the deliveries, shield
+                // intercepts and claims that preceded
+                // the abort, readable directly instead
+                // of reconstructed from the whole log.
+                if sig == 11 && (DVMABORT_PC_LO..DVMABORT_PC_HI).contains(&pc) {
+                    let logs = coord.ignition_dump(pid, "dvmabort");
+                    replay_logs(logs);
                 }
                 // 0.9.102: dump the tracee's binder input
                 // buffer (its most recent read fill) verbatim.
