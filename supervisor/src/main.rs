@@ -1950,6 +1950,12 @@ struct BinderProc {
     /// it happens.
     free_parcel_hit: u32,
     free_miss: u32,
+    /// BC_FREE_BUFFER rescue hits (0.9.119): the freeing
+    /// thread's own base missed (or it had none), but the
+    /// pointer resolved against another registered base of
+    /// the same arena and the free landed. Reported at
+    /// arena death alongside the other free counters.
+    free_rescued: u32,
     /// handle -> node index (handle 0 is the context manager
     /// in every process and is never stored here)
     handles: HashMap<u32, usize>,
@@ -3312,6 +3318,7 @@ fn binder_open_arena(
                 free_stale: 0,
                 free_parcel_hit: 0,
                 free_miss: 0,
+                free_rescued: 0,
                 handles: HashMap::new(),
                 next_handle: 1,
                 inbound: Vec::new(),
@@ -4694,20 +4701,55 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 let ptr = u32_at(stream, cur);
                 cur += 4;
                 if let Some(bp) = st.procs.get_mut(arena) {
-                    match bp.base.get(&pid) {
-                        Some(&base) => {
-                            let off = ptr.wrapping_sub(base);
+                    // Path 1 (unchanged): the freeing thread's
+                    // own registered base.
+                    let mut freed = false;
+                    if let Some(&base) = bp.base.get(&pid) {
+                        let off = ptr.wrapping_sub(base);
+                        if let Some(sz) = bp.used.remove(&off) {
+                            bp.free.push((off, sz));
+                            if bp.parcels.remove(&off).is_some() {
+                                bp.free_parcel_hit += 1;
+                            }
+                            bp.free_hit += 1;
+                            freed = true;
+                        }
+                    }
+                    if !freed {
+                        // Rescue (0.9.119): a buffer can be
+                        // freed by a thread whose own base was
+                        // never registered, or whose offset
+                        // misses under its own base; before
+                        // this, such a free was dropped whole
+                        // and the parcel leaked for the life
+                        // of the arena. Try every distinct
+                        // registered base of this arena: the
+                        // buffer lives at exactly one offset
+                        // in the used table.
+                        let mut bases: Vec<u32> =
+                            bp.base.values().copied().collect();
+                        bases.sort_unstable();
+                        bases.dedup();
+                        for base in bases {
+                            let Some(off) = ptr.checked_sub(base) else {
+                                continue;
+                            };
                             if let Some(sz) = bp.used.remove(&off) {
                                 bp.free.push((off, sz));
                                 if bp.parcels.remove(&off).is_some() {
                                     bp.free_parcel_hit += 1;
                                 }
                                 bp.free_hit += 1;
-                            } else {
-                                bp.free_stale += 1;
+                                bp.free_rescued += 1;
+                                freed = true;
+                                break;
                             }
                         }
-                        None => {
+                    }
+                    if !freed {
+                        if bp.base.contains_key(&pid) {
+                            bp.free_stale += 1;
+                        } else {
                             bp.free_nobase += 1;
                             bp.free_miss += 1;
                             bsup!(
@@ -5935,7 +5977,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -5943,7 +5985,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.notify_queued,
             st.shield_drops,
             bp.free_parcel_hit,
-            bp.free_miss
+            bp.free_miss,
+            bp.free_rescued
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
