@@ -5205,6 +5205,26 @@ fn binder_send_txn(
         });
     }
     if let Some(bp) = st.procs.get_mut(arena) {
+        // Kernel ordering: 81e7dc2 flushed the shared
+        // inbound stream ahead of BR_REPLY (and ahead of
+        // direct looper delivery), but the completion
+        // word took the same two-queue shortcut it fixed
+        // elsewhere: binder_translate queued this
+        // transaction's reference notices into this
+        // arena's inbound stream, yet the reads fill from
+        // the sender's personal queue first, so a
+        // one-way sender read BR_TRANSACTION_COMPLETE,
+        // returned from transact and dropped the last
+        // strong ref of the very object it had just sent
+        // before reaching the pending BR_ACQUIRE, which
+        // then incStrong'd a dead cookie (S-B). Drain
+        // the stream into the sender's queue first, so
+        // it reads [..., notices, TRANSACTION_COMPLETE].
+        if !bp.inbound.is_empty() {
+            let pending = std::mem::take(&mut bp.inbound);
+            bp.push_to(pid, &pending);
+            bsup!("binder: flushed pending inbound ahead of transaction-complete to pid={pid}");
+        }
         bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
     }
     binder_maybe_wake(st, &owner, actions);
