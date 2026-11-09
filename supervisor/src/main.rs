@@ -7965,10 +7965,12 @@ fn do_handoff(
 /// driver (nobody is sending -- a sender / dependency
 /// problem) versus threads stopped inside synchronous
 /// calls awaiting replies (a peer problem). Purely
-/// additive: the caller invokes this from the
-/// signal-delivery stop and reinjects the signal
-/// exactly as before. Returns true when the snapshot
-/// was printed (the caller spends the one-shot).
+/// additive: callers (0.9.123: the kill-syscall hook
+/// in the entry stop, primarily; the signal-delivery
+/// stop as backstop) invoke this with the SIGQUIT's
+/// target and leave signal handling exactly as
+/// before. Returns true when the snapshot was
+/// printed (the caller spends the one-shot).
 fn wedge_snapshot(
     trig: i32,
     procs: &HashMap<i32, ProcState>,
@@ -8233,6 +8235,12 @@ fn tracer_loop(ctx: TracerCtx) {
         }
 
         let mut pending_handoff: Option<(i32, u8, bool)> = None;
+        // Wedge forensics (0.9.123): a kill-family entry
+        // stop that aims SIGQUIT at a pid records the
+        // target here; the snapshot fires after the
+        // stop's handlers release their &mut borrow of
+        // procs (mirrors pending_handoff).
+        let mut wedge_kill_target: Option<i32> = None;
         if sig == SYSCALL_STOP_SIG {
             let Some(proc) = procs.get_mut(&pid) else {
                 cont_syscall(pid, 0);
@@ -8934,6 +8942,14 @@ fn tracer_loop(ctx: TracerCtx) {
                             nr_name(proc.compat, nr),
                             nr
                         );
+                        // Wedge forensics (0.9.123): a
+                        // SIGQUIT aimed at a named pid is
+                        // a snapshot candidate; family
+                        // membership is judged when the
+                        // target is consumed below.
+                        if signum == 3 {
+                            wedge_kill_target = Some(target as i32);
+                        }
                     }
                     *counts.entry((proc.compat, nr)).or_insert(0) += 1;
                     if seen.insert((proc.compat, nr)) {
@@ -9151,6 +9167,32 @@ fn tracer_loop(ctx: TracerCtx) {
             if let Some((hpid, twid, root)) = pending_handoff.take() {
                 do_handoff(hpid, twid, root, wid, &mut procs, &mut vcreds, &mut coord);
             }
+            // Wedge forensics (0.9.123): the kill-syscall
+            // hook is the snapshot's primary trigger.
+            // 0.9.122 hooked the signal-delivery stop, and
+            // its field run fired zero times: a wedged
+            // family thread sits in a ptrace stop the
+            // supervisor never restarts, so the queued
+            // SIGQUIT raises no delivery stop before the
+            // watchdog's SIGKILL terminates the stopped
+            // tracee and discards it. Firing here -- at
+            // the sender's entry stop, the first moment
+            // the SIGQUIT exists -- reaches the wedge by
+            // construction. The one-shot flag and
+            // wedge_snapshot itself are 0.9.122's,
+            // unchanged; the delivery-stop hook below
+            // stays as a backstop under the same flag for
+            // any SIGQUIT that does get delivered (a
+            // running, unparked family thread).
+            if let Some(tp) = wedge_kill_target.take() {
+                if !wedge_snapped {
+                    if let Some(leader) = dump_candidate {
+                        if wedge_snapshot(tp, &procs, leader) {
+                            wedge_snapped = true;
+                        }
+                    }
+                }
+            }
         } else if sig == SIGTRAP && event == PTRACE_EVENT_EXEC {
             // The exec event stop sits between the execve entry and
             // exit stops; surface the entry's description here and
@@ -9276,12 +9318,16 @@ fn tracer_loop(ctx: TracerCtx) {
             // exit stop, that exit stop still follows, and the exit
             // path already tolerates a missing record.
             let mut deliver = sig;
-            // Wedge forensics (0.9.122, telemetry only):
-            // the first guest-sent SIGQUIT (3) to reach a
-            // system_server family thread spends this
-            // tenure's one state snapshot. Pure logging
-            // on the side: `deliver` and everything below
-            // proceed exactly as before.
+            // Wedge forensics (0.9.122, telemetry only;
+            // backstop since 0.9.123): the primary trigger
+            // is the kill-syscall hook in the entry stop
+            // above -- a wedged (parked) family thread
+            // never reaches this delivery stop. If a
+            // SIGQUIT (3) does get delivered to a family
+            // thread, it spends the same shared one-shot
+            // here. Pure logging on the side: `deliver`
+            // and everything below proceed exactly as
+            // before.
             if sig == 3 && !wedge_snapped {
                 if let Some(leader) = dump_candidate {
                     if wedge_snapshot(pid, &procs, leader) {
