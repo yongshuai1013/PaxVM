@@ -1467,6 +1467,8 @@ const BR_FAILED_REPLY: u32 = 0x7211;
 const BR_DEAD_BINDER: u32 = 0x8004_720f;
 const BR_INCREFS: u32 = 0x8008_7207;
 const BR_ACQUIRE: u32 = 0x8008_7208;
+const BR_DECREFS: u32 = 0x8008_7209;
+const BR_RELEASE: u32 = 0x8008_720a;
 const BINDER_WRITE_READ: u32 = 0xC018_6201;
 const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
 const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
@@ -1897,6 +1899,16 @@ struct ParcelPrint {
     total: u32,
     mask: Vec<u32>,
     head: Vec<u32>,
+    /// Death-inventory telemetry (0.9.118, ported from
+    /// 0.9.116): who sent this parcel and what it carried,
+    /// captured at delivery so an arena that dies holding
+    /// unread/unfreed parcels can name them. Read only by
+    /// the death inventory dump in binder_on_proc_exit;
+    /// delivery logic never consults these fields.
+    from_pid: i32,
+    code: u32,
+    target_ptr: u32,
+    txn_cookie: u32,
 }
 
 struct BinderProc {
@@ -1926,6 +1938,24 @@ struct BinderProc {
     free_hit: u32,
     free_nobase: u32,
     free_stale: u32,
+    /// BC_FREE_BUFFER delivery-record outcome counters
+    /// (0.9.118, ported from 0.9.117), reported when the
+    /// arena dies alongside the 0.9.99 set: free_parcel_hit
+    /// = the free removed a live ParcelPrint (the delivery
+    /// record), free_miss = the freeing thread had no
+    /// registered base and the free was dropped -- the
+    /// nobase path, counted under this name so a tenure
+    /// whose frees silently miss can be told apart from
+    /// one whose frees land; each miss is also logged as
+    /// it happens.
+    free_parcel_hit: u32,
+    free_miss: u32,
+    /// BC_FREE_BUFFER rescue hits (0.9.119): the freeing
+    /// thread's own base missed (or it had none), but the
+    /// pointer resolved against another registered base of
+    /// the same arena and the free landed. Reported at
+    /// arena death alongside the other free counters.
+    free_rescued: u32,
     /// handle -> node index (handle 0 is the context manager
     /// in every process and is never stored here)
     handles: HashMap<u32, usize>,
@@ -2032,8 +2062,14 @@ struct BinderState {
     /// (node, receiver arena) pairs already sent a
     /// BR_INCREFS(/BR_ACQUIRE) notice to the node's owner:
     /// the real driver notifies once per new reference
-    /// holder, not once per parcel (S5c)
-    ref_notified: HashSet<(usize, String)>,
+    /// holder, not once per parcel (S5c). The value is
+    /// the weak flag of the crossing that actually sent
+    /// the notice, kept so the death settlement in
+    /// binder_on_proc_exit can mirror the pair exactly
+    /// (BR_DECREFS always, BR_RELEASE only where an
+    /// ACQUIRE went out); the dedup key is the pair
+    /// alone, exactly as before (0.9.118).
+    ref_notified: HashMap<(usize, String), bool>,
     /// Count of reference notices actually queued to an
     /// owner (0.9.100's suppression experiment counted the
     /// suppressed calls here; 0.9.101 restored the notices
@@ -2043,6 +2079,14 @@ struct BinderState {
     /// 0.9.103: cumulative shield drops (see
     /// shield_ref_pairs). Reported at arena death.
     shield_drops: u64,
+    /// 0.9.120: cumulative shield-cookie suspects
+    /// reported by the workers' shield_live_pairs
+    /// probe (delivered REF pairs whose referent's
+    /// strong count already read zero, or whose
+    /// memory was unreadable). Global like
+    /// shield_drops; reported at arena death
+    /// alongside the free counters.
+    shield_cookie_suspects: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -2230,6 +2274,12 @@ const MSG_HELLO: u8 = 31;
 // SIGUSR2 stack-dump request; the coordinator
 // broadcasts it to the workers as a push.
 const MSG_ONEWAY_DUMP_REQ: u8 = 32;
+// 0.9.120: a worker's shield_live_pairs probe found a
+// delivered REF pair whose referent's strong count is
+// already zero (or unreadable); the coordinator
+// resolves the pair's node, counts it and logs it.
+// Telemetry only -- the pair is delivered regardless.
+const MSG_ONEWAY_SHIELD_COOKIE_SUSPECT: u8 = 33;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
@@ -3013,6 +3063,21 @@ impl CoordClient {
         self.send(MSG_ONEWAY_ASHMEM_SET_PROT, &e.0);
     }
 
+    /// 0.9.120 telemetry: shield_live_pairs delivered
+    /// a REF pair whose referent already looks dead
+    /// (see the probe there). The worker cannot name
+    /// the pair's node or keep the global count --
+    /// both live in the coordinator's BinderState --
+    /// so the sighting is reported, not logged here.
+    fn oneway_shield_cookie_suspect(&mut self, pid: i32, ptr: u32, cookie: u32, why: &str) {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.u32(ptr);
+        e.u32(cookie);
+        e.string(why);
+        self.send(MSG_ONEWAY_SHIELD_COOKIE_SUSPECT, &e.0);
+    }
+
     /// S2 routing: this tracer now owns `pid`, with
     /// these virtual credentials (seeds the coordinator's
     /// global credential book too).
@@ -3280,6 +3345,9 @@ fn binder_open_arena(
                 free_hit: 0,
                 free_nobase: 0,
                 free_stale: 0,
+                free_parcel_hit: 0,
+                free_miss: 0,
+                free_rescued: 0,
                 handles: HashMap::new(),
                 next_handle: 1,
                 inbound: Vec::new(),
@@ -3946,6 +4014,38 @@ impl CoordServer {
             MSG_ONEWAY_DUMP_REQ => {
                 self.push_dump_stacks();
             }
+            MSG_ONEWAY_SHIELD_COOKIE_SUSPECT => {
+                let pid = d.i32();
+                let ptr = d.u32();
+                let cookie = d.u32();
+                let why = d.string();
+                self.st.shield_cookie_suspects += 1;
+                // REF pairs in a read batch name nodes
+                // the reader's own arena owns (notices
+                // are only ever queued to the owner), so
+                // (owner, ptr, cookie) resolves the node
+                // exactly the way node_for_local keyed
+                // it; prefer the live record if a dead
+                // one happens to share the tuple.
+                let node = self.st.thread_arena.get(&pid).and_then(|owner| {
+                    let st = &self.st;
+                    st.nodes
+                        .iter()
+                        .position(|n| {
+                            !n.dead && n.owner == *owner && n.ptr == ptr && n.cookie == cookie
+                        })
+                        .or_else(|| {
+                            st.nodes.iter().position(|n| {
+                                n.owner == *owner && n.ptr == ptr && n.cookie == cookie
+                            })
+                        })
+                });
+                let node = node.map(|i| i.to_string()).unwrap_or_else(|| "-".to_string());
+                bsup!(
+                    "binder: shield-cookie suspect node={} ptr=0x{:x} cookie=0x{:x} why={}",
+                    node, ptr, cookie, why
+                );
+            }
             MSG_ONEWAY_HANDOFF => {
                 let pid = d.i32();
                 let twid = d.u8();
@@ -4176,7 +4276,7 @@ fn exec_binder_actions(
     for (i, j) in pairs {
         let (baddr, newlen) = match &mut actions[i] {
             BAction::WriteMem { addr, bytes } => {
-                let filtered = shield_live_pairs(pid, std::mem::take(bytes));
+                let filtered = shield_live_pairs(pid, std::mem::take(bytes), coord);
                 *bytes = filtered;
                 (*addr, bytes.len() as u32)
             }
@@ -4273,9 +4373,11 @@ fn binder_notify_ref(
     if dead || owner == to {
         return;
     }
-    if !st.ref_notified.insert((node, to.to_string())) {
+    let notified_key = (node, to.to_string());
+    if st.ref_notified.contains_key(&notified_key) {
         return;
     }
+    st.ref_notified.insert(notified_key, weak);
     st.notify_queued += 1;
     if let Some(bp) = st.procs.get_mut(&owner) {
         bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
@@ -4446,7 +4548,19 @@ fn binder_deliver(
             .map(|i| u32_at(&img, i * 4))
             .collect();
         let crc = crc32(&img);
-        bp.parcels.insert(off, ParcelPrint { crc, total, mask, head });
+        bp.parcels.insert(
+            off,
+            ParcelPrint {
+                crc,
+                total,
+                mask,
+                head,
+                from_pid: sender_pid,
+                code,
+                target_ptr,
+                txn_cookie: cookie,
+            },
+        );
     }
     if !offs.is_empty() {
         let bases: Vec<String> = bp
@@ -4648,19 +4762,60 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 let ptr = u32_at(stream, cur);
                 cur += 4;
                 if let Some(bp) = st.procs.get_mut(arena) {
-                    match bp.base.get(&pid) {
-                        Some(&base) => {
-                            let off = ptr.wrapping_sub(base);
+                    // Path 1 (unchanged): the freeing thread's
+                    // own registered base.
+                    let mut freed = false;
+                    if let Some(&base) = bp.base.get(&pid) {
+                        let off = ptr.wrapping_sub(base);
+                        if let Some(sz) = bp.used.remove(&off) {
+                            bp.free.push((off, sz));
+                            if bp.parcels.remove(&off).is_some() {
+                                bp.free_parcel_hit += 1;
+                            }
+                            bp.free_hit += 1;
+                            freed = true;
+                        }
+                    }
+                    if !freed {
+                        // Rescue (0.9.119): a buffer can be
+                        // freed by a thread whose own base was
+                        // never registered, or whose offset
+                        // misses under its own base; before
+                        // this, such a free was dropped whole
+                        // and the parcel leaked for the life
+                        // of the arena. Try every distinct
+                        // registered base of this arena: the
+                        // buffer lives at exactly one offset
+                        // in the used table.
+                        let mut bases: Vec<u32> =
+                            bp.base.values().copied().collect();
+                        bases.sort_unstable();
+                        bases.dedup();
+                        for base in bases {
+                            let Some(off) = ptr.checked_sub(base) else {
+                                continue;
+                            };
                             if let Some(sz) = bp.used.remove(&off) {
                                 bp.free.push((off, sz));
-                                bp.parcels.remove(&off);
+                                if bp.parcels.remove(&off).is_some() {
+                                    bp.free_parcel_hit += 1;
+                                }
                                 bp.free_hit += 1;
-                            } else {
-                                bp.free_stale += 1;
+                                bp.free_rescued += 1;
+                                freed = true;
+                                break;
                             }
                         }
-                        None => {
+                    }
+                    if !freed {
+                        if bp.base.contains_key(&pid) {
+                            bp.free_stale += 1;
+                        } else {
                             bp.free_nobase += 1;
+                            bp.free_miss += 1;
+                            bsup!(
+                                "binder: free-buffer miss arena={arena} pid={pid} ptr=0x{ptr:x}"
+                            );
                         }
                     }
                 }
@@ -5371,11 +5526,27 @@ fn ref_batch_qualifies(bytes: &[u8]) -> bool {
 /// everything; that attempt was removed in 0.9.105).
 /// A pair whose link does not close, or whose memory
 /// is unmapped, is cut whole and logged.
-fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
+/// 0.9.120 adds a passive probe beside the check:
+/// each pair that passes also has the word at refs+0
+/// (weakref_impl::mStrong, same donor layout) read
+/// and classified, and a pair whose referent's
+/// strong count is already zero -- or whose memory
+/// cannot be read -- is reported to the coordinator
+/// as a shield-cookie suspect. The probe never
+/// drops: it exists to count how often a pair the
+/// link check waves through names an object the
+/// guest side has already destroyed.
+fn shield_live_pairs(pid: i32, bytes: Vec<u8>, coord: &mut CoordClient) -> Vec<u8> {
     if !ref_batch_qualifies(&bytes) {
         return bytes;
     }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    // 0.9.120: per-batch verdict cache for the
+    // mStrong probe below, keyed by (ptr, cookie):
+    // the INCREFS and the ACQUIRE of one pair name
+    // the same referent, so a suspect pair is
+    // reported once per batch, not twice.
+    let mut probe_cache: HashMap<(u32, u32), Option<&'static str>> = HashMap::new();
     let mut off = 0usize;
     while off + 4 <= bytes.len() {
         let cmd = u32_at(&bytes, off);
@@ -5401,6 +5572,38 @@ fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
                 );
                 off += len;
                 continue;
+            }
+            // 0.9.120 probe (telemetry only -- the
+            // pair is delivered either way): the link
+            // check above validates the weakref half
+            // of the referent, which by design
+            // outlives the object; read the word it
+            // is blind to, weakref_impl::mStrong at
+            // ptr+0 (donor libutils layout, see the
+            // function comment). Zero means the
+            // object's own strong count is already
+            // gone -- the referent is a husk the
+            // guest is about to dereference through
+            // the cookie. An unreadable word is
+            // reported the same way. Every other
+            // value (1.. or INITIAL_STRONG_VALUE) is
+            // unremarkable and stays silent.
+            if !probe_cache.contains_key(&(a, b)) {
+                let verdict = match read_mem_vec(pid, a as u64, 4) {
+                    Some(v) => {
+                        let mstrong = u32::from_le_bytes(v[0..4].try_into().unwrap());
+                        if mstrong == 0 {
+                            Some("strong-zero")
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some("unreadable"),
+                };
+                probe_cache.insert((a, b), verdict);
+                if let Some(why) = verdict {
+                    coord.oneway_shield_cookie_suspect(pid, a, b, why);
+                }
             }
         }
         out.extend_from_slice(&bytes[off..off + len]);
@@ -5837,7 +6040,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
-    let bytes = shield_live_pairs(pid, bytes);
+    let bytes = shield_live_pairs(pid, bytes, coord);
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
     }
@@ -5883,13 +6086,178 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
             bp.parcels.len(),
             st.notify_queued,
-            st.shield_drops
+            st.shield_drops,
+            bp.free_parcel_hit,
+            bp.free_miss,
+            bp.free_rescued,
+            st.shield_cookie_suspects
+        );
+    }
+    // 0.9.118 death inventory (telemetry only: reads
+    // state, changes nothing; ported from 0.9.116). When
+    // an arena dies holding a backlog of unfreed parcels,
+    // name what they were and who sent them, which death
+    // notices this death is about to fire, and how the
+    // global ref-notice ledger stands -- a tenure-killing
+    // backlog should identify itself, not just its size.
+    if let Some(bp) = st.procs.get(arena) {
+        if bp.parcels.len() >= 10 {
+            let total = bp.parcels.len();
+            let mut offs: Vec<u32> = bp.parcels.keys().copied().collect();
+            offs.sort_unstable();
+            for (i, &off) in offs.iter().take(200).enumerate() {
+                let pp = &bp.parcels[&off];
+                bsup!(
+                    "binder: arena {arena} death-inventory parcel {}/{}: off=0x{:x} size={} from_pid={} code={} target_ptr=0x{:x} cookie=0x{:x}",
+                    i + 1,
+                    total,
+                    off,
+                    pp.total,
+                    pp.from_pid,
+                    pp.code,
+                    pp.target_ptr,
+                    pp.txn_cookie
+                );
+            }
+            if total > 200 {
+                bsup!(
+                    "binder: arena {arena} death-inventory parcels truncated: showing 200 of {total}"
+                );
+            }
+        }
+    }
+    {
+        // Death notices this death is about to fire: the
+        // watches registered on this arena's nodes (the
+        // firing loop further down consumes exactly this
+        // set). Recipient pids are the watcher arena's
+        // registered thread pids at this instant.
+        let mut dn: Vec<(usize, &String, u32)> = Vec::new();
+        for (i, n) in st.nodes.iter().enumerate() {
+            if n.owner == arena && !n.dead {
+                if let Some(list) = st.watchers.get(&i) {
+                    for (w, c) in list {
+                        dn.push((i, w, *c));
+                    }
+                }
+            }
+        }
+        let dn_total = dn.len();
+        for (i, (node, w, c)) in dn.iter().take(200).enumerate() {
+            let mut pids: Vec<i32> = st
+                .procs
+                .get(w.as_str())
+                .map(|bp| bp.base.keys().copied().collect())
+                .unwrap_or_default();
+            pids.sort_unstable();
+            let pids: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+            bsup!(
+                "binder: arena {arena} death-inventory death-notice {}/{}: to_arena={} to_pids=[{}] node={} cookie=0x{:x}",
+                i + 1,
+                dn_total,
+                w,
+                pids.join(" "),
+                node,
+                c
+            );
+        }
+        if dn_total > 200 {
+            bsup!(
+                "binder: arena {arena} death-inventory death-notices truncated: showing 200 of {dn_total}"
+            );
+        }
+    }
+    {
+        // Global ref-notice ledger by owner arena. The
+        // 0.9.116 original tallied per-node queued flags
+        // from the 0.9.113 state machine; this tree has no
+        // such flags -- a notice is pushed straight into
+        // the owner's inbound stream at crossing time, and
+        // ref_notified is the ledger of (node, holder)
+        // pairs it went out for. Tally the outstanding
+        // pairs per owner arena in one read-only pass.
+        let mut by_owner: HashMap<String, u32> = HashMap::new();
+        for ((node, _holder), _weak) in &st.ref_notified {
+            if let Some(n) = st.nodes.get(*node) {
+                *by_owner.entry(n.owner.clone()).or_default() += 1;
+            }
+        }
+        if by_owner.is_empty() {
+            bsup!("binder: arena {arena} death-inventory pending-ref-notices global: none");
+        } else {
+            let mut owners: Vec<&String> = by_owner.keys().collect();
+            owners.sort();
+            let parts: Vec<String> = owners
+                .iter()
+                .map(|o| format!("{o} notified={}", by_owner[*o]))
+                .collect();
+            bsup!(
+                "binder: arena {arena} death-inventory pending-ref-notices global: {}",
+                parts.join("; ")
+            );
+        }
+    }
+    // C2 death settlement (0.9.118, ported from 0.9.117
+    // to this tree's reference model): references this
+    // arena held on other arenas' nodes were announced
+    // to their owners with BR_INCREFS(/BR_ACQUIRE) when
+    // the objects crossed (binder_notify_ref) and are
+    // ledgered in ref_notified. The holder is gone now;
+    // settle every pair the way the real driver does --
+    // queue BR_DECREFS (plus BR_RELEASE where the hold
+    // was strong) to the node's owner and forget the
+    // pair -- instead of leaking one count per tenure on
+    // every long-lived owner's books. Only this arena's
+    // holds are touched: no node is destroyed, no other
+    // arena's parcels move, notify_queued is untouched,
+    // and the death-notice firing further down runs
+    // exactly as before. Parcels left in the dead arena
+    // are counted as settled: in this tree they carry no
+    // per-parcel ref records, and the buffer table dies
+    // with the arena record.
+    {
+        let parcels_left = st.procs.get(arena).map_or(0, |bp| bp.parcels.len());
+        let held: Vec<(usize, bool)> = st
+            .ref_notified
+            .iter()
+            .filter(|(k, _)| k.1 == arena)
+            .map(|(k, w)| (k.0, *w))
+            .collect();
+        let mut nodes_touched: HashSet<usize> = HashSet::new();
+        let mut settle_owners: HashSet<String> = HashSet::new();
+        let mut refs_returned = 0usize;
+        for (node, weak) in held {
+            st.ref_notified.remove(&(node, arena.to_string()));
+            nodes_touched.insert(node);
+            let Some(n) = st.nodes.get(node) else {
+                continue;
+            };
+            let (owner, nptr, ncookie) = (n.owner.clone(), n.ptr, n.cookie);
+            if let Some(bp) = st.procs.get_mut(&owner) {
+                bp.inbound.extend_from_slice(&BR_DECREFS.to_le_bytes());
+                bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+                bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+                if !weak {
+                    bp.inbound.extend_from_slice(&BR_RELEASE.to_le_bytes());
+                    bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+                    bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+                }
+                refs_returned += 1;
+                settle_owners.insert(owner);
+            }
+        }
+        for owner in settle_owners {
+            binder_maybe_wake_pids(st, &owner, wakes);
+        }
+        bsup!(
+            "binder: arena {arena} death-settle parcels={parcels_left} refs_returned={refs_returned} nodes_touched={}",
+            nodes_touched.len()
         );
     }
     // Queued manager transactions from this arena's
