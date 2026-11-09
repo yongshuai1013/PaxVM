@@ -2044,6 +2044,36 @@ struct ReplyWait {
     sender_arena: String,
     cookie: u32,
     target_handle: u32,
+    /// Transaction code of the call being waited on
+    /// (0.9.125): part of the identity a serving thread
+    /// claims this wait by when the fill hands it the
+    /// transaction parcel (binder_claim_fills).
+    code: u32,
+}
+
+/// One frame of a serving thread's transaction stack
+/// (0.9.125). Reply = a claimed two-way wait this thread
+/// owes an answer; Other = a transaction that owes none
+/// (one-way, or a two-way parcel whose wait record could
+/// not be claimed -- the miss is logged at fill time and
+/// the orphan wait stays in the shared queue).
+enum ServingFrame {
+    Reply(ReplyWait),
+    Other,
+}
+
+/// A serving thread's transaction stack (0.9.125): the
+/// supervisor-side mirror of the kernel's per-thread
+/// transaction stack. A two-way wait lives in the shared
+/// per-arena queue only until a read fill hands the
+/// transaction parcel to a serving thread; the claim
+/// (binder_claim_fills) moves it here, and the thread's
+/// later BC_REPLY answers the newest Reply frame --
+/// never a stranger picked off the shared queue.
+struct ServingStack {
+    /// Arena the serving thread belongs to.
+    arena: String,
+    frames: Vec<ServingFrame>,
 }
 
 #[derive(Default)]
@@ -2055,6 +2085,11 @@ struct BinderState {
     parked: HashMap<i32, ParkedIoctl>,
     /// target arena -> processes waiting for a reply from it
     waiters: HashMap<String, Vec<ReplyWait>>,
+    /// 0.9.125: per-serving-thread transaction stacks
+    /// (see ServingStack): where a reply wait lives once
+    /// the parcel has been handed to a serving thread,
+    /// and where a BC_REPLY finds the wait it answers.
+    serving: HashMap<i32, ServingStack>,
     /// node index -> (watcher arena, cookie) death watches
     watchers: HashMap<usize, Vec<(String, u32)>>,
     thread_arena: HashMap<i32, String>,
@@ -2087,6 +2122,13 @@ struct BinderState {
     /// shield_drops; reported at arena death
     /// alongside the free counters.
     shield_cookie_suspects: u64,
+    /// 0.9.125: cumulative BC_REPLYs dropped because the
+    /// replier's serving stack held no claimed wait for
+    /// them (identity-bound pairing: an unmatched reply
+    /// is dropped, never paired with a stranger from the
+    /// shared queue). Global like shield_drops; reported
+    /// at arena death alongside the free counters.
+    reply_unmatched: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -3228,6 +3270,24 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
         bp.loopers.remove(&pid);
     }
     let mut dwakes: Vec<i32> = Vec::new();
+    // 0.9.125: transactions this thread had claimed die
+    // with it -- a claimed wait lives only on its stack
+    // and no other thread can answer for a parcel only
+    // it consumed. Fail their callers with DEAD_REPLY
+    // now (unclaimed waits get the same treatment at
+    // arena death in binder_on_proc_exit; running this
+    // first, for every exiting thread including the
+    // arena's last, keeps each wait's failure single).
+    if let Some(stack) = st.serving.remove(&pid) {
+        for fr in stack.frames {
+            if let ServingFrame::Reply(w) = fr {
+                if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
+                    bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
+                }
+                binder_maybe_wake_pids(st, &w.sender_arena, &mut dwakes);
+            }
+        }
+    }
     binder_on_proc_exit(&a, st, &mut dwakes);
     Some(dwakes)
 }
@@ -3438,6 +3498,7 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         bp.drain_for(pid, n)
     };
     let bytes = shield_ref_pairs(st, &arena, pid, bytes);
+    binder_claim_fills(st, &arena, pid, &bytes);
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -5014,33 +5075,80 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         return;
     }
     if is_reply {
-        // 0.9.100 telemetry: the waiter queue is FIFO per
-        // serving arena (the real driver routes a reply to
-        // the exact thread that sent the request). Only log
-        // when a reply is paired while more than one waiter
-        // is outstanding -- the only case where FIFO can
-        // cross two callers.
-        if let Some(v) = st.waiters.get(arena) {
-            if v.len() > 1 {
+        // 0.9.125: pairing is by transaction identity, not
+        // by queue position. The wait this reply answers
+        // was claimed onto the replier thread's own serving
+        // stack when a read fill handed it the transaction
+        // parcel (binder_claim_fills); pop to the newest
+        // claimed wait. Other frames above it are
+        // transactions that owed no reply and are complete
+        // by the time the thread answers an older one.
+        // The shared queue's FIFO pop is gone: under
+        // concurrency it handed waiters other callers'
+        // parcels (0.9.124's reply-pair dump photographed
+        // 632-792B transaction parcels delivered as
+        // replies; the receivers died on the garbage first
+        // word -- s9-app-crash).
+        // 0.9.124's dump below keeps the pairing line's
+        // outstanding definition: the shared queue's
+        // length before this pairing (unclaimed waits
+        // only, now that claimed ones live on stacks).
+        let n_outstanding = st.waiters.get(arena).map_or(0, |v| v.len());
+        let mut claimed: Option<ReplyWait> = None;
+        if let Some(stack) = st.serving.get_mut(&pid) {
+            while let Some(fr) = stack.frames.pop() {
+                if let ServingFrame::Reply(w) = fr {
+                    claimed = Some(w);
+                    break;
+                }
+            }
+        }
+        let Some(w) = claimed else {
+            // No claimed wait: this reply answers nothing
+            // this thread was ever handed. Drop it and
+            // count it -- pairing it with a stranger from
+            // the shared queue is exactly the defect being
+            // removed. The pre-0.9.125 "no waiter" early
+            // return lands here too (a reply whose
+            // transaction was never claimed can have no
+            // legitimate recipient).
+            st.reply_unmatched += 1;
+            bsup!(
+                "binder: reply-pair unmatched sender={pid} size={} dropped",
+                data.len()
+            );
+            notes.push(
+                "BC_REPLY with no claimed waiter; dropped (reply-pair unmatched)"
+                    .to_string(),
+            );
+            return;
+        };
+        // The 0.9.100 concurrency line, kept truthful:
+        // it now fires when this reply pairs while other
+        // waits for the same arena are still outstanding
+        // (shared queue plus Reply frames claimed on
+        // other threads' stacks), and names the waiter
+        // actually claimed -- concurrency is context now,
+        // not the pairing mechanism.
+        {
+            let mut others = n_outstanding;
+            for (tpid, stack) in st.serving.iter() {
+                if stack.arena == arena && *tpid != pid {
+                    others += stack
+                        .frames
+                        .iter()
+                        .filter(|fr| matches!(fr, ServingFrame::Reply(_)))
+                        .count();
+                }
+            }
+            if others > 0 {
                 bsup!(
-                    "binder: reply pairing under concurrency: arena={arena} replier pid={pid} outstanding={} popped waiter pid={}",
-                    v.len(),
-                    v[0].sender_pid
+                    "binder: reply pairing under concurrency: arena={arena} replier pid={pid} outstanding={} claimed waiter pid={}",
+                    others + 1,
+                    w.sender_pid
                 );
             }
         }
-        // 0.9.124: waiter count before this pop (the
-        // pairing line's definition), for the reply-pair
-        // dump printed at delivery below.
-        let n_outstanding = st.waiters.get(arena).map_or(0, |v| v.len());
-        let w = st
-            .waiters
-            .get_mut(arena)
-            .and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) });
-        let Some(w) = w else {
-            notes.push("BC_REPLY with no waiter; dropped".to_string());
-            return;
-        };
         if oob {
             bsup!(
                 "binder: shield3 dropped OOB reply pid={pid} dsize={} osize={}",
@@ -5235,6 +5343,7 @@ fn binder_send_txn(
             sender_arena: arena.to_string(),
             cookie,
             target_handle: target,
+            code,
         });
     }
     if let Some(bp) = st.procs.get_mut(arena) {
@@ -5349,6 +5458,7 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             .map(|bp| bp.drain_for(pid, fill_n).0)
             .unwrap_or_default();
         let bytes = shield_ref_pairs(st, &arena, pid, bytes);
+        binder_claim_fills(st, &arena, pid, &bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
         let filled = bytes.len();
         actions.push(BAction::WriteMem {
@@ -5453,6 +5563,86 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
         off += len;
     }
     off
+}
+
+/// 0.9.125: claim the transactions in a read fill for
+/// the thread consuming them. Every BR_TRANSACTION the
+/// supervisor hands a thread moves that transaction's
+/// reply wait out of the shared per-arena queue and onto
+/// the thread's own serving stack, keyed by the
+/// identity the parcel itself carries: (sender pid,
+/// target node, code) against the wait recorded at send
+/// time -- so the thread's later BC_REPLY is paired
+/// with the transaction it actually executed, the
+/// kernel's per-thread transaction-stack routing.
+/// Frames are pushed in stream order; one-way
+/// transactions and unclaimable parcels push Other so
+/// the stack's depth keeps matching what the thread
+/// executed. A claim miss leaves the wait in the shared
+/// queue (it can still be claimed by a later parcel of
+/// the same identity, or failed at arena death) and is
+/// logged -- it means the send-side wait record and
+/// the fill-side parcel disagreed, which should not
+/// happen and must not pass silently.
+fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8]) {
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, i);
+        let adv = br_one_len(cmd);
+        if adv < 4 || i + adv > bytes.len() {
+            break;
+        }
+        if cmd == BR_TRANSACTION {
+            let tptr = u32_at(bytes, i + 4);
+            let tcookie = u32_at(bytes, i + 8);
+            let code = u32_at(bytes, i + 12);
+            let flags = u32_at(bytes, i + 16);
+            let sender_pid = u32_at(bytes, i + 20) as i32;
+            let mut frame = ServingFrame::Other;
+            if flags & TF_ONE_WAY == 0 {
+                let sender_arena = st.thread_arena.get(&sender_pid).cloned();
+                let node_idx = st.nodes.iter().position(|n| {
+                    n.owner == arena && n.ptr == tptr && n.cookie == tcookie
+                });
+                let qpos = match (sender_arena, node_idx) {
+                    (Some(sa), Some(ni)) => st.waiters.get(arena).and_then(|q| {
+                        q.iter().position(|w| {
+                            w.sender_pid == sender_pid
+                                && w.sender_arena == sa
+                                && w.code == code
+                                && st
+                                    .procs
+                                    .get(&w.sender_arena)
+                                    .and_then(|bp| bp.handles.get(&w.target_handle))
+                                    .copied()
+                                    == Some(ni)
+                        })
+                    }),
+                    _ => None,
+                };
+                match qpos {
+                    Some(j) => {
+                        let w = st.waiters.get_mut(arena).unwrap().remove(j);
+                        frame = ServingFrame::Reply(w);
+                    }
+                    None => {
+                        bsup!(
+                            "binder: reply-claim miss: reader pid={pid} arena={arena} sender pid={sender_pid} code={code} target=0x{tptr:x}/0x{tcookie:x} (wait stays queued)"
+                        );
+                    }
+                }
+            }
+            st.serving
+                .entry(pid)
+                .or_insert_with(|| ServingStack {
+                    arena: arena.to_string(),
+                    frames: Vec::new(),
+                })
+                .frames
+                .push(frame);
+        }
+        i += adv;
+    }
 }
 
 /// 0.9.103 shield (user's call: intercept the bad
@@ -6139,7 +6329,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -6149,7 +6339,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             bp.free_parcel_hit,
             bp.free_miss,
             bp.free_rescued,
-            st.shield_cookie_suspects
+            st.shield_cookie_suspects,
+            st.reply_unmatched
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
@@ -6340,6 +6531,19 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     for v in st.waiters.values_mut() {
         v.retain(|w| w.sender_arena != arena);
+    }
+    // 0.9.125: claimed waits sent BY the dead arena are
+    // scrubbed from the surviving serving stacks too
+    // (mirror of the queue retain above -- their callers
+    // are gone, so the claims can never be answered).
+    // Stacks belonging to the dead arena's own threads
+    // need no handling here: binder_thread_exit drained
+    // them, failing their callers, before this ran.
+    for stack in st.serving.values_mut() {
+        stack.frames.retain(|fr| match fr {
+            ServingFrame::Reply(w) => w.sender_arena != arena,
+            ServingFrame::Other => true,
+        });
     }
     let mut dead_nodes: Vec<usize> = Vec::new();
     for (i, n) in st.nodes.iter_mut().enumerate() {
