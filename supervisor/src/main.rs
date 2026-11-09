@@ -2135,6 +2135,16 @@ struct BinderState {
     /// shared queue). Global like shield_drops; reported
     /// at arena death alongside the free counters.
     reply_unmatched: u64,
+    /// 0.9.129: cumulative replies dropped by shield4 --
+    /// a first word in guest-pointer territory where a
+    /// reply's exception header belongs (the replier's
+    /// own memory at (daddr, dsize) already held a
+    /// native memory slice when the supervisor copied
+    /// it; s9-128-substitution (c)). The waiter is
+    /// answered FAILED_REPLY instead, mirroring
+    /// shield3. Global like shield_drops; reported at
+    /// arena death alongside the free counters.
+    shield4_drops: u64,
     /// 0.9.128: global claim sequence counter. Every
     /// successful claim in binder_claim_fills takes the
     /// next number and stamps it on the ServingFrame it
@@ -5186,10 +5196,24 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // delivery, which is what separates a wrong-frame
         // pop from the other two substitution candidates
         // (s9-127-big-reply Q5). Log only.
+        let first_word = if data.len() >= 4 { u32_at(&data, 0) } else { 0 };
         {
-            let first = if data.len() >= 4 { u32_at(&data, 0) } else { 0 };
+            let first = first_word;
             bsup!(
                 "binder: reply-pop dump replier={pid} claim_seq={claim_seq} popped={pop_count} depth={pop_depth} first=0x{first:x} size={}",
+                data.len()
+            );
+        }
+        // 0.9.129 c1/c2 separation, first half (telemetry
+        // only): for large replies, name the guest
+        // address the data was copied from. The re-read
+        // half sits just before the shield4 judgement
+        // below (delivery-adjacent); this line is what
+        // covers replies that never reach it (shield3's
+        // OOB return above all). Log only.
+        if data.len() >= 256 {
+            bsup!(
+                "binder: reply-pop daddr claim_seq={claim_seq} replier={pid} daddr=0x{daddr:x} size={}",
                 data.len()
             );
         }
@@ -5230,6 +5254,64 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             }
             binder_maybe_wake(st, &w.sender_arena, actions);
             notes.push("REPLY with OOB object offset -> FAILED_REPLY (shield3)".to_string());
+            return;
+        }
+        // 0.9.129 c1/c2 separation, second half (telemetry
+        // only): for large replies, re-read the first word
+        // at the copied-from address, delivery-adjacent.
+        // A re-read that differs from the copy means the
+        // replier's buffer moved under the supervisor's
+        // segmented handling; agreement means whatever
+        // the copy holds sat static in the replier's
+        // memory (s9-128-substitution Q5). Read only: the
+        // shield4 judgement below and the delivery after
+        // it both use the copied bytes, never this value.
+        if data.len() >= 256 {
+            if let Some(v) = rd(pid, daddr as u64, 4) {
+                let reread = u32_at(&v, 0);
+                if reread != first_word {
+                    bsup!(
+                        "binder: reply reread differs seq={claim_seq} first=0x{first_word:x} reread=0x{reread:x}"
+                    );
+                }
+            }
+        }
+        // 0.9.129 shield, fourth layer: a reply whose
+        // first word is a guest pointer is not a reply at
+        // all. The 0.9.128 field run's three poisoned
+        // replies (claim_seq 1040/1434/1618) were copied
+        // verbatim from the replier's own memory at its
+        // (daddr, dsize): the size was the honest size of
+        // the call's real reply, the bytes were a native
+        // memory slice (paired heap pointers, zeroes, a
+        // libc address 0xafd4658c that cannot appear in
+        // any wire parcel), while every honest reply in
+        // the census began 0x0, 0xffffffff, a type
+        // constant or a small integer -- never a pointer.
+        // A waiter reading such a parcel takes the
+        // pointer for an exception code and dies
+        // (0.9.126's systemui). The faithful mirror of
+        // the driver failing a bad copy: answer
+        // FAILED_REPLY instead, exactly like shield3
+        // above, and let the waiter unwind cleanly.
+        // Judged on the copied bytes; a reply shorter
+        // than 4B carries no first word and is never
+        // judged.
+        let poisoned = data.len() >= 4
+            && ((0x4000_0000..0x5000_0000).contains(&first_word)
+                || (0xafd0_0000..0xb100_0000).contains(&first_word));
+        if poisoned {
+            st.shield4_drops += 1;
+            bsup!(
+                "binder: shield4 poisoned reply dropped claim_seq={claim_seq} replier={pid} waiter={} size={} first=0x{first_word:x} -> FAILED_REPLY",
+                w.sender_pid,
+                data.len()
+            );
+            if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
+                bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
+            }
+            binder_maybe_wake(st, &w.sender_arena, actions);
+            notes.push("POISONED REPLY -> FAILED_REPLY (shield4)".to_string());
             return;
         }
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
@@ -6527,7 +6609,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -6538,7 +6620,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             bp.free_miss,
             bp.free_rescued,
             st.shield_cookie_suspects,
-            st.reply_unmatched
+            st.reply_unmatched,
+            st.shield4_drops
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
