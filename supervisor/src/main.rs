@@ -1902,6 +1902,16 @@ struct ParcelPrint {
     /// Temporary per-handle refs acquired while the kernel rewrites this
     /// transaction parcel; BC_FREE_BUFFER releases these exact references.
     refs: Vec<(usize, bool)>,
+    /// Death-inventory telemetry (0.9.116): who sent this
+    /// parcel and what it carried, captured at delivery so
+    /// an arena that dies holding unread/unfreed parcels
+    /// can name them. Read only by the death inventory
+    /// dump in binder_on_proc_exit; delivery logic never
+    /// consults these fields.
+    from_pid: i32,
+    code: u32,
+    target_ptr: u32,
+    txn_cookie: u32,
 }
 
 struct BinderProc {
@@ -5021,6 +5031,10 @@ fn binder_deliver(
                 mask,
                 head,
                 refs: parcel_refs.clone(),
+                from_pid: sender_pid,
+                code,
+                target_ptr,
+                txn_cookie: cookie,
             },
         );
     }
@@ -6898,6 +6912,122 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.notify_queued,
             st.shield_drops
         );
+    }
+    // 0.9.116 death inventory (telemetry only: reads
+    // state, changes nothing). When an arena dies holding
+    // a backlog of unfreed parcels, name what they were
+    // and who sent them, which death notices this death
+    // is about to fire, and how many ref notices sit
+    // undelivered globally -- a tenure-killing backlog
+    // should identify itself, not just its size.
+    if let Some(bp) = st.procs.get(arena) {
+        if bp.parcels.len() >= 10 {
+            let total = bp.parcels.len();
+            let mut offs: Vec<u32> = bp.parcels.keys().copied().collect();
+            offs.sort_unstable();
+            for (i, &off) in offs.iter().take(200).enumerate() {
+                let pp = &bp.parcels[&off];
+                let refs: Vec<String> = pp
+                    .refs
+                    .iter()
+                    .map(|(n, s)| format!("n{}{}", n, if *s { "S" } else { "W" }))
+                    .collect();
+                bsup!(
+                    "binder: arena {arena} death-inventory parcel {}/{}: off=0x{:x} size={} from_pid={} code={} target_ptr=0x{:x} cookie=0x{:x} refs=[{}]",
+                    i + 1,
+                    total,
+                    off,
+                    pp.total,
+                    pp.from_pid,
+                    pp.code,
+                    pp.target_ptr,
+                    pp.txn_cookie,
+                    refs.join(" ")
+                );
+            }
+            if total > 200 {
+                bsup!(
+                    "binder: arena {arena} death-inventory parcels truncated: showing 200 of {total}"
+                );
+            }
+        }
+    }
+    {
+        // Death notices this death is about to fire: the
+        // watches registered on this arena's nodes (the
+        // firing loop further down consumes exactly this
+        // set). Recipient pids are the watcher arena's
+        // registered thread pids at this instant.
+        let mut dn: Vec<(usize, &String, u32)> = Vec::new();
+        for (i, n) in st.nodes.iter().enumerate() {
+            if n.owner == arena && !n.dead {
+                if let Some(list) = st.watchers.get(&i) {
+                    for (w, c) in list {
+                        dn.push((i, w, *c));
+                    }
+                }
+            }
+        }
+        let dn_total = dn.len();
+        for (i, (node, w, c)) in dn.iter().take(200).enumerate() {
+            let mut pids: Vec<i32> = st
+                .procs
+                .get(w.as_str())
+                .map(|bp| bp.base.keys().copied().collect())
+                .unwrap_or_default();
+            pids.sort_unstable();
+            let pids: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+            bsup!(
+                "binder: arena {arena} death-inventory death-notice {}/{}: to_arena={} to_pids=[{}] node={} cookie=0x{:x}",
+                i + 1,
+                dn_total,
+                w,
+                pids.join(" "),
+                node,
+                c
+            );
+        }
+        if dn_total > 200 {
+            bsup!(
+                "binder: arena {arena} death-inventory death-notices truncated: showing 200 of {dn_total}"
+            );
+        }
+    }
+    {
+        // Global pending ref notices by owner arena: a
+        // node's ref_*_queued flag means its notice pair
+        // is in an owner-readable queue, not yet delivered
+        // to guest userspace -- exactly the pending set,
+        // tallyable in one read-only pass over the nodes.
+        let mut by_owner: HashMap<String, (u32, u32)> = HashMap::new();
+        for n in &st.nodes {
+            if n.ref_strong_queued || n.ref_weak_queued {
+                let e = by_owner.entry(n.owner.clone()).or_default();
+                if n.ref_strong_queued {
+                    e.0 += 1;
+                }
+                if n.ref_weak_queued {
+                    e.1 += 1;
+                }
+            }
+        }
+        if by_owner.is_empty() {
+            bsup!("binder: arena {arena} death-inventory pending-ref-notices global: none");
+        } else {
+            let mut owners: Vec<&String> = by_owner.keys().collect();
+            owners.sort();
+            let parts: Vec<String> = owners
+                .iter()
+                .map(|o| {
+                    let (s, w) = by_owner[*o];
+                    format!("{o} strong={s} weak={w}")
+                })
+                .collect();
+            bsup!(
+                "binder: arena {arena} death-inventory pending-ref-notices global: {}",
+                parts.join("; ")
+            );
+        }
     }
     // Queued manager transactions from this arena's
     // senders die with it (0.9.24).
@@ -10704,6 +10834,10 @@ mod fd_fixup_tests {
                 mask: Vec::new(),
                 head: Vec::new(),
                 refs,
+                from_pid: 0,
+                code: 0,
+                target_ptr: 0,
+                txn_cookie: 0,
             },
         );
 
@@ -10729,6 +10863,10 @@ mod fd_fixup_tests {
                 mask: Vec::new(),
                 head: Vec::new(),
                 refs: vec![(node, true)],
+                from_pid: 0,
+                code: 0,
+                target_ptr: 0,
+                txn_cookie: 0,
             },
         );
         st.procs.insert("client".to_string(), client);
