@@ -7950,6 +7950,125 @@ fn do_handoff(
 /// The tracing loop, shared verbatim by W0 and every
 /// worker: it differs only in the TracerCtx it is fed
 /// (root/shard map on W0, neither in workers).
+/// Wedge forensics (0.9.122, telemetry only): when a
+/// guest-sent SIGQUIT reaches a thread of the current
+/// system_server candidate's family, print a one-shot
+/// snapshot of every family thread's supervised state.
+/// The S9 residual forensics found every surviving
+/// system_server tenure now dies the same way: the
+/// whole arena falls silent around span line ~10k and
+/// the guest's own Watchdog executes it with
+/// sig3 x2 -> sig9; the first sig3 is the last moment
+/// the arena's state is still news. The snapshot
+/// discriminates the two candidate worlds at that
+/// instant: every thread idle-parked on the binder
+/// driver (nobody is sending -- a sender / dependency
+/// problem) versus threads stopped inside synchronous
+/// calls awaiting replies (a peer problem). Purely
+/// additive: the caller invokes this from the
+/// signal-delivery stop and reinjects the signal
+/// exactly as before. Returns true when the snapshot
+/// was printed (the caller spends the one-shot).
+fn wedge_snapshot(
+    trig: i32,
+    procs: &HashMap<i32, ProcState>,
+    leader: i32,
+) -> bool {
+    // Family membership: the tracer-side parent chain
+    // (ProcState.parent, recorded at each birth event)
+    // walks from any family thread up to the leader;
+    // the leader's own parent is the shard root
+    // (zygote), outside the family.
+    let in_family = |mut cur: i32| -> bool {
+        for _ in 0..256 {
+            if cur == leader {
+                return true;
+            }
+            match procs.get(&cur) {
+                Some(p) if p.parent > 0 && p.parent != cur => {
+                    cur = p.parent
+                }
+                _ => return false,
+            }
+        }
+        false
+    };
+    if !in_family(trig) {
+        return false;
+    }
+    // The snapshot is for the guest Watchdog's SIGQUIT.
+    // A host-sent one must not spend the one-shot: the
+    // DumpStacks path kill()s the candidate from this
+    // very supervisor, and a manual dump an hour before
+    // the wedge would leave nothing for the wedge. When
+    // GETSIGINFO names a sender that is not one of our
+    // tracees, stay silent. On the device GETSIGINFO
+    // usually fails; an unreadable siginfo falls
+    // through and the snapshot fires, as an unattended
+    // run has no host dumps to confuse it with.
+    {
+        let compat = procs.get(&trig).map(|p| p.compat).unwrap_or(false);
+        let mut buf = [0u8; 128];
+        if ptrace4(
+            PTRACE_GETSIGINFO,
+            trig,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+        ) == 0
+        {
+            let sender = if compat {
+                u32::from_ne_bytes(buf[12..16].try_into().unwrap()) as i32
+            } else {
+                u32::from_ne_bytes(buf[16..20].try_into().unwrap()) as i32
+            };
+            if sender > 0 && !procs.contains_key(&sender) {
+                return false;
+            }
+        }
+    }
+    let mut family: Vec<i32> =
+        procs.keys().copied().filter(|p| in_family(*p)).collect();
+    family.sort_unstable();
+    sup!(
+        "binder: wedge-snapshot arena={leader} threads={}",
+        family.len()
+    );
+    for pid in family {
+        let p = &procs[&pid];
+        // State vocabulary, all from the thread's
+        // existing Pending record:
+        //   binder_parked -- held at a binder
+        //     WRITE_READ entry stop, waiting for the
+        //     virtual driver to grow data (park=binder).
+        //   expect_exit with a pending record -- inside
+        //     that syscall now, in-kernel or held
+        //     (park=syscall; last_syscall names it).
+        //   anything else -- no call in flight from the
+        //     supervisor's seat (a fake's record retained
+        //     past its exit stop does not count);
+        //     park=running, last_syscall=-.
+        // last_read_lines_ago has no honest source: the
+        // worker keeps no event / log-line sequence, so
+        // the field prints - rather than a fabricated
+        // age.
+        let (last_syscall, park) = match &p.pending {
+            Some(pend) if pend.binder_parked => (
+                format!("{}({})", nr_name(p.compat, pend.nr), pend.nr),
+                "binder",
+            ),
+            Some(pend) if p.expect_exit => (
+                format!("{}({})", nr_name(p.compat, pend.nr), pend.nr),
+                "syscall",
+            ),
+            _ => ("-".to_string(), "running"),
+        };
+        sup!(
+            "binder: wedge-thread pid={pid} last_syscall={last_syscall} park={park} last_read_lines_ago=-"
+        );
+    }
+    true
+}
+
 fn tracer_loop(ctx: TracerCtx) {
     let TracerCtx {
         wid,
@@ -7974,6 +8093,13 @@ fn tracer_loop(ctx: TracerCtx) {
     if selfpipe_rd < 0 {
         sup!("WARN: SIGCHLD self-pipe failed; stop wakeups ride coordinator traffic only");
     }
+
+    // Wedge forensics (0.9.122): one snapshot per
+    // system_server tenure, spent by the first
+    // guest-sent SIGQUIT to reach a family thread (see
+    // wedge_snapshot); reset whenever the candidate
+    // slot changes hands.
+    let mut wedge_snapped = false;
 
     // ---- main tracing loop over the whole guest tree ----
     // (S2: one loop body for every tracer process. The
@@ -8023,6 +8149,7 @@ fn tracer_loop(ctx: TracerCtx) {
             // at its own birth.
             if dump_candidate == Some(pid) {
                 dump_candidate = None;
+                wedge_snapped = false;
             }
             // S5c: if that was the arena's last thread,
             // run the driver's death processing; it may
@@ -9118,6 +9245,9 @@ fn tracer_loop(ctx: TracerCtx) {
                     && dump_candidate.is_none()
                 {
                     dump_candidate = Some(child);
+                    // A new tenure earns a fresh wedge
+                    // snapshot (0.9.122).
+                    wedge_snapped = false;
                 }
             }
             cont_syscall(pid, 0);
@@ -9146,6 +9276,19 @@ fn tracer_loop(ctx: TracerCtx) {
             // exit stop, that exit stop still follows, and the exit
             // path already tolerates a missing record.
             let mut deliver = sig;
+            // Wedge forensics (0.9.122, telemetry only):
+            // the first guest-sent SIGQUIT (3) to reach a
+            // system_server family thread spends this
+            // tenure's one state snapshot. Pure logging
+            // on the side: `deliver` and everything below
+            // proceed exactly as before.
+            if sig == 3 && !wedge_snapped {
+                if let Some(leader) = dump_candidate {
+                    if wedge_snapshot(pid, &procs, leader) {
+                        wedge_snapped = true;
+                    }
+                }
+            }
             if sig >= 32 {
                 // 0.9.63 telemetry: realtime-range
                 // signals are rare in the guests and
