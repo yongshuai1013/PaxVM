@@ -1467,8 +1467,8 @@ const BR_FAILED_REPLY: u32 = 0x7211;
 const BR_DEAD_BINDER: u32 = 0x8004_720f;
 const BR_INCREFS: u32 = 0x8008_7207;
 const BR_ACQUIRE: u32 = 0x8008_7208;
-const BR_RELEASE: u32 = 0x8008_7209;
-const BR_DECREFS: u32 = 0x8008_720a;
+const BR_DECREFS: u32 = 0x8008_7209;
+const BR_RELEASE: u32 = 0x8008_720a;
 const BINDER_WRITE_READ: u32 = 0xC018_6201;
 const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
 const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
@@ -1899,15 +1899,12 @@ struct ParcelPrint {
     total: u32,
     mask: Vec<u32>,
     head: Vec<u32>,
-    /// Temporary per-handle refs acquired while the kernel rewrites this
-    /// transaction parcel; BC_FREE_BUFFER releases these exact references.
-    refs: Vec<(usize, bool)>,
-    /// Death-inventory telemetry (0.9.116): who sent this
-    /// parcel and what it carried, captured at delivery so
-    /// an arena that dies holding unread/unfreed parcels
-    /// can name them. Read only by the death inventory
-    /// dump in binder_on_proc_exit; delivery logic never
-    /// consults these fields.
+    /// Death-inventory telemetry (0.9.118, ported from
+    /// 0.9.116): who sent this parcel and what it carried,
+    /// captured at delivery so an arena that dies holding
+    /// unread/unfreed parcels can name them. Read only by
+    /// the death inventory dump in binder_on_proc_exit;
+    /// delivery logic never consults these fields.
     from_pid: i32,
     code: u32,
     target_ptr: u32,
@@ -1942,14 +1939,15 @@ struct BinderProc {
     free_nobase: u32,
     free_stale: u32,
     /// BC_FREE_BUFFER delivery-record outcome counters
-    /// (0.9.117), reported when the arena dies alongside
-    /// the 0.9.99 set: free_parcel_hit = the free removed
-    /// a live ParcelPrint (the delivery record), free_miss
-    /// = the freeing thread had no registered base and the
-    /// free was dropped -- the nobase path, counted under
-    /// this name so a tenure whose frees silently miss can
-    /// be told apart from one whose frees land; each miss
-    /// is also logged as it happens.
+    /// (0.9.118, ported from 0.9.117), reported when the
+    /// arena dies alongside the 0.9.99 set: free_parcel_hit
+    /// = the free removed a live ParcelPrint (the delivery
+    /// record), free_miss = the freeing thread had no
+    /// registered base and the free was dropped -- the
+    /// nobase path, counted under this name so a tenure
+    /// whose frees silently miss can be told apart from
+    /// one whose frees land; each miss is also logged as
+    /// it happens.
     free_parcel_hit: u32,
     free_miss: u32,
     /// handle -> node index (handle 0 is the context manager
@@ -2026,28 +2024,6 @@ struct BinderNode {
     /// outstanding handles to it dead-reply, and a fresh
     /// registration creates a new node (S5c)
     dead: bool,
-    /// Counts in each receiver process's binder_ref. Strong/weak
-    /// transitions are per ref count, not per-arena membership: transaction
-    /// parcels and BpBinder handles can hold several refs to one node.
-    remote_refs: HashMap<String, RemoteRefCounts>,
-    /// What the owner has actually been told it holds
-    /// (the kernel's has_strong_ref / has_weak_ref): set
-    /// when a notice pair passes delivery
-    /// (shield_ref_pairs), not when it is queued.
-    ref_strong_told: bool,
-    ref_weak_told: bool,
-    /// The kernel retains a temporary local ref after writing BR_ACQUIRE /
-    /// BR_INCREFS, until the matching BC_*_DONE acknowledges guest handling.
-    ref_strong_pending: bool,
-    ref_weak_pending: bool,
-    /// A pair for the pending transition is in an owner-readable
-    /// queue and has not yet been delivered to guest userspace.
-    ref_strong_queued: bool,
-    ref_weak_queued: bool,
-    /// Worker-side stale-memory validation rejected this notice. Keep the
-    /// current demand from being requeued until that demand falls to zero.
-    ref_strong_dropped: bool,
-    ref_weak_dropped: bool,
 }
 
 struct ParkedIoctl {
@@ -2063,17 +2039,6 @@ struct ReplyWait {
     cookie: u32,
     target_handle: u32,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DroppedRefNotice {
-    cmd: u32,
-    ptr: u32,
-    cookie: u32,
-}
-#[derive(Clone, Copy, Default)]
-struct RemoteRefCounts {
-    strong: u32,
-    weak: u32,
-}
 
 #[derive(Default)]
 struct BinderState {
@@ -2088,6 +2053,17 @@ struct BinderState {
     watchers: HashMap<usize, Vec<(String, u32)>>,
     thread_arena: HashMap<i32, String>,
     noted: HashSet<String>,
+    /// (node, receiver arena) pairs already sent a
+    /// BR_INCREFS(/BR_ACQUIRE) notice to the node's owner:
+    /// the real driver notifies once per new reference
+    /// holder, not once per parcel (S5c). The value is
+    /// the weak flag of the crossing that actually sent
+    /// the notice, kept so the death settlement in
+    /// binder_on_proc_exit can mirror the pair exactly
+    /// (BR_DECREFS always, BR_RELEASE only where an
+    /// ACQUIRE went out); the dedup key is the pair
+    /// alone, exactly as before (0.9.118).
+    ref_notified: HashMap<(usize, String), bool>,
     /// Count of reference notices actually queued to an
     /// owner (0.9.100's suppression experiment counted the
     /// suppressed calls here; 0.9.101 restored the notices
@@ -2114,6 +2090,7 @@ struct BinderState {
     /// injection, resolve_fd_fixups) and the word is patched
     /// with the receiver-side number.
     fd_pending: HashMap<String, Vec<FdFixup>>,
+    fd_cache: HashMap<(String, i32, i32), i32>,
     /// Transactions addressed to handle 0 before any
     /// context manager registered (0.9.24). On real
     /// hardware this cannot happen -- servicemanager is
@@ -2153,23 +2130,8 @@ struct AshmemRec {
 
 struct FdFixup {
     file_off: u64,
-    parcel_ptr: u32,
     sender_pid: i32,
     sender_fd: i32,
-    source_dev: u64,
-    source_ino: u64,
-    open_flags: i32,
-    failure: FixupFailure,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FixupFailure {
-    parcel_ptr: u32,
-    reply_arena: String,
-    reply_pid: i32,
-    reply_cmd: u32,
-    wait_cookie: u32,
-    wait_target_handle: u32,
 }
 
 impl BinderState {
@@ -2189,15 +2151,6 @@ impl BinderState {
             ptr,
             cookie,
             dead: false,
-            remote_refs: HashMap::new(),
-            ref_strong_told: false,
-            ref_weak_told: false,
-            ref_strong_pending: false,
-            ref_weak_pending: false,
-            ref_strong_queued: false,
-            ref_weak_queued: false,
-            ref_strong_dropped: false,
-            ref_weak_dropped: false,
         });
         let id = self.nodes.len() - 1;
         bsup!(
@@ -2275,6 +2228,9 @@ impl BinderState {
 // reply. One request at a time, strictly ordered: the
 // split cannot reorder anything the inline code ordered.
 
+/// The fd_cache key: (arena path, sender pid, sender fd).
+type CacheKey = (String, i32, i32);
+
 const MSG_REQ_WRITE_READ: u8 = 1;
 const MSG_REQ_COMPLETE_PARKED: u8 = 2;
 const MSG_REQ_THREAD_EXIT: u8 = 3;
@@ -2283,6 +2239,7 @@ const MSG_REQ_OPEN_BINDER: u8 = 5;
 const MSG_REQ_OPEN_ASHMEM: u8 = 6;
 const MSG_REQ_ASHMEM_GET: u8 = 7;
 const MSG_ONEWAY_PARK: u8 = 16;
+const MSG_ONEWAY_FD_CACHE_PUT: u8 = 17;
 const MSG_ONEWAY_PARK_REMOVE: u8 = 18;
 const MSG_ONEWAY_THREAD_ARENA: u8 = 19;
 const MSG_ONEWAY_ARENA_REGISTER: u8 = 20;
@@ -2303,8 +2260,6 @@ const MSG_HELLO: u8 = 31;
 // SIGUSR2 stack-dump request; the coordinator
 // broadcasts it to the workers as a push.
 const MSG_ONEWAY_DUMP_REQ: u8 = 32;
-const MSG_ONEWAY_FD_FIXUP_FAILED: u8 = 33;
-const MSG_ONEWAY_REF_NOTICE_DROPPED: u8 = 34;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
@@ -2414,32 +2369,22 @@ impl Enc {
     }
     fn fixup(&mut self, f: &FdFixup) {
         self.u64(f.file_off);
-        self.u32(f.parcel_ptr);
         self.i32(f.sender_pid);
         self.i32(f.sender_fd);
-        self.u64(f.source_dev);
-        self.u64(f.source_ino);
-        self.i32(f.open_flags);
-        self.fixup_failure(&f.failure);
-    }
-    fn fixup_failure(&mut self, f: &FixupFailure) {
-        self.u32(f.parcel_ptr);
-        self.string(&f.reply_arena);
-        self.i32(f.reply_pid);
-        self.u32(f.reply_cmd);
-        self.u32(f.wait_cookie);
-        self.u32(f.wait_target_handle);
-    }
-    fn fixup_failures(&mut self, fs: &[FixupFailure]) {
-        self.u32(fs.len() as u32);
-        for f in fs {
-            self.fixup_failure(f);
-        }
     }
     fn fixups(&mut self, fs: &[FdFixup]) {
         self.u32(fs.len() as u32);
         for f in fs {
             self.fixup(f);
+        }
+    }
+    fn cache(&mut self, es: &[(CacheKey, i32)]) {
+        self.u32(es.len() as u32);
+        for ((arena, spid, sfd), fd) in es {
+            self.string(arena);
+            self.i32(*spid);
+            self.i32(*sfd);
+            self.i32(*fd);
         }
     }
     fn logs(&mut self, ls: &[(String, String)]) {
@@ -2472,12 +2417,11 @@ impl Enc {
                     self.u8(4);
                     self.i32(*pid);
                 }
-                BAction::ResolveFdFixupsInline { arena, fixups, read_buf, bwr_addr } => {
+                BAction::ResolveFdFixupsInline { arena, fixups, cache } => {
                     self.u8(5);
                     self.string(arena);
                     self.fixups(fixups);
-                    self.u64(*read_buf);
-                    self.u64(*bwr_addr);
+                    self.cache(cache);
                 }
             }
         }
@@ -2557,32 +2501,25 @@ impl<'a> Dec<'a> {
     fn fixup(&mut self) -> FdFixup {
         FdFixup {
             file_off: self.u64(),
-            parcel_ptr: self.u32(),
             sender_pid: self.i32(),
             sender_fd: self.i32(),
-            source_dev: self.u64(),
-            source_ino: self.u64(),
-            open_flags: self.i32(),
-            failure: self.fixup_failure(),
         }
-    }
-    fn fixup_failure(&mut self) -> FixupFailure {
-        FixupFailure {
-            parcel_ptr: self.u32(),
-            reply_arena: self.string(),
-            reply_pid: self.i32(),
-            reply_cmd: self.u32(),
-            wait_cookie: self.u32(),
-            wait_target_handle: self.u32(),
-        }
-    }
-    fn fixup_failures(&mut self) -> Vec<FixupFailure> {
-        let n = self.u32();
-        (0..n).map(|_| self.fixup_failure()).collect()
     }
     fn fixups(&mut self) -> Vec<FdFixup> {
         let n = self.u32();
         (0..n).map(|_| self.fixup()).collect()
+    }
+    fn cache(&mut self) -> Vec<(CacheKey, i32)> {
+        let n = self.u32();
+        (0..n)
+            .map(|_| {
+                let arena = self.string();
+                let spid = self.i32();
+                let sfd = self.i32();
+                let fd = self.i32();
+                ((arena, spid, sfd), fd)
+            })
+            .collect()
     }
     fn logs(&mut self) -> Vec<(String, String)> {
         let n = self.u32();
@@ -2609,14 +2546,8 @@ impl<'a> Dec<'a> {
                 _ => {
                     let arena = self.string();
                     let fixups = self.fixups();
-                    let read_buf = self.u64();
-                    let bwr_addr = self.u64();
-                    out.push(BAction::ResolveFdFixupsInline {
-                        arena,
-                        fixups,
-                        read_buf,
-                        bwr_addr,
-                    });
+                    let cache = self.cache();
+                    out.push(BAction::ResolveFdFixupsInline { arena, fixups, cache });
                 }
             }
         }
@@ -2642,8 +2573,24 @@ enum ParkedOutcome {
     Complete {
         park: ParkedIoctl,
         bytes: Vec<u8>,
-        fixups: Option<(String, Vec<FdFixup>)>,
+        fixups: Option<(String, Vec<FdFixup>, Vec<(CacheKey, i32)>)>,
     },
+}
+
+/// Cache entries a fixup resolution learned: present
+/// in the resolution's map afterwards, absent from the
+/// seed it started with. Those are exactly the inserts
+/// the inline resolver used to make in the driver's
+/// fd_cache, owed back to the coordinator before any
+/// later decision reads the cache again.
+fn learned_entries(
+    map: &std::collections::HashMap<CacheKey, i32>,
+    seed: &std::collections::HashSet<CacheKey>,
+) -> Vec<(CacheKey, i32)> {
+    map.iter()
+        .filter(|(k, _)| !seed.contains(*k))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
 }
 
 /// A frame the coordinator pushes to a tracer outside
@@ -2948,7 +2895,8 @@ impl CoordClient {
             let fixups = if d.bool() {
                 let arena = d.string();
                 let fx = d.fixups();
-                Some((arena, fx))
+                let cache = d.cache();
+                Some((arena, fx, cache))
             } else {
                 None
             };
@@ -3036,28 +2984,13 @@ impl CoordClient {
         self.send(MSG_ONEWAY_PARK, &e.0);
     }
 
-    fn oneway_fd_fixup_failed(&mut self, receiver_arena: &str, failures: &[FixupFailure]) {
-        if failures.is_empty() {
+    fn oneway_fd_cache_put(&mut self, entries: &[(CacheKey, i32)]) {
+        if entries.is_empty() {
             return;
         }
         let mut e = Enc::new();
-        e.string(receiver_arena);
-        e.fixup_failures(failures);
-        self.send(MSG_ONEWAY_FD_FIXUP_FAILED, &e.0);
-    }
-    fn oneway_ref_notice_dropped(&mut self, pid: i32, dropped: &[DroppedRefNotice]) {
-        if dropped.is_empty() {
-            return;
-        }
-        let mut e = Enc::new();
-        e.i32(pid);
-        e.u32(dropped.len() as u32);
-        for notice in dropped {
-            e.u32(notice.cmd);
-            e.u32(notice.ptr);
-            e.u32(notice.cookie);
-        }
-        self.send(MSG_ONEWAY_REF_NOTICE_DROPPED, &e.0);
+        e.cache(entries);
+        self.send(MSG_ONEWAY_FD_CACHE_PUT, &e.0);
     }
 
     fn oneway_park_remove(&mut self, pid: i32) {
@@ -3445,11 +3378,11 @@ fn ashmem_open_region(pid: i32, rootfs: &str, st: &mut BinderState) -> String {
 /// complete_parked ran against the state before it
 /// touched the guest -- remove the park, resolve the
 /// thread's arena and queue, drain the pending reply
-/// bytes, and take only fixups for parcels in this batch.
+/// bytes, and take any fd fixups owed to this arena.
 /// A drained-empty queue puts the park back (Nothing),
 /// as before. What the tracer still owes is returned:
-/// the reply bytes to write into the guest and the
-/// matching fixups to resolve before resuming it.
+/// the reply bytes to write into the guest, and the
+/// fixups with the cache entries they will consult.
 fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let Some(park) = st.parked.remove(&pid) else {
         return ParkedOutcome::Nothing;
@@ -3457,10 +3390,6 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let Some(arena) = st.thread_arena.get(&pid).cloned() else {
         return ParkedOutcome::Nothing;
     };
-    // Kernel-faithful ref notices are computed now, at
-    // fill time, from current state -- not when the
-    // reference crossed (materialize_ref_notices).
-    materialize_ref_notices(st, &arena);
     let (bytes, from_inbound) = {
         let Some(bp) = st.procs.get_mut(&arena) else {
             return ParkedOutcome::Nothing;
@@ -3531,12 +3460,20 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         st.parked.insert(pid, park);
         return ParkedOutcome::Nothing;
     }
-    let fx = take_fd_fixups_for_batch(st, &arena, &bytes);
-    let fixups = if fx.is_empty() {
-        None
-    } else {
-        Some((arena.clone(), fx))
-    };
+    let fixups = st.fd_pending.remove(&arena).and_then(|fx| {
+        if fx.is_empty() {
+            None
+        } else {
+            let cache: Vec<(CacheKey, i32)> = fx
+                .iter()
+                .filter_map(|f| {
+                    let key: CacheKey = (arena.clone(), f.sender_pid, f.sender_fd);
+                    st.fd_cache.get(&key).map(|fd| (key, *fd))
+                })
+                .collect();
+            Some((arena.clone(), fx, cache))
+        }
+    });
     ParkedOutcome::Complete { park, bytes, fixups }
 }
 
@@ -3818,10 +3755,11 @@ impl CoordServer {
                         e.bytes(bytes);
                         match fixups {
                             None => e.bool(false),
-                            Some((arena, fx)) => {
+                            Some((arena, fx, cache)) => {
                                 e.bool(true);
                                 e.string(arena);
                                 e.fixups(fx);
+                                e.cache(cache);
                             }
                         }
                     }
@@ -3943,85 +3881,9 @@ impl CoordServer {
                     }
                 }
             }
-            MSG_ONEWAY_FD_FIXUP_FAILED => {
-                let receiver_arena = d.string();
-                let mut seen = HashSet::new();
-                let mut released_parcels = HashSet::new();
-                for failure in d.fixup_failures() {
-                    if !seen.insert(failure.clone()) {
-                        continue;
-                    }
-                    if released_parcels.insert(failure.parcel_ptr) {
-                        let owners = binder_discard_failed_parcel(
-                            &mut self.st,
-                            &receiver_arena,
-                            failure.parcel_ptr,
-                        );
-                        for owner in owners {
-                            let mut wake_pids = Vec::new();
-                            binder_maybe_wake_pids(&self.st, &owner, &mut wake_pids);
-                            for pid in wake_pids {
-                                self.push_wake(pid);
-                            }
-                        }
-                    }
-                    if matches!(failure.reply_cmd, BR_DEAD_REPLY | BR_FAILED_REPLY) {
-                        if let Some(waiters) = self.st.waiters.get_mut(&receiver_arena) {
-                            waiters.retain(|w| {
-                                !(w.sender_pid == failure.reply_pid
-                                    && w.sender_arena == failure.reply_arena
-                                    && w.cookie == failure.wait_cookie
-                                    && w.target_handle == failure.wait_target_handle)
-                            });
-                        }
-                    }
-                    if matches!(failure.reply_cmd, BR_DEAD_REPLY | BR_FAILED_REPLY) {
-                        let queued = if let Some(bp) = self.st.procs.get_mut(&failure.reply_arena) {
-                            bp.push_to(failure.reply_pid, &failure.reply_cmd.to_le_bytes());
-                            bsup!(
-                                "binder: fd fixup failed parcel=0x{:x}; queued reply 0x{:x} to pid={}",
-                                failure.parcel_ptr,
-                                failure.reply_cmd,
-                                failure.reply_pid
-                            );
-                            true
-                        } else {
-                            bsup!(
-                                "binder: fd fixup failed parcel=0x{:x}; reply arena {} is gone",
-                                failure.parcel_ptr,
-                                failure.reply_arena
-                            );
-                            false
-                        };
-                        if queued {
-                            self.push_wake(failure.reply_pid);
-                        }
-                    } else {
-                        bsup!(
-                            "binder: fd fixup failed parcel=0x{:x}; one-way transaction dropped",
-                            failure.parcel_ptr
-                        );
-                    }
-                }
-            }
-            MSG_ONEWAY_REF_NOTICE_DROPPED => {
-                let pid = d.i32();
-                let count = d.u32() as usize;
-                let dropped: Vec<DroppedRefNotice> = (0..count)
-                    .map(|_| DroppedRefNotice {
-                        cmd: d.u32(),
-                        ptr: d.u32(),
-                        cookie: d.u32(),
-                    })
-                    .collect();
-                if let Some(arena) = self.st.thread_arena.get(&pid).cloned() {
-                    if binder_cancel_dropped_ref_notices(&mut self.st, &arena, &dropped) {
-                        let mut wake_pids = Vec::new();
-                        binder_maybe_wake_pids(&self.st, &arena, &mut wake_pids);
-                        for wake_pid in wake_pids {
-                            self.push_wake(wake_pid);
-                        }
-                    }
+            MSG_ONEWAY_FD_CACHE_PUT => {
+                for (k, fd) in d.cache() {
+                    self.st.fd_cache.insert(k, fd);
                 }
             }
             MSG_ONEWAY_PARK_REMOVE => {
@@ -4285,14 +4147,16 @@ enum BAction {
     /// Settle one arena's fd fixups inline, riding the
     /// current call's entry stop (resolve_fd_fixups_core);
     /// when rides were needed, the fake result is applied
-    /// to the regs and pend.applied is set. The read-buffer
-    /// address and BWR address let failure handling remove
-    /// only the failed transaction and update read_consumed.
+    /// to the regs and pend.applied is set -- the old
+    /// inline tail of binder_write_read, verbatim. Since
+    /// S1b the resolver's fd cache lives with the
+    /// coordinator: `cache` carries the entries these
+    /// fixups consult, and entries the resolution learns
+    /// are sent back before anything else can read them.
     ResolveFdFixupsInline {
         arena: String,
         fixups: Vec<FdFixup>,
-        read_buf: u64,
-        bwr_addr: u64,
+        cache: Vec<(CacheKey, i32)>,
     },
 }
 
@@ -4344,8 +4208,7 @@ fn exec_binder_actions(
     for (i, j) in pairs {
         let (baddr, newlen) = match &mut actions[i] {
             BAction::WriteMem { addr, bytes } => {
-                let (filtered, dropped) = shield_live_pairs(pid, std::mem::take(bytes));
-                coord.oneway_ref_notice_dropped(pid, &dropped);
+                let filtered = shield_live_pairs(pid, std::mem::take(bytes));
                 *bytes = filtered;
                 (*addr, bytes.len() as u32)
             }
@@ -4356,37 +4219,10 @@ fn exec_binder_actions(
             bytes[16..20].copy_from_slice(&newlen.to_le_bytes());
         }
     }
-    let mut failed_parcels: HashSet<u32> = HashSet::new();
-    let mut failed_read_buf: Option<u64> = None;
-    let mut failed_bwr_addr: Option<u64> = None;
-    let mut filtered_read_len: Option<u32> = None;
     for a in actions {
         match a {
-            BAction::WriteMem { addr, mut bytes } => {
-                if failed_read_buf == Some(addr) && !failed_parcels.is_empty() {
-                    let filtered = filter_failed_fd_parcels_from_ptrs(&bytes, &failed_parcels);
-                    match filtered {
-                        Some(next) => bytes = next,
-                        None => {
-                            sup!("binder: malformed read batch while filtering failed parcel; failing closed");
-                            let dropped = complete_ref_notices_prefix(&bytes);
-                            coord.oneway_ref_notice_dropped(pid, &dropped);
-                            bytes.clear();
-                        }
-                    }
-                    filtered_read_len = Some(bytes.len() as u32);
-                    fill = Some((addr as u32, bytes.len() as u32));
-                }
-                if failed_bwr_addr == Some(addr) {
-                    if let Some(read_len) = filtered_read_len.take() {
-                        if bytes.len() == 24 {
-                            bytes[16..20].copy_from_slice(&read_len.to_le_bytes());
-                        }
-                    }
-                }
-                if let Err(e) = write_mem(pid, addr, &bytes) {
-                    sup!("binder: action write_mem failed pid={pid} addr=0x{addr:x} errno={e}");
-                }
+            BAction::WriteMem { addr, bytes } => {
+                let _ = write_mem(pid, addr, &bytes);
             }
             BAction::SkipSyscall(v) => skip_syscall(pid, regs, pend, v),
             BAction::Park { pid: p, park } => {
@@ -4404,13 +4240,14 @@ fn exec_binder_actions(
                     wakes.push(w);
                 }
             }
-            BAction::ResolveFdFixupsInline { arena, fixups, read_buf, bwr_addr } => {
-                let resolution = resolve_fd_fixups_core(pid, compat, &arena, &fixups, regs);
-                coord.oneway_fd_fixup_failed(&arena, &resolution.failures);
-                failed_parcels.extend(resolution.failures.iter().map(|f| f.parcel_ptr));
-                failed_read_buf = Some(read_buf);
-                failed_bwr_addr = Some(bwr_addr);
-                if resolution.rides > 0 {
+            BAction::ResolveFdFixupsInline { arena, fixups, cache } => {
+                let seed: std::collections::HashSet<CacheKey> =
+                    cache.iter().map(|(k, _)| k.clone()).collect();
+                let mut cmap: HashMap<CacheKey, i32> = cache.into_iter().collect();
+                let rides =
+                    resolve_fd_fixups_core(pid, compat, &mut cmap, &arena, &fixups, regs);
+                coord.oneway_fd_cache_put(&learned_entries(&cmap, &seed));
+                if rides > 0 {
                     regs.set_retval(0);
                     if set_regs(pid, regs) {
                         pend.applied = true;
@@ -4447,367 +4284,45 @@ fn binder_write_obj(st: &mut BinderState, to: &str, node: usize, weak: bool, out
     }
 }
 
-/// Record that a new arena now holds a reference to
-/// Whether remote processes currently hold weak/strong refs to this node.
-/// A strong binder_ref also keeps the node weakly referenced, as in binder.c.
-fn binder_remote_wants(node: &BinderNode) -> (bool, bool) {
-    let strong = node.remote_refs.values().any(|r| r.strong != 0);
-    let weak = strong || node.remote_refs.values().any(|r| r.weak != 0);
-    (weak, strong)
-}
-
-/// Change one receiver process's binder_ref count. Return the node owner so
-/// callers can wake its parked Binder loopers when the desired state changes.
-fn binder_adjust_remote_ref(
+/// Tell a node's owner that a new arena now holds a
+/// reference to it, the way the real driver does when an
+/// object crosses into another process: BR_INCREFS always,
+/// BR_ACQUIRE as well for a strong object. Once per
+/// (node, receiver) pair. Guests whose parse skips these
+/// (stock binder.c) are unaffected; libbinder owners use
+/// them for local object lifetime tracking (S5c).
+fn binder_notify_ref(
     st: &mut BinderState,
     node: usize,
-    arena: &str,
-    strong: bool,
-    increment: bool,
-) -> Option<String> {
-    let (owner, invalid) = {
-        let n = st.nodes.get_mut(node)?;
-        if n.dead {
-            return None;
-        }
-        let owner = n.owner.clone();
-        let counts = n.remote_refs.entry(arena.to_string()).or_default();
-        let value = if strong { &mut counts.strong } else { &mut counts.weak };
-        let invalid = if increment {
-            if *value == u32::MAX {
-                true
-            } else {
-                *value += 1;
-                false
-            }
-        } else if *value == 0 {
-            true
-        } else {
-            *value -= 1;
-            false
-        };
-        let empty = counts.strong == 0 && counts.weak == 0;
-        if empty {
-            n.remote_refs.remove(arena);
-        }
-        let (want_weak, want_strong) = binder_remote_wants(n);
-        if !want_weak {
-            n.ref_weak_dropped = false;
-        }
-        if !want_strong {
-            n.ref_strong_dropped = false;
-        }
-        (owner, invalid)
+    to: &str,
+    weak: bool,
+    actions: &mut Vec<BAction>,
+) {
+    let (owner, nptr, ncookie, dead) = {
+        let n = &st.nodes[node];
+        (n.owner.clone(), n.ptr, n.cookie, n.dead)
     };
-    if invalid {
-        st.note(if increment {
-            "remote binder ref count saturated"
-        } else {
-            "unmatched remote binder ref decrement ignored"
-        });
-    }
-    Some(owner)
-}
-
-/// Undo only the delivery state of exact worker-dropped INCREFS/ACQUIRE pairs.
-/// A stale drop was never visible to guest userspace, so it must not leave a
-/// told/pending bit that suppresses a later release or accepts a phantom DONE.
-fn binder_cancel_dropped_ref_notices(
-    st: &mut BinderState,
-    arena: &str,
-    dropped: &[DroppedRefNotice],
-) -> bool {
-    let mut changed = false;
-    for notice in dropped {
-        if !matches!(notice.cmd, BR_INCREFS | BR_ACQUIRE) {
-            continue;
-        }
-        let Some(node) = st.nodes.iter_mut().find(|n| {
-            !n.dead && n.owner == arena && n.ptr == notice.ptr && n.cookie == notice.cookie
-        }) else {
-            continue;
-        };
-        match notice.cmd {
-            BR_INCREFS if node.ref_weak_pending && node.ref_weak_told => {
-                node.ref_weak_pending = false;
-                node.ref_weak_told = false;
-                node.ref_weak_queued = false;
-                let (want_weak, _) = binder_remote_wants(node);
-                node.ref_weak_dropped = want_weak;
-                changed = true;
-            }
-            BR_ACQUIRE if node.ref_strong_pending && node.ref_strong_told => {
-                node.ref_strong_pending = false;
-                node.ref_strong_told = false;
-                node.ref_strong_queued = false;
-                let (_, want_strong) = binder_remote_wants(node);
-                node.ref_strong_dropped = want_strong;
-                changed = true;
-            }
-            _ => {}
-        }
-    }
-    if changed {
-        st.note("worker-dropped stale Binder ref notice cancelled");
-        materialize_ref_notices(st, arena);
-    }
-    changed
-}
-
-/// Reclaim a transaction buffer that the FD fixup path will filter from the
-/// guest's read batch, and release the temporary handle refs it carried.
-fn binder_discard_failed_parcel(st: &mut BinderState, arena: &str, ptr: u32) -> HashSet<String> {
-    if ptr == 0 {
-        return HashSet::new();
-    }
-    let refs = {
-        let Some(bp) = st.procs.get_mut(arena) else {
-            return HashSet::new();
-        };
-        let Some(off) = bp.base.values().find_map(|base| {
-            let off = ptr.wrapping_sub(*base);
-            bp.used.contains_key(&off).then_some(off)
-        }) else {
-            return HashSet::new();
-        };
-        let Some(size) = bp.used.remove(&off) else {
-            return HashSet::new();
-        };
-        bp.free.push((off, size));
-        bp.free_hit += 1;
-        bp.parcels.remove(&off).map(|parcel| parcel.refs).unwrap_or_default()
-    };
-    let mut owners = HashSet::new();
-    for (node, strong) in refs {
-        if let Some(owner) = binder_adjust_remote_ref(st, node, arena, strong, false) {
-            owners.insert(owner);
-        }
-    }
-    owners
-}
-
-#[derive(Clone, Copy)]
-struct RefNoticeState {
-    node: usize,
-    live: bool,
-    want_weak: bool,
-    want_strong: bool,
-    told_weak: bool,
-    told_strong: bool,
-    pending_weak: bool,
-    pending_strong: bool,
-}
-
-fn prune_ref_notice_stream(
-    bytes: &mut Vec<u8>,
-    states: &HashMap<(u32, u32), RefNoticeState>,
-) -> Vec<(usize, u32)> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut removed = Vec::new();
-    let mut off = 0usize;
-    while off + 4 <= bytes.len() {
-        let cmd = u32_at(bytes, off);
-        let len = br_one_len(cmd);
-        if off + len > bytes.len() {
-            break;
-        }
-        if matches!(cmd, BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS) {
-            let key = (u32_at(bytes, off + 4), u32_at(bytes, off + 8));
-            let state = states.get(&key).copied();
-            let keep = state.is_some_and(|s| {
-                if !s.live {
-                    return false;
-                }
-                match cmd {
-                    BR_INCREFS => s.want_weak && !s.told_weak && !s.pending_weak,
-                    BR_ACQUIRE => s.want_strong && !s.told_strong && !s.pending_strong,
-                    BR_DECREFS => {
-                        !s.want_weak
-                            && s.told_weak
-                            && !s.pending_weak
-                            && !s.pending_strong
-                            && !s.told_strong
-                    }
-                    _ => !s.want_strong && s.told_strong && !s.pending_strong,
-                }
-            });
-            if !keep {
-                if let Some(state) = state {
-                    removed.push((state.node, cmd));
-                }
-                off += len;
-                continue;
-            }
-        }
-        out.extend_from_slice(&bytes[off..off + len]);
-        off += len;
-    }
-    out.extend_from_slice(&bytes[off..]);
-    *bytes = out;
-    removed
-}
-
-/// Drop queued reference commands whose transition has already reversed
-/// before a reader consumes them. The kernel queues node work, then derives
-/// BR_* from current node state inside binder_thread_read; immutable command
-/// bytes must not outlive the state they represented.
-fn prune_pending_ref_notices(st: &mut BinderState, arena: &str) {
-    let mut states = HashMap::new();
-    for (i, n) in st.nodes.iter().enumerate().filter(|(_, n)| n.owner == arena) {
-        let (want_weak, want_strong) = binder_remote_wants(n);
-        states.insert(
-            (n.ptr, n.cookie),
-            RefNoticeState {
-                node: i,
-                live: !n.dead,
-                want_weak,
-                want_strong,
-                told_weak: n.ref_weak_told,
-                told_strong: n.ref_strong_told,
-                pending_weak: n.ref_weak_pending,
-                pending_strong: n.ref_strong_pending,
-            },
-        );
-    }
-    let mut removed = Vec::new();
-    if let Some(bp) = st.procs.get_mut(arena) {
-        removed.extend(prune_ref_notice_stream(&mut bp.inbound, &states));
-        for q in bp.queues.values_mut() {
-            removed.extend(prune_ref_notice_stream(q, &states));
-        }
-    }
-    for (i, cmd) in removed {
-        if let Some(n) = st.nodes.get_mut(i) {
-            match cmd {
-                BR_INCREFS | BR_DECREFS => n.ref_weak_queued = false,
-                BR_ACQUIRE | BR_RELEASE => n.ref_strong_queued = false,
-                _ => {}
-            }
-        }
-    }
-}
-
-fn binder_ref_work_pending(st: &BinderState, arena: &str) -> bool {
-    st.nodes.iter().any(|n| {
-        if n.dead || n.owner != arena {
-            return false;
-        }
-        let (want_weak, want_strong) = binder_remote_wants(n);
-        (want_weak
-            && !n.ref_weak_told
-            && !n.ref_weak_pending
-            && !n.ref_weak_queued
-            && !n.ref_weak_dropped)
-            || (want_strong
-                && !n.ref_strong_told
-                && !n.ref_strong_pending
-                && !n.ref_strong_queued
-                && !n.ref_strong_dropped
-                && n.ref_weak_told)
-            || (!want_strong
-                && n.ref_strong_told
-                && !n.ref_strong_pending
-                && !n.ref_strong_queued)
-            || (!want_weak
-                && n.ref_weak_told
-                && !n.ref_weak_pending
-                && !n.ref_strong_pending
-                && !n.ref_strong_told
-                && !n.ref_weak_queued)
-    })
-}
-
-/// Materialize one arena's pending reference notices at read time, after
-/// pruning stale commands and reconciling counted ref state. ACQUIRE/INCREFS
-/// remain pending until the matching BC_*_DONE is observed.
-fn materialize_ref_notices(st: &mut BinderState, arena: &str) {
-    if !st.procs.contains_key(arena) {
+    if dead || owner == to {
         return;
     }
-    prune_pending_ref_notices(st, arena);
-    let mut pairs: Vec<u8> = Vec::new();
-    for n in &mut st.nodes {
-        if n.dead || n.owner != arena {
-            continue;
-        }
-        let (want_weak, want_strong) = binder_remote_wants(n);
-        // Upward conversions are emitted as one atomic run in this
-        // pass: INCREFS first, then ACQUIRE in the SAME owner read
-        // batch. The one-conversion-per-pass chain (0.9.114) forced
-        // ACQUIRE at least one full guest read turn behind INCREFS;
-        // owners whose Bn object lives only for the scope of the
-        // transaction that published it (mediaserver's startup
-        // burst) drop the object inside that turn, and the delayed
-        // ACQUIRE then incStrong()s freed heap -- deterministically,
-        // on the first ACQUIRE batch of every incarnation. The
-        // kernel's read loop likewise keeps converting the same
-        // node within one read while conversions are owed.
-        let mut emitted_up = false;
-        if want_weak
-            && !n.ref_weak_told
-            && !n.ref_weak_pending
-            && !n.ref_weak_queued
-            && !n.ref_weak_dropped
-        {
-            pairs.extend_from_slice(&BR_INCREFS.to_le_bytes());
-            pairs.extend_from_slice(&n.ptr.to_le_bytes());
-            pairs.extend_from_slice(&n.cookie.to_le_bytes());
-            n.ref_weak_queued = true;
-            emitted_up = true;
-        }
-        if want_strong
-            && !n.ref_strong_told
-            && !n.ref_strong_pending
-            && !n.ref_strong_queued
-            && !n.ref_strong_dropped
-            && (n.ref_weak_told || n.ref_weak_queued)
-        {
-            pairs.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
-            pairs.extend_from_slice(&n.ptr.to_le_bytes());
-            pairs.extend_from_slice(&n.cookie.to_le_bytes());
-            n.ref_strong_queued = true;
-            emitted_up = true;
-        }
-        if emitted_up {
-            continue;
-        }
-        let notice = if !want_strong
-            && n.ref_strong_told
-            && !n.ref_strong_pending
-            && !n.ref_strong_queued
-        {
-            Some(BR_RELEASE)
-        } else if !want_weak
-            && n.ref_weak_told
-            && !n.ref_weak_pending
-            && !n.ref_strong_pending
-            && !n.ref_strong_told
-            && !n.ref_weak_queued
-        {
-            Some(BR_DECREFS)
-        } else {
-            None
-        };
-        if let Some(cmd) = notice {
-            pairs.extend_from_slice(&cmd.to_le_bytes());
-            pairs.extend_from_slice(&n.ptr.to_le_bytes());
-            pairs.extend_from_slice(&n.cookie.to_le_bytes());
-            match cmd {
-                BR_DECREFS => n.ref_weak_queued = true,
-                BR_RELEASE => n.ref_strong_queued = true,
-                _ => {}
-            }
-        }
-    }
-    if pairs.is_empty() {
+    let notified_key = (node, to.to_string());
+    if st.ref_notified.contains_key(&notified_key) {
         return;
     }
-    if let Some(bp) = st.procs.get_mut(arena) {
-        let mut block = pairs;
-        block.extend_from_slice(&bp.inbound);
-        bp.inbound = block;
-        st.note("ref notices materialized at owner read");
+    st.ref_notified.insert(notified_key, weak);
+    st.notify_queued += 1;
+    if let Some(bp) = st.procs.get_mut(&owner) {
+        bp.inbound.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+        bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+        if !weak {
+            bp.inbound.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+            bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+            bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+        }
     }
+    binder_maybe_wake(st, &owner, actions);
+    st.note("ref notice queued to object owner");
 }
 
 /// Compact dump of a parcel's object slots for telemetry:
@@ -4846,6 +4361,7 @@ fn binder_translate(
     to: &str,
     data: &[u8],
     offs: &[u8],
+    actions: &mut Vec<BAction>,
     fd_fixups: &mut Vec<(usize, i32)>,
 ) -> Vec<u8> {
     let mut out = data.to_vec();
@@ -4863,6 +4379,7 @@ fn binder_translate(
             OBJ_BINDER | OBJ_WEAK_BINDER => {
                 let node = st.node_for_local(from, ptr, cookie);
                 binder_write_obj(st, to, node, ty == OBJ_WEAK_BINDER, &mut out, off);
+                binder_notify_ref(st, node, to, ty == OBJ_WEAK_BINDER, actions);
             }
             OBJ_HANDLE | OBJ_WEAK_HANDLE => {
                 let node = if ptr == 0 {
@@ -4875,6 +4392,7 @@ fn binder_translate(
                 match node {
                     Some(n) => {
                         binder_write_obj(st, to, n, ty == OBJ_WEAK_HANDLE, &mut out, off);
+                        binder_notify_ref(st, n, to, ty == OBJ_WEAK_HANDLE, actions);
                     }
                     None => bsup!(
                         "binder: unknown handle 0x{ptr:x} in parcel {from} -> {to}; left untranslated"
@@ -4892,70 +4410,12 @@ fn binder_translate(
     out
 }
 
-/// Snapshot the identity and access mode of a sender descriptor while
-/// the originating Binder write is being handled. This lets the delayed
-/// receiver-side open reject a closed/reused descriptor instead of
-/// silently substituting an unrelated file.
-fn proc_fd_snapshot(pid: i32, fd: i32) -> Option<(u64, u64, i32)> {
-    if fd < 0 {
-        return None;
-    }
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(format!("/proc/{pid}/fd/{fd}")).ok()?;
-    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
-    let raw_flags = info
-        .lines()
-        .find_map(|line| line.strip_prefix("flags:").map(str::trim))
-        .and_then(|s| u32::from_str_radix(s, 8).ok())?;
-    const LINUX_O_PATH: u32 = 0x20_0000;
-    let open_flags = if raw_flags & LINUX_O_PATH != 0 {
-        LINUX_O_PATH as i32
-    } else {
-        (raw_flags & libc::O_ACCMODE as u32) as i32
-    };
-    Some((meta.dev(), meta.ino(), open_flags))
-}
-
-/// Find remote handle references whose lifetime is tied to this delivered
-/// transaction buffer. The kernel increments these while translating the
-/// parcel and decrements them when the receiver sends BC_FREE_BUFFER.
-fn parcel_remote_refs(
-    st: &BinderState,
-    arena: &str,
-    data: &[u8],
-    offs: &[u8],
-) -> Vec<(usize, bool)> {
-    let mut refs = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= offs.len() {
-        let off = u32_at(offs, i) as usize;
-        i += 4;
-        if off.checked_add(16).is_none_or(|end| end > data.len()) {
-            continue;
-        }
-        let ty = u32_at(data, off);
-        if !matches!(ty, OBJ_HANDLE | OBJ_WEAK_HANDLE) {
-            continue;
-        }
-        let handle = u32_at(data, off + 8);
-        let node = st
-            .procs
-            .get(arena)
-            .and_then(|p| p.handles.get(&handle).copied());
-        if let Some(node) = node {
-            refs.push((node, ty == OBJ_HANDLE));
-        }
-    }
-    refs
-}
-
 /// Copy a translated parcel into the target arena and queue
 /// the BR_TRANSACTION / BR_REPLY carrying it. On failure the
 /// Err names the exact stage, so a dead delivery explains
 /// itself in the log instead of hiding behind a bool.
 fn binder_deliver(
     st: &mut BinderState,
-    actions: &mut Vec<BAction>,
     target: &str,
     br_cmd: u32,
     target_ptr: u32,
@@ -4967,22 +4427,25 @@ fn binder_deliver(
     data: &[u8],
     offs: &[u8],
     fd_fixups: &[(usize, i32)],
-    failure: FixupFailure,
     // For BR_REPLY: the thread this reply belongs to. Its
     // bytes must land in that thread's own queue, never in
     // the shared inbound stream.
     reply_to: Option<i32>,
 ) -> Result<(), &'static str> {
-    let parcel_refs = parcel_remote_refs(st, target, data, offs);
-    let snapshots: Vec<(u64, u64, i32)> = fd_fixups
-        .iter()
-        .map(|(_, sfd)| proc_fd_snapshot(sender_pid, *sfd))
-        .collect::<Option<Vec<_>>>()
-        .ok_or("source fd closed or cannot be inspected")?;
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
         return Err("alloc failed (no such arena state, or out of mapped space)");
     };
+    for (rel, sfd) in fd_fixups {
+        st.fd_pending
+            .entry(target.to_string())
+            .or_default()
+            .push(FdFixup {
+                file_off: off as u64 + *rel as u64,
+                sender_pid,
+                sender_fd: *sfd,
+            });
+    }
     let Some(bp) = st.procs.get_mut(target) else {
         return Err("arena state vanished after alloc");
     };
@@ -4993,25 +4456,6 @@ fn binder_deliver(
         || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
     {
         return Err("arena file write failed");
-    }
-    for ((rel, sfd), (source_dev, source_ino, open_flags)) in
-        fd_fixups.iter().zip(snapshots.into_iter())
-    {
-        let mut failure = failure.clone();
-        failure.parcel_ptr = base + off;
-        st.fd_pending
-            .entry(target.to_string())
-            .or_default()
-            .push(FdFixup {
-                file_off: off as u64 + *rel as u64,
-                parcel_ptr: base + off,
-                sender_pid,
-                sender_fd: *sfd,
-                source_dev,
-                source_ino,
-                open_flags,
-                failure,
-            });
     }
     {
         // 0.9.99: fingerprint the parcel image exactly as
@@ -5043,7 +4487,6 @@ fn binder_deliver(
                 total,
                 mask,
                 head,
-                refs: parcel_refs.clone(),
                 from_pid: sender_pid,
                 code,
                 target_ptr,
@@ -5154,16 +4597,6 @@ fn binder_deliver(
             }
         }
     }
-    let mut ref_owners = HashSet::new();
-    for &(node, strong) in &parcel_refs {
-        if let Some(owner) = binder_adjust_remote_ref(st, node, target, strong, true) {
-            ref_owners.insert(owner);
-        }
-    }
-    st.notify_queued += parcel_refs.len() as u64;
-    for owner in ref_owners {
-        binder_maybe_wake(st, &owner, actions);
-    }
     Ok(())
 }
 
@@ -5176,13 +4609,12 @@ fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
     let Some(bp) = st.procs.get(arena) else {
         return Vec::new();
     };
-    let ref_work = binder_ref_work_pending(st, arena);
-    if bp.inbound.is_empty() && bp.queues.values().all(|q| q.is_empty()) && !ref_work {
+    if bp.inbound.is_empty() && bp.queues.values().all(|q| q.is_empty()) {
         return Vec::new();
     }
-    // Wake exactly parked threads that have addressed bytes,
-    // or loopers that can read inbound bytes / pending node
-    // work. (The old code
+    // Wake exactly the parked threads that have bytes they
+    // may read: a thread with addressed bytes, or a looper
+    // while the inbound stream is non-empty. (The old code
     // woke the first parked thread it found and handed it
     // the whole shared queue, whatever the bytes were for.)
     let mut out = Vec::new();
@@ -5194,9 +4626,7 @@ fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
             continue;
         }
         let own = bp.queues.get(pid).map_or(0, |q| q.len());
-        if own > 0
-            || ((!bp.inbound.is_empty() || ref_work) && bp.loopers.contains(pid))
-        {
+        if own > 0 || (!bp.inbound.is_empty() && bp.loopers.contains(pid)) {
             out.push(*pid);
         }
     }
@@ -5263,15 +4693,13 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 }
                 let ptr = u32_at(stream, cur);
                 cur += 4;
-                let mut released_refs = Vec::new();
                 if let Some(bp) = st.procs.get_mut(arena) {
                     match bp.base.get(&pid) {
                         Some(&base) => {
                             let off = ptr.wrapping_sub(base);
                             if let Some(sz) = bp.used.remove(&off) {
                                 bp.free.push((off, sz));
-                                if let Some(parcel) = bp.parcels.remove(&off) {
-                                    released_refs = parcel.refs;
+                                if bp.parcels.remove(&off).is_some() {
                                     bp.free_parcel_hit += 1;
                                 }
                                 bp.free_hit += 1;
@@ -5288,70 +4716,19 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                         }
                     }
                 }
-                let mut owners = HashSet::new();
-                for (node, strong) in released_refs {
-                    if let Some(owner) = binder_adjust_remote_ref(st, node, arena, strong, false) {
-                        owners.insert(owner);
-                    }
-                }
-                for owner in owners {
-                    binder_maybe_wake(st, &owner, actions);
-                }
             }
             BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
                 if cur + 4 > stream.len() {
                     break;
                 }
-                let h = u32_at(stream, cur);
                 cur += 4;
-                // The guest's own BpBinder reference counts are
-                // per binder_ref, just like parcel-held counts.
-                // Handle 0 is the context manager: skip silently.
-                if h != 0 {
-                    let node = st
-                        .procs
-                        .get(arena)
-                        .and_then(|p| p.handles.get(&h).copied());
-                    if let Some(ni) = node {
-                        let strong = matches!(cmd, BC_ACQUIRE | BC_RELEASE);
-                        let increment = matches!(cmd, BC_INCREFS | BC_ACQUIRE);
-                        if let Some(owner) =
-                            binder_adjust_remote_ref(st, ni, arena, strong, increment)
-                        {
-                            binder_maybe_wake(st, &owner, actions);
-                        }
-                        st.note("refcount BC applied");
-                    }
-                }
+                st.note("refcount BC consumed (v1 no-op)");
             }
             BC_INCREFS_DONE | BC_ACQUIRE_DONE => {
                 if cur + 8 > stream.len() {
                     break;
                 }
-                let ptr = u32_at(stream, cur);
-                let cookie = u32_at(stream, cur + 4);
                 cur += 8;
-                let matched = st.nodes.iter_mut().find(|n| {
-                    !n.dead && n.owner == arena && n.ptr == ptr && n.cookie == cookie
-                });
-                let acknowledged = if let Some(n) = matched {
-                    if cmd == BC_ACQUIRE_DONE && n.ref_strong_pending {
-                        n.ref_strong_pending = false;
-                        true
-                    } else if cmd == BC_INCREFS_DONE && n.ref_weak_pending {
-                        n.ref_weak_pending = false;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !acknowledged {
-                    st.note("unmatched Binder reference DONE ignored");
-                } else {
-                    st.note("Binder reference DONE acknowledged");
-                }
             }
             BC_ATTEMPT_ACQUIRE => {
                 if cur + 8 > stream.len() {
@@ -5561,10 +4938,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             return;
         }
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
-        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, &mut fd_fixups);
+        let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, actions, &mut fd_fixups);
         let delivered = binder_deliver(
             st,
-            actions,
             &w.sender_arena,
             BR_REPLY,
             w.target_handle,
@@ -5576,14 +4952,6 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             &tdata,
             &offs,
             &fd_fixups,
-            FixupFailure {
-                parcel_ptr: 0,
-                reply_arena: w.sender_arena.clone(),
-                reply_pid: w.sender_pid,
-                reply_cmd: BR_FAILED_REPLY,
-                wait_cookie: w.cookie,
-                wait_target_handle: w.target_handle,
-            },
             Some(w.sender_pid),
         );
         if let Err(why) = delivered {
@@ -5712,37 +5080,17 @@ fn binder_send_txn(
         );
     }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
-    let tdata = binder_translate(st, arena, &owner, &data, &offs, &mut fd_fixups);
+    let tdata = binder_translate(st, arena, &owner, &data, &offs, actions, &mut fd_fixups);
     let delivered = binder_deliver(
-        st, actions, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
+        st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
         &fd_fixups,
-        FixupFailure {
-            parcel_ptr: 0,
-            reply_arena: arena.to_string(),
-            reply_pid: pid,
-            reply_cmd: if flags & TF_ONE_WAY == 0 { BR_FAILED_REPLY } else { 0 },
-            wait_cookie: cookie,
-            wait_target_handle: target,
-        },
         None,
     );
     if let Err(why) = delivered {
-        if flags & TF_ONE_WAY == 0 {
-            let reply = if why == "source fd closed or cannot be inspected" {
-                BR_FAILED_REPLY
-            } else {
-                BR_DEAD_REPLY
-            };
-            if let Some(bp) = st.procs.get_mut(arena) {
-                bp.push_to(pid, &reply.to_le_bytes());
-            }
-            notes.push(format!(
-                "TRANSACTION target cannot receive ({why}) -> {}",
-                if reply == BR_FAILED_REPLY { "FAILED_REPLY" } else { "DEAD_REPLY" }
-            ));
-        } else {
-            notes.push(format!("one-way TRANSACTION target cannot receive ({why}); dropped"));
+        if let Some(bp) = st.procs.get_mut(arena) {
+            bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
+        notes.push(format!("TRANSACTION target cannot receive ({why}) -> DEAD_REPLY"));
         return;
     }
     if flags & TF_ONE_WAY == 0 {
@@ -5819,10 +5167,6 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         put_u32(&mut b, 20, rb);
         b
     };
-    // Same fill-time ref-notice materialization as the
-    // parked path (materialize_ref_notices), before the
-    // readable computation below consults the queues.
-    materialize_ref_notices(st, &arena);
     let queue_len = st
         .procs
         .get(&arena)
@@ -5851,16 +5195,6 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         let bytes = shield_ref_pairs(st, &arena, pid, bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
         let filled = bytes.len();
-        let fixups = take_fd_fixups_for_batch(st, &arena, &bytes);
-        actions.push(BAction::SkipSyscall(0));
-        if !fixups.is_empty() {
-            actions.push(BAction::ResolveFdFixupsInline {
-                arena: arena.clone(),
-                fixups,
-                read_buf: rb as u64,
-                bwr_addr,
-            });
-        }
         actions.push(BAction::WriteMem {
             addr: rb as u64,
             bytes,
@@ -5869,6 +5203,7 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             addr: bwr_addr,
             bytes: writeback(filled as u32).to_vec(),
         });
+        actions.push(BAction::SkipSyscall(0));
         // Deliveries to this arena may have left fd fixups
         // unresolved. They are normally settled when the
         // receiver is woken out of a park; a thread that
@@ -5883,6 +5218,27 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // regs by the executor and the caller drops its
         // exit-stop expectation (it keys that off
         // pend.applied).
+        if let Some(fixups) = st.fd_pending.remove(&arena) {
+            if !fixups.is_empty() {
+                // The resolver runs tracer-side but the
+                // cache lives here now: attach the entries
+                // these fixups will consult; what it
+                // learns comes back before any later
+                // decision reads the cache again.
+                let cache: Vec<(CacheKey, i32)> = fixups
+                    .iter()
+                    .filter_map(|f| {
+                        let key: CacheKey = (arena.clone(), f.sender_pid, f.sender_fd);
+                        st.fd_cache.get(&key).map(|fd| (key, *fd))
+                    })
+                    .collect();
+                actions.push(BAction::ResolveFdFixupsInline {
+                    arena: arena.clone(),
+                    fixups,
+                    cache,
+                });
+            }
+        }
         notes.push(format!("read filled {}B", filled));
     } else if rs > 0 {
         actions.push(BAction::SkipSyscall(0));
@@ -5904,7 +5260,6 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         });
         actions.push(BAction::SkipSyscall(0));
     }
-    binder_maybe_wake(st, &arena, actions);
     if notes.is_empty() {
         notes.push("no work".to_string());
     }
@@ -5944,131 +5299,13 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
     off
 }
 
-fn batch_parcel_ptrs(bytes: &[u8]) -> HashSet<u32> {
-    let mut out = HashSet::new();
-    let mut off = 0usize;
-    while off + 4 <= bytes.len() {
-        let cmd = u32_at(bytes, off);
-        let len = br_one_len(cmd);
-        if off + len > bytes.len() {
-            break;
-        }
-        if matches!(cmd, BR_TRANSACTION | BR_REPLY) {
-            // The 4-byte BR opcode precedes binder_transaction_data;
-            // data.ptr.buffer is at offset 32 within that struct.
-            out.insert(u32_at(bytes, off + 36));
-        }
-        off += len;
-    }
-    out
-}
-
-fn take_fd_fixups_for_batch(st: &mut BinderState, arena: &str, bytes: &[u8]) -> Vec<FdFixup> {
-    let Some(all) = st.fd_pending.remove(arena) else {
-        return Vec::new();
-    };
-    let parcels = batch_parcel_ptrs(bytes);
-    let mut selected = Vec::new();
-    let mut remaining = Vec::new();
-    for fixup in all {
-        if parcels.contains(&fixup.parcel_ptr) {
-            selected.push(fixup);
-        } else {
-            remaining.push(fixup);
-        }
-    }
-    if !remaining.is_empty() {
-        st.fd_pending.insert(arena.to_string(), remaining);
-    }
-    selected
-}
-
-/// Remove only transaction commands whose parcel fixups failed. A failed
-/// pointer absent from this batch is not a reason to discard unrelated work;
-/// None is reserved for a malformed command stream that cannot be filtered.
-fn filter_failed_fd_parcels(bytes: &[u8], failures: &[FixupFailure]) -> Option<Vec<u8>> {
-    if failures.is_empty() {
-        return Some(bytes.to_vec());
-    }
-    let failed: HashSet<u32> = failures.iter().map(|f| f.parcel_ptr).collect();
-    filter_failed_fd_parcels_from_ptrs(bytes, &failed)
-}
-
-fn filter_failed_fd_parcels_from_ptrs(bytes: &[u8], failed: &HashSet<u32>) -> Option<Vec<u8>> {
-    if failed.is_empty() {
-        return Some(bytes.to_vec());
-    }
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut off = 0usize;
-    while off + 4 <= bytes.len() {
-        let cmd = u32_at(bytes, off);
-        let len = br_one_len(cmd);
-        if off + len > bytes.len() {
-            return None;
-        }
-        if matches!(cmd, BR_TRANSACTION | BR_REPLY) {
-            let parcel_ptr = u32_at(bytes, off + 36);
-            if failed.contains(&parcel_ptr) {
-                off += len;
-                continue;
-            }
-        }
-        out.extend_from_slice(&bytes[off..off + len]);
-        off += len;
-    }
-    if off != bytes.len() {
-        return None;
-    }
-    Some(out)
-}
-
-/// Collect only complete, recognized ref notices from the valid prefix of a
-/// batch that is about to be discarded wholesale. Unknown or truncated data
-/// ends the scan, so arbitrary payload bytes cannot become rollback keys.
-fn complete_ref_notices_prefix(bytes: &[u8]) -> Vec<DroppedRefNotice> {
-    let mut notices = Vec::new();
-    let mut off = 0usize;
-    while off + 4 <= bytes.len() {
-        let cmd = u32_at(bytes, off);
-        if !matches!(
-            cmd,
-            BR_TRANSACTION
-                | BR_REPLY
-                | BR_INCREFS
-                | BR_ACQUIRE
-                | 0x8008_7209
-                | 0x8008_720a
-                | BR_DEAD_BINDER
-                | BR_CLEAR_DEATH_NOTIFICATION_DONE
-                | 0x8000_7200
-                | BR_DEAD_REPLY
-                | BR_TRANSACTION_COMPLETE
-        ) {
-            break;
-        }
-        let len = br_one_len(cmd);
-        if off + len > bytes.len() {
-            break;
-        }
-        if matches!(cmd, BR_INCREFS | BR_ACQUIRE) {
-            notices.push(DroppedRefNotice {
-                cmd,
-                ptr: u32_at(bytes, off + 4),
-                cookie: u32_at(bytes, off + 8),
-            });
-        }
-        off += len;
-    }
-    notices
-}
-
 /// 0.9.103 shield (user's call: intercept the bad
 /// reference before the receiver can consume it).
 /// Validate every BR_INCREFS / BR_ACQUIRE pair in an
 /// assembled batch against the node registry: a pair is
 /// deliverable only if it names a LIVE node owned by the
 /// batch's own arena -- exactly the (ptr, obj) words
-/// node is owned by the arena whose reader receives it. Anything else
+/// binder_notify_ref queued it from. Anything else
 /// (unknown pair, or a dead node's pair: delivering it
 /// makes the guest incStrong freed memory, the crash
 /// shape itself) is cut out of the batch whole -- 12B
@@ -6104,7 +5341,7 @@ fn shield_ref_pairs(
         if off + len > bytes.len() {
             break;
         }
-        if matches!(cmd, BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS) {
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
             let a = u32_at(&bytes, off + 4);
             let b = u32_at(&bytes, off + 8);
             if !live.contains(&(a, b)) {
@@ -6122,39 +5359,6 @@ fn shield_ref_pairs(
             }
         }
         out.extend_from_slice(&bytes[off..off + len]);
-        // A ref pair that passes here is being delivered. Acquire/increfs
-        // create kernel-style pending refs; the guest releases those pins
-        // only by sending the matching BC_*_DONE after handling the command.
-        if len == 12 && matches!(cmd, BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS) {
-            let a = u32_at(&bytes, off + 4);
-            let b = u32_at(&bytes, off + 8);
-            if let Some(n) = st
-                .nodes
-                .iter_mut()
-                .find(|n| !n.dead && n.owner == arena && n.ptr == a && n.cookie == b)
-            {
-                match cmd {
-                    BR_INCREFS => {
-                        n.ref_weak_told = true;
-                        n.ref_weak_pending = true;
-                        n.ref_weak_queued = false;
-                    }
-                    BR_ACQUIRE => {
-                        n.ref_strong_told = true;
-                        n.ref_strong_pending = true;
-                        n.ref_strong_queued = false;
-                    }
-                    BR_RELEASE => {
-                        n.ref_strong_told = false;
-                        n.ref_strong_queued = false;
-                    }
-                    _ => {
-                        n.ref_weak_told = false;
-                        n.ref_weak_queued = false;
-                    }
-                }
-            }
-        }
         off += len;
     }
     if off < bytes.len() {
@@ -6219,15 +5423,11 @@ fn ref_batch_qualifies(bytes: &[u8]) -> bool {
 /// everything; that attempt was removed in 0.9.105).
 /// A pair whose link does not close, or whose memory
 /// is unmapped, is cut whole and logged.
-fn filter_live_ref_pairs<F>(bytes: Vec<u8>, mut is_live: F) -> (Vec<u8>, Vec<DroppedRefNotice>)
-where
-    F: FnMut(u32, u32, u32) -> bool,
-{
+fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> Vec<u8> {
     if !ref_batch_qualifies(&bytes) {
-        return (bytes, Vec::new());
+        return bytes;
     }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut dropped = Vec::new();
     let mut off = 0usize;
     while off + 4 <= bytes.len() {
         let cmd = u32_at(&bytes, off);
@@ -6235,12 +5435,22 @@ where
         if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
             let a = u32_at(&bytes, off + 4);
             let b = u32_at(&bytes, off + 8);
-            if !is_live(cmd, a, b) {
-                dropped.push(DroppedRefNotice {
-                    cmd,
-                    ptr: a,
-                    cookie: b,
-                });
+            let mbase = read_mem_vec(pid, (a as u64) + 8, 4)
+                .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()));
+            let backref = mbase.and_then(|m| {
+                read_mem_vec(pid, (m as u64) + 4, 4)
+                    .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()))
+            });
+            if backref != Some(a) {
+                sup!(
+                    "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={} backref={}",
+                    mbase
+                        .map(|m| format!("0x{m:x}"))
+                        .unwrap_or_else(|| "<unmapped>".to_string()),
+                    backref
+                        .map(|m| format!("0x{m:x}"))
+                        .unwrap_or_else(|| "<unmapped>".to_string())
+                );
                 off += len;
                 continue;
             }
@@ -6248,29 +5458,7 @@ where
         out.extend_from_slice(&bytes[off..off + len]);
         off += len;
     }
-    (out, dropped)
-}
-fn shield_live_pairs(pid: i32, bytes: Vec<u8>) -> (Vec<u8>, Vec<DroppedRefNotice>) {
-    filter_live_ref_pairs(bytes, |cmd, a, b| {
-        let mbase = read_mem_vec(pid, (a as u64) + 8, 4)
-            .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()));
-        let backref = mbase.and_then(|m| {
-            read_mem_vec(pid, (m as u64) + 4, 4)
-                .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()))
-        });
-        if backref != Some(a) {
-            sup!(
-                "binder: shield2 dropped stale ref pair pid={pid}: op=0x{cmd:x} a=0x{a:x} b=0x{b:x} mbase={} backref={}",
-                mbase
-                    .map(|m| format!("0x{m:x}"))
-                    .unwrap_or_else(|| "<unmapped>".to_string()),
-                backref
-                    .map(|m| format!("0x{m:x}"))
-                    .unwrap_or_else(|| "<unmapped>".to_string())
-            );
-        }
-        backref == Some(a)
-    })
+    out
 }
 
 /// One-shot latch for the success-side VMA sample.
@@ -6550,7 +5738,6 @@ fn inject_openat(
     path_addr: u64,
     entry_pc: u64,
     rewind: bool,
-    open_flags: i32,
     regs: &mut Regs,
 ) -> i64 {
     if rewind {
@@ -6560,7 +5747,7 @@ fn inject_openat(
     regs.set_nr(nr_openat);
     regs.set_arg(0, (-100i32) as i64 as u64); // AT_FDCWD
     regs.set_arg(1, path_addr);
-    regs.set_arg(2, open_flags as u64);
+    regs.set_arg(2, 2); // O_RDWR
     regs.set_arg(3, 0);
     if !set_regs(pid, regs) {
         return -1;
@@ -6591,81 +5778,6 @@ fn inject_openat(
     }
 }
 
-fn inject_close(
-    pid: i32,
-    compat: bool,
-    entry_pc: u64,
-    rewind: bool,
-    fd: i32,
-    regs: &mut Regs,
-) -> i64 {
-    if rewind {
-        regs.set_pc(entry_pc);
-    }
-    let nr_close: u64 = if compat { 6 } else { 57 };
-    regs.set_nr(nr_close);
-    regs.set_arg(0, fd as u64);
-    if !set_regs(pid, regs) || !set_syscallno(pid, nr_close as i32) {
-        return -1;
-    }
-    cont_syscall(pid, 0);
-    let mut stops_needed = if rewind { 2 } else { 1 };
-    loop {
-        match wait_one_syscall_stop(pid) {
-            Some(()) => {
-                stops_needed -= 1;
-                if stops_needed == 0 {
-                    match get_regs(pid, compat) {
-                        Some(r) => {
-                            *regs = r;
-                            return r.retval();
-                        }
-                        None => return -1,
-                    }
-                }
-                cont_syscall(pid, 0);
-            }
-            None => return -1,
-        }
-    }
-}
-
-struct FdFixupResolution {
-    rides: usize,
-    failures: Vec<FixupFailure>,
-}
-
-fn unique_fixup_failures(fixups: &[FdFixup]) -> Vec<FixupFailure> {
-    let mut seen = HashSet::new();
-    fixups
-        .iter()
-        .filter_map(|fx| {
-            if seen.insert(fx.failure.clone()) {
-                Some(fx.failure.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn close_injected_fds(
-    pid: i32,
-    compat: bool,
-    entry_pc: u64,
-    regs: &mut Regs,
-    rides: &mut usize,
-    fds: impl IntoIterator<Item = i32>,
-) {
-    for fd in fds {
-        let rc = inject_close(pid, compat, entry_pc, *rides > 0, fd, regs);
-        *rides += 1;
-        if rc < 0 {
-            sup!("binder: could not close rolled-back receiver fd={fd} in pid={pid}");
-        }
-    }
-}
-
 /// Resolve one wake's FD fixups: make the receiver open
 /// each sender fd itself, patch the parcel words in its
 /// arena file, then settle its parked call. The rides
@@ -6684,127 +5796,34 @@ fn close_injected_fds(
 fn resolve_fd_fixups_core(
     pid: i32,
     compat: bool,
+    cache: &mut HashMap<CacheKey, i32>,
     arena: &str,
     fixups: &[FdFixup],
     regs: &mut Regs,
-) -> FdFixupResolution {
+) -> usize {
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
-    let mut rides = 0usize;
-    let mut failed_parcels = HashSet::new();
-    let mut failures = Vec::new();
-    let mut opened: HashMap<u32, Vec<i32>> = HashMap::new();
-    let arena_file = match std::fs::OpenOptions::new().write(true).open(arena) {
-        Ok(f) => f,
-        Err(e) => {
-            sup!("binder: cannot open arena for fd fixup {}: {e}", arena);
-            return FdFixupResolution {
-                rides,
-                failures: unique_fixup_failures(fixups),
-            };
-        }
-    };
-    use std::os::unix::fs::FileExt;
+    let mut rides = 0;
     for fx in fixups {
-        if failed_parcels.contains(&fx.parcel_ptr) {
-            continue;
-        }
-        let source = proc_fd_snapshot(fx.sender_pid, fx.sender_fd);
-        if !matches!(source, Some((dev, ino, flags)) if dev == fx.source_dev && ino == fx.source_ino && flags == fx.open_flags)
-        {
-            failed_parcels.insert(fx.parcel_ptr);
-            failures.push(fx.failure.clone());
-            close_injected_fds(
-                pid,
-                compat,
-                entry_pc,
-                regs,
-                &mut rides,
-                opened.remove(&fx.parcel_ptr).unwrap_or_default(),
-            );
-            sup!(
-                "binder: source fd {} of pid {} changed before fixup; parcel=0x{:x} rejected",
-                fx.sender_fd,
-                fx.sender_pid,
-                fx.parcel_ptr
-            );
-            continue;
-        }
-        let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
-        let Some(path_addr) = scratch_write(pid, &mut cursor, &path) else {
-            failed_parcels.insert(fx.parcel_ptr);
-            failures.push(fx.failure.clone());
-            close_injected_fds(
-                pid,
-                compat,
-                entry_pc,
-                regs,
-                &mut rides,
-                opened.remove(&fx.parcel_ptr).unwrap_or_default(),
-            );
-            continue;
-        };
-        let newfd = inject_openat(
-            pid,
-            compat,
-            path_addr,
-            entry_pc,
-            rides > 0,
-            fx.open_flags,
-            regs,
-        );
-        rides += 1;
-        let opened_snapshot = if newfd >= 0 {
-            proc_fd_snapshot(pid, newfd as i32)
+        let cache_key = (arena.to_string(), fx.sender_pid, fx.sender_fd);
+        let newfd: i64 = if let Some(fd) = cache.get(&cache_key) {
+            *fd as i64
         } else {
-            None
-        };
-        if !matches!(opened_snapshot, Some((dev, ino, flags)) if dev == fx.source_dev && ino == fx.source_ino && flags == fx.open_flags)
-        {
-            if newfd >= 0 {
-                close_injected_fds(pid, compat, entry_pc, regs, &mut rides, [newfd as i32]);
+            let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
+            let fd = match scratch_write(pid, &mut cursor, &path) {
+                Some(addr) => inject_openat(pid, compat, addr, entry_pc, rides > 0, &mut *regs),
+                None => -1,
+            };
+            rides += 1;
+            if fd >= 0 {
+                cache.insert(cache_key, fd as i32);
             }
-            failed_parcels.insert(fx.parcel_ptr);
-            failures.push(fx.failure.clone());
-            close_injected_fds(
-                pid,
-                compat,
-                entry_pc,
-                regs,
-                &mut rides,
-                opened.remove(&fx.parcel_ptr).unwrap_or_default(),
-            );
-            sup!(
-                "binder: openat failed or resolved a different object for sender fd {} pid {}; parcel=0x{:x} rejected",
-                fx.sender_fd,
-                fx.sender_pid,
-                fx.parcel_ptr
-            );
-            continue;
+            fd
+        };
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(arena) {
+            use std::os::unix::fs::FileExt;
+            let _ = f.write_all_at(&(newfd as u32).to_le_bytes(), fx.file_off);
         }
-        if arena_file
-            .write_all_at(&(newfd as u32).to_le_bytes(), fx.file_off)
-            .is_err()
-        {
-            failed_parcels.insert(fx.parcel_ptr);
-            failures.push(fx.failure.clone());
-            close_injected_fds(
-                pid,
-                compat,
-                entry_pc,
-                regs,
-                &mut rides,
-                [newfd as i32]
-                    .into_iter()
-                    .chain(opened.remove(&fx.parcel_ptr).unwrap_or_default()),
-            );
-            sup!(
-                "binder: arena fd word write failed for parcel=0x{:x}",
-                fx.parcel_ptr
-            );
-            continue;
-        }
-        opened.entry(fx.parcel_ptr).or_default().push(newfd as i32);
         sup!(
             "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup)",
             fx.sender_fd,
@@ -6813,7 +5832,7 @@ fn resolve_fd_fixups_core(
             pid
         );
     }
-    FdFixupResolution { rides, failures }
+    rides
 }
 
 fn resolve_fd_fixups(
@@ -6822,22 +5841,22 @@ fn resolve_fd_fixups(
     coord: &mut CoordClient,
     arena: &str,
     fixups: &[FdFixup],
-) -> Vec<FixupFailure> {
+    cache_seed: Vec<(CacheKey, i32)>,
+) {
     let Some(proc0) = procs.get(&pid) else {
-        let failures = unique_fixup_failures(fixups);
-        coord.oneway_fd_fixup_failed(arena, &failures);
-        return failures;
+        return;
     };
     let compat = proc0.compat;
     let Some(mut regs) = get_regs(pid, compat) else {
-        let failures = unique_fixup_failures(fixups);
-        coord.oneway_fd_fixup_failed(arena, &failures);
-        return failures;
+        return;
     };
-    let resolution = resolve_fd_fixups_core(pid, compat, arena, fixups, &mut regs);
-    coord.oneway_fd_fixup_failed(arena, &resolution.failures);
-    if resolution.rides == 0 {
-        return resolution.failures;
+    let seed: std::collections::HashSet<CacheKey> =
+        cache_seed.iter().map(|(k, _)| k.clone()).collect();
+    let mut cache: HashMap<CacheKey, i32> = cache_seed.into_iter().collect();
+    let rides = resolve_fd_fixups_core(pid, compat, &mut cache, arena, fixups, &mut regs);
+    coord.oneway_fd_cache_put(&learned_entries(&cache, &seed));
+    if rides == 0 {
+        return;
     }
     if let Some(proc) = procs.get_mut(&pid) {
         if let Some(pend) = proc.pending.as_mut() {
@@ -6855,7 +5874,6 @@ fn resolve_fd_fixups(
         }
         proc.expect_exit = false;
     }
-    resolution.failures
 }
 
 /// Finish a parked binder ioctl now that its arena has
@@ -6871,21 +5889,7 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
-    let mut bytes = bytes;
-    if let Some((arena, fixups)) = fixups {
-        let failures = resolve_fd_fixups(pid, procs, coord, &arena, &fixups);
-        if !failures.is_empty() {
-            match filter_failed_fd_parcels(&bytes, &failures) {
-                Some(filtered) => bytes = filtered,
-                None => {
-                    sup!("binder: malformed parked read batch while filtering failed parcel; failing closed");
-                    bytes.clear();
-                }
-            }
-        }
-    }
-    let (bytes, dropped) = shield_live_pairs(pid, bytes);
-    coord.oneway_ref_notice_dropped(pid, &dropped);
+    let bytes = shield_live_pairs(pid, bytes);
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
     }
@@ -6905,6 +5909,13 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     // applies the 0 and retains the record, the late SIGSYS
     // is rescued and consumes it. (No regs surgery here: the
     // exit stop applies the inject itself.)
+    // FD fixups, if this delivery carried any, resolve while
+    // the receiver is still parked: it opens the senders'
+    // fds itself under supervisor control, and its parked
+    // call is settled by the resolver (see resolve_fd_fixups).
+    if let Some((arena, fixups, cache)) = fixups {
+        resolve_fd_fixups(pid, procs, coord, &arena, &fixups, cache);
+    }
     cont_syscall(pid, 0);
 }
 
@@ -6935,13 +5946,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             bp.free_miss
         );
     }
-    // 0.9.116 death inventory (telemetry only: reads
-    // state, changes nothing). When an arena dies holding
-    // a backlog of unfreed parcels, name what they were
-    // and who sent them, which death notices this death
-    // is about to fire, and how many ref notices sit
-    // undelivered globally -- a tenure-killing backlog
-    // should identify itself, not just its size.
+    // 0.9.118 death inventory (telemetry only: reads
+    // state, changes nothing; ported from 0.9.116). When
+    // an arena dies holding a backlog of unfreed parcels,
+    // name what they were and who sent them, which death
+    // notices this death is about to fire, and how the
+    // global ref-notice ledger stands -- a tenure-killing
+    // backlog should identify itself, not just its size.
     if let Some(bp) = st.procs.get(arena) {
         if bp.parcels.len() >= 10 {
             let total = bp.parcels.len();
@@ -6949,13 +5960,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             offs.sort_unstable();
             for (i, &off) in offs.iter().take(200).enumerate() {
                 let pp = &bp.parcels[&off];
-                let refs: Vec<String> = pp
-                    .refs
-                    .iter()
-                    .map(|(n, s)| format!("n{}{}", n, if *s { "S" } else { "W" }))
-                    .collect();
                 bsup!(
-                    "binder: arena {arena} death-inventory parcel {}/{}: off=0x{:x} size={} from_pid={} code={} target_ptr=0x{:x} cookie=0x{:x} refs=[{}]",
+                    "binder: arena {arena} death-inventory parcel {}/{}: off=0x{:x} size={} from_pid={} code={} target_ptr=0x{:x} cookie=0x{:x}",
                     i + 1,
                     total,
                     off,
@@ -6963,8 +5969,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
                     pp.from_pid,
                     pp.code,
                     pp.target_ptr,
-                    pp.txn_cookie,
-                    refs.join(" ")
+                    pp.txn_cookie
                 );
             }
             if total > 200 {
@@ -7016,21 +6021,18 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         }
     }
     {
-        // Global pending ref notices by owner arena: a
-        // node's ref_*_queued flag means its notice pair
-        // is in an owner-readable queue, not yet delivered
-        // to guest userspace -- exactly the pending set,
-        // tallyable in one read-only pass over the nodes.
-        let mut by_owner: HashMap<String, (u32, u32)> = HashMap::new();
-        for n in &st.nodes {
-            if n.ref_strong_queued || n.ref_weak_queued {
-                let e = by_owner.entry(n.owner.clone()).or_default();
-                if n.ref_strong_queued {
-                    e.0 += 1;
-                }
-                if n.ref_weak_queued {
-                    e.1 += 1;
-                }
+        // Global ref-notice ledger by owner arena. The
+        // 0.9.116 original tallied per-node queued flags
+        // from the 0.9.113 state machine; this tree has no
+        // such flags -- a notice is pushed straight into
+        // the owner's inbound stream at crossing time, and
+        // ref_notified is the ledger of (node, holder)
+        // pairs it went out for. Tally the outstanding
+        // pairs per owner arena in one read-only pass.
+        let mut by_owner: HashMap<String, u32> = HashMap::new();
+        for ((node, _holder), _weak) in &st.ref_notified {
+            if let Some(n) = st.nodes.get(*node) {
+                *by_owner.entry(n.owner.clone()).or_default() += 1;
             }
         }
         if by_owner.is_empty() {
@@ -7040,10 +6042,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             owners.sort();
             let parts: Vec<String> = owners
                 .iter()
-                .map(|o| {
-                    let (s, w) = by_owner[*o];
-                    format!("{o} strong={s} weak={w}")
-                })
+                .map(|o| format!("{o} notified={}", by_owner[*o]))
                 .collect();
             bsup!(
                 "binder: arena {arena} death-inventory pending-ref-notices global: {}",
@@ -7051,43 +6050,51 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             );
         }
     }
-    // C2 death settlement (0.9.117): parcels delivered
-    // into this arena and never freed still hold the
-    // temporary remote refs they carried -- the refs
-    // BC_FREE_BUFFER would have released one by one.
-    // Settle them here, binder_discard_failed_parcel
-    // style (drop the buffer, return each carried ref
-    // through binder_adjust_remote_ref), BEFORE the
-    // wholesale remote_refs reconciliation below zeroes
-    // what remains of this arena's counts (its own
-    // BpBinder counts), so every parcel-held ref goes
-    // back through the ordinary decrement path and its
-    // owner gets woken. Only this arena's parcels and
-    // its own refcounts are touched: no node is
-    // destroyed, no other arena's parcels move, and the
-    // death-notice firing loop further down runs
-    // exactly as before.
+    // C2 death settlement (0.9.118, ported from 0.9.117
+    // to this tree's reference model): references this
+    // arena held on other arenas' nodes were announced
+    // to their owners with BR_INCREFS(/BR_ACQUIRE) when
+    // the objects crossed (binder_notify_ref) and are
+    // ledgered in ref_notified. The holder is gone now;
+    // settle every pair the way the real driver does --
+    // queue BR_DECREFS (plus BR_RELEASE where the hold
+    // was strong) to the node's owner and forget the
+    // pair -- instead of leaking one count per tenure on
+    // every long-lived owner's books. Only this arena's
+    // holds are touched: no node is destroyed, no other
+    // arena's parcels move, notify_queued is untouched,
+    // and the death-notice firing further down runs
+    // exactly as before. Parcels left in the dead arena
+    // are counted as settled: in this tree they carry no
+    // per-parcel ref records, and the buffer table dies
+    // with the arena record.
     {
-        let mut settled_refs: Vec<(usize, bool)> = Vec::new();
-        let mut settled_parcels = 0usize;
-        if let Some(bp) = st.procs.get_mut(arena) {
-            let offs: Vec<u32> = bp.parcels.keys().copied().collect();
-            for off in offs {
-                if let Some(sz) = bp.used.remove(&off) {
-                    bp.free.push((off, sz));
-                }
-                if let Some(pp) = bp.parcels.remove(&off) {
-                    settled_parcels += 1;
-                    settled_refs.extend(pp.refs);
-                }
-            }
-        }
+        let parcels_left = st.procs.get(arena).map_or(0, |bp| bp.parcels.len());
+        let held: Vec<(usize, bool)> = st
+            .ref_notified
+            .iter()
+            .filter(|(k, _)| k.1 == arena)
+            .map(|(k, w)| (k.0, *w))
+            .collect();
         let mut nodes_touched: HashSet<usize> = HashSet::new();
         let mut settle_owners: HashSet<String> = HashSet::new();
         let mut refs_returned = 0usize;
-        for (node, strong) in settled_refs {
+        for (node, weak) in held {
+            st.ref_notified.remove(&(node, arena.to_string()));
             nodes_touched.insert(node);
-            if let Some(owner) = binder_adjust_remote_ref(st, node, arena, strong, false) {
+            let Some(n) = st.nodes.get(node) else {
+                continue;
+            };
+            let (owner, nptr, ncookie) = (n.owner.clone(), n.ptr, n.cookie);
+            if let Some(bp) = st.procs.get_mut(&owner) {
+                bp.inbound.extend_from_slice(&BR_DECREFS.to_le_bytes());
+                bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+                bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+                if !weak {
+                    bp.inbound.extend_from_slice(&BR_RELEASE.to_le_bytes());
+                    bp.inbound.extend_from_slice(&nptr.to_le_bytes());
+                    bp.inbound.extend_from_slice(&ncookie.to_le_bytes());
+                }
                 refs_returned += 1;
                 settle_owners.insert(owner);
             }
@@ -7096,7 +6103,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             binder_maybe_wake_pids(st, &owner, wakes);
         }
         bsup!(
-            "binder: arena {arena} death-settle parcels={settled_parcels} refs_returned={refs_returned} nodes_touched={}",
+            "binder: arena {arena} death-settle parcels={parcels_left} refs_returned={refs_returned} nodes_touched={}",
             nodes_touched.len()
         );
     }
@@ -7127,24 +6134,6 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     for v in st.waiters.values_mut() {
         v.retain(|w| w.sender_arena != arena);
-    }
-    // A process exit drops all of its binder_ref counts at once. Reconcile
-    // affected owners' node work and wake any parked readers.
-    let mut ref_owners = HashSet::new();
-    for n in &mut st.nodes {
-        if n.remote_refs.remove(arena).is_some() {
-            let (want_weak, want_strong) = binder_remote_wants(n);
-            if !want_weak {
-                n.ref_weak_dropped = false;
-            }
-            if !want_strong {
-                n.ref_strong_dropped = false;
-            }
-            ref_owners.insert(n.owner.clone());
-        }
-    }
-    for owner in ref_owners {
-        binder_maybe_wake_pids(st, &owner, wakes);
     }
     let mut dead_nodes: Vec<usize> = Vec::new();
     for (i, n) in st.nodes.iter_mut().enumerate() {
@@ -8842,21 +7831,14 @@ fn tracer_loop(ctx: TracerCtx) {
                 continue;
             }
             let is_root = pid == root_pid;
-            let is_system_server_candidate = dump_candidate == Some(pid);
             if libc::WIFEXITED(status) {
                 if is_root {
                     sup!("GUEST_EXITED code={}", libc::WEXITSTATUS(status));
-                }
-                if is_system_server_candidate {
-                    sup!("SYSTEM_SERVER_EXIT pid={pid} code={}", libc::WEXITSTATUS(status));
                 }
                 sup!("PROC_EXITED pid={pid} code={}", libc::WEXITSTATUS(status));
             } else {
                 if is_root {
                     sup!("GUEST_SIGNALED sig={}", libc::WTERMSIG(status));
-                }
-                if is_system_server_candidate {
-                    sup!("SYSTEM_SERVER_EXIT pid={pid} sig={}", libc::WTERMSIG(status));
                 }
                 sup!("PROC_SIGNALED pid={pid} sig={}", libc::WTERMSIG(status));
             }
@@ -9963,7 +8945,6 @@ fn tracer_loop(ctx: TracerCtx) {
                     && dump_candidate.is_none()
                 {
                     dump_candidate = Some(child);
-                    sup!("SYSTEM_SERVER_CANDIDATE pid={child} parent={pid}");
                 }
             }
             cont_syscall(pid, 0);
@@ -10619,527 +9600,4 @@ fn main() {
 
     let _ = reader.join();
     sup!("supervisor done");
-}
-
-#[cfg(test)]
-mod fd_fixup_tests {
-    use super::*;
-    use std::os::fd::AsRawFd;
-
-    fn failure(parcel_ptr: u32, reply_cmd: u32) -> FixupFailure {
-        FixupFailure {
-            parcel_ptr,
-            reply_arena: "/tmp/reply-arena".to_string(),
-            reply_pid: 41,
-            reply_cmd,
-            wait_cookie: 7,
-            wait_target_handle: 3,
-        }
-    }
-
-    fn fixup(parcel_ptr: u32) -> FdFixup {
-        FdFixup {
-            file_off: 0x100,
-            parcel_ptr,
-            sender_pid: 12,
-            sender_fd: 9,
-            source_dev: 4,
-            source_ino: 5,
-            open_flags: libc::O_RDONLY,
-            failure: failure(parcel_ptr, BR_FAILED_REPLY),
-        }
-    }
-
-    fn txn(cmd: u32, parcel_ptr: u32) -> Vec<u8> {
-        let mut bytes = vec![0; 44];
-        bytes[..4].copy_from_slice(&cmd.to_le_bytes());
-        bytes[36..40].copy_from_slice(&parcel_ptr.to_le_bytes());
-        bytes
-    }
-    fn ref_pair(cmd: u32, ptr: u32, cookie: u32) -> Vec<u8> {
-        let mut bytes = cmd.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&ptr.to_le_bytes());
-        bytes.extend_from_slice(&cookie.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn failed_transaction_and_reply_are_removed_without_dropping_other_work() {
-        let good = txn(BR_TRANSACTION, 0x1110);
-        let bad = txn(BR_REPLY, 0x2220);
-        let mut batch = good.clone();
-        batch.extend_from_slice(&bad);
-        batch.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
-
-        let filtered = filter_failed_fd_parcels(&batch, &[failure(0x2220, BR_FAILED_REPLY)])
-            .expect("failed parcel must be found in the batch");
-        let mut expected = good;
-        expected.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
-        assert_eq!(filtered, expected);
-        assert_eq!(batch_parcel_ptrs(&filtered), HashSet::from([0x1110]));
-    }
-
-    #[test]
-    fn unmatched_failed_parcel_preserves_unrelated_transactions_and_waiter_work() {
-        let mut batch = txn(BR_TRANSACTION, 0x1110);
-        batch.extend_from_slice(&txn(BR_REPLY, 0x2220));
-        batch.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
-        let filtered = filter_failed_fd_parcels(&batch, &[failure(0xdead, BR_DEAD_REPLY)])
-            .expect("a valid batch remains filterable when the failed pointer is absent");
-        assert_eq!(filtered, batch);
-        assert_eq!(
-            batch_parcel_ptrs(&filtered),
-            HashSet::from([0x1110, 0x2220])
-        );
-    }
-    #[test]
-    fn malformed_batch_still_fails_closed_when_filtering_failed_parcel() {
-        let mut malformed = BR_TRANSACTION.to_le_bytes().to_vec();
-        malformed.extend_from_slice(&[0xaa, 0xbb]);
-        assert!(filter_failed_fd_parcels(&malformed, &[failure(0xdead, BR_DEAD_REPLY)]).is_none());
-    }
-
-    #[test]
-    fn malformed_batch_rollback_clears_all_discarded_refs_only() {
-        let mut st = BinderState::default();
-        let first = st.node_for_local("owner", 0x1110, 0x2220);
-        let second = st.node_for_local("owner", 0x3330, 0x4440);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, first, "client", false, true);
-        binder_adjust_remote_ref(&mut st, second, "client", false, true);
-        materialize_ref_notices(&mut st, "owner");
-        let queued = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        let delivered = shield_ref_pairs(&mut st, "owner", 7, queued);
-        assert!(st.nodes[first].ref_weak_told && st.nodes[first].ref_weak_pending);
-        assert!(st.nodes[second].ref_weak_told && st.nodes[second].ref_weak_pending);
-
-        let unrelated = st.node_for_local("owner", 0x5550, 0x6660);
-        binder_adjust_remote_ref(&mut st, unrelated, "client", false, true);
-        materialize_ref_notices(&mut st, "owner");
-        let unrelated_queued = ref_pair(BR_INCREFS, 0x5550, 0x6660);
-        assert_eq!(st.procs["owner"].inbound, unrelated_queued);
-
-        let mut malformed = delivered;
-        malformed.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
-        malformed.extend_from_slice(&[0xaa, 0xbb]);
-        assert!(filter_failed_fd_parcels(&malformed, &[failure(0xdead, BR_DEAD_REPLY)]).is_none());
-        let dropped = complete_ref_notices_prefix(&malformed);
-        assert_eq!(
-            dropped,
-            vec![
-                DroppedRefNotice {
-                    cmd: BR_INCREFS,
-                    ptr: 0x1110,
-                    cookie: 0x2220
-                },
-                DroppedRefNotice {
-                    cmd: BR_INCREFS,
-                    ptr: 0x3330,
-                    cookie: 0x4440
-                },
-            ]
-        );
-        assert!(binder_cancel_dropped_ref_notices(
-            &mut st, "owner", &dropped
-        ));
-        assert!(!st.nodes[first].ref_weak_told && !st.nodes[first].ref_weak_pending);
-        assert!(!st.nodes[second].ref_weak_told && !st.nodes[second].ref_weak_pending);
-        assert!(st.nodes[unrelated].ref_weak_queued);
-        assert_eq!(st.procs["owner"].inbound, unrelated_queued);
-    }
-
-    #[test]
-    fn worker_stale_pair_filter_reports_exact_drop_and_preserves_other_work() {
-        let transaction = txn(BR_TRANSACTION, 0x1110);
-        let mut batch = transaction.clone();
-        batch.extend_from_slice(&ref_pair(BR_ACQUIRE, 0x3330, 0x4440));
-        let (filtered, dropped) = filter_live_ref_pairs(batch, |_, _, _| false);
-        assert_eq!(filtered, transaction);
-        assert_eq!(
-            dropped,
-            vec![DroppedRefNotice {
-                cmd: BR_ACQUIRE,
-                ptr: 0x3330,
-                cookie: 0x4440,
-            }]
-        );
-    }
-
-    #[test]
-    fn only_fixups_for_the_current_read_batch_are_taken() {
-        let mut st = BinderState::default();
-        st.fd_pending
-            .insert("arena".to_string(), vec![fixup(0x1110), fixup(0x2220)]);
-        let mut batch = txn(BR_TRANSACTION, 0x1110);
-        batch.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
-
-        let selected = take_fd_fixups_for_batch(&mut st, "arena", &batch);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].parcel_ptr, 0x1110);
-        let remaining = st
-            .fd_pending
-            .get("arena")
-            .expect("second batch remains queued");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].parcel_ptr, 0x2220);
-    }
-
-    #[test]
-    fn fixup_action_wire_round_trip_preserves_failure_and_addresses() {
-        let fx = fixup(0x1234);
-        let action = BAction::ResolveFdFixupsInline {
-            arena: "arena".to_string(),
-            fixups: vec![fx],
-            read_buf: 0x8000,
-            bwr_addr: 0x9000,
-        };
-        let mut enc = Enc::new();
-        enc.actions(&[action]);
-        let mut dec = Dec::new(&enc.0);
-        let decoded = dec.actions();
-        match &decoded[0] {
-            BAction::ResolveFdFixupsInline {
-                arena,
-                fixups,
-                read_buf,
-                bwr_addr,
-            } => {
-                assert_eq!(arena, "arena");
-                assert_eq!(*read_buf, 0x8000);
-                assert_eq!(*bwr_addr, 0x9000);
-                assert_eq!(fixups.len(), 1);
-                assert_eq!(fixups[0].failure, failure(0x1234, BR_FAILED_REPLY));
-                assert_eq!(fixups[0].source_ino, 5);
-            }
-            _ => panic!("wrong action decoded"),
-        }
-    }
-
-    #[test]
-    fn proc_fd_snapshot_preserves_read_only_and_write_only_modes() {
-        let read = std::fs::File::open("/dev/null").expect("open /dev/null read-only");
-        let write = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .expect("open /dev/null write-only");
-        let pid = std::process::id() as i32;
-        assert_eq!(
-            proc_fd_snapshot(pid, read.as_raw_fd()).unwrap().2,
-            libc::O_RDONLY
-        );
-        assert_eq!(
-            proc_fd_snapshot(pid, write.as_raw_fd()).unwrap().2,
-            libc::O_WRONLY
-        );
-    }
-
-    fn test_binder_proc() -> BinderProc {
-        BinderProc {
-            file: std::fs::File::open("/dev/null").expect("open test arena"),
-            base: HashMap::new(),
-            maplen: HashMap::new(),
-            bump: 0,
-            free: Vec::new(),
-            used: HashMap::new(),
-            parcels: HashMap::new(),
-            free_hit: 0,
-            free_nobase: 0,
-            free_stale: 0,
-            free_parcel_hit: 0,
-            free_miss: 0,
-            handles: HashMap::new(),
-            next_handle: 1,
-            inbound: Vec::new(),
-            queues: HashMap::new(),
-            loopers: HashSet::new(),
-        }
-    }
-
-    fn process_write_stream(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8]) {
-        let mut rd = |_: i32, _: u64, _: usize| None;
-        let mut actions = Vec::new();
-        let mut notes = Vec::new();
-        binder_process_stream(pid, arena, bytes, st, 0, &mut rd, &mut actions, &mut notes);
-    }
-
-    #[test]
-    fn same_arena_multiple_refs_survive_until_the_last_decrement() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        assert_eq!(binder_remote_wants(&st.nodes[node]), (true, true));
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        assert_eq!(binder_remote_wants(&st.nodes[node]), (true, true));
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        assert_eq!(binder_remote_wants(&st.nodes[node]), (false, false));
-    }
-
-    #[test]
-    fn freeing_a_parcel_releases_only_its_own_handle_reference() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        let mut client = test_binder_proc();
-        client.handles.insert(5, node);
-        client.base.insert(12, 0x1000);
-        client.used.insert(0x20, 16);
-        st.procs.insert("client".to_string(), client);
-
-        let mut data = vec![0; 16];
-        put_u32(&mut data, 0, OBJ_HANDLE);
-        put_u32(&mut data, 8, 5);
-        let offs = 0u32.to_le_bytes();
-        let refs = parcel_remote_refs(&st, "client", &data, &offs);
-        assert_eq!(refs, vec![(node, true)]);
-        for &(ni, strong) in &refs {
-            binder_adjust_remote_ref(&mut st, ni, "client", strong, true);
-        }
-        // An independently acquired BpBinder remains after the parcel is freed.
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        st.procs.get_mut("client").unwrap().parcels.insert(
-            0x20,
-            ParcelPrint {
-                crc: 0,
-                total: 16,
-                mask: Vec::new(),
-                head: Vec::new(),
-                refs,
-                from_pid: 0,
-                code: 0,
-                target_ptr: 0,
-                txn_cookie: 0,
-            },
-        );
-
-        let mut stream = BC_FREE_BUFFER.to_le_bytes().to_vec();
-        stream.extend_from_slice(&0x1020u32.to_le_bytes());
-        process_write_stream(&mut st, "client", 12, &stream);
-        assert_eq!(st.nodes[node].remote_refs["client"].strong, 1);
-        assert_eq!(binder_remote_wants(&st.nodes[node]), (true, true));
-    }
-
-    #[test]
-    fn filtered_fd_failure_discards_parcel_and_its_temporary_reference() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        let mut client = test_binder_proc();
-        client.base.insert(12, 0x1000);
-        client.used.insert(0x20, 16);
-        client.parcels.insert(
-            0x20,
-            ParcelPrint {
-                crc: 0,
-                total: 16,
-                mask: Vec::new(),
-                head: Vec::new(),
-                refs: vec![(node, true)],
-                from_pid: 0,
-                code: 0,
-                target_ptr: 0,
-                txn_cookie: 0,
-            },
-        );
-        st.procs.insert("client".to_string(), client);
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-
-        let owners = binder_discard_failed_parcel(&mut st, "client", 0x1020);
-        assert_eq!(owners, HashSet::from(["owner".to_string()]));
-        assert_eq!(binder_remote_wants(&st.nodes[node]), (false, false));
-        assert!(!st.procs["client"].used.contains_key(&0x20));
-        assert!(!st.procs["client"].parcels.contains_key(&0x20));
-    }
-
-    #[test]
-    fn worker_dropped_increfs_cancels_pending_without_phantom_decrefs() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", false, true);
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        materialize_ref_notices(&mut st, "owner");
-        let queued = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        let delivered = shield_ref_pairs(&mut st, "owner", 7, queued);
-        assert_eq!(u32_at(&delivered, 0), BR_INCREFS);
-        assert!(st.nodes[node].ref_weak_told && st.nodes[node].ref_weak_pending);
-
-        let (filtered, dropped) = filter_live_ref_pairs(delivered, |_, _, _| false);
-        assert!(filtered.is_empty());
-        assert_eq!(
-            dropped,
-            vec![DroppedRefNotice {
-                cmd: BR_INCREFS,
-                ptr: 0x1110,
-                cookie: 0x2220
-            }]
-        );
-        assert!(binder_cancel_dropped_ref_notices(
-            &mut st, "owner", &dropped
-        ));
-        assert!(!st.nodes[node].ref_weak_told && !st.nodes[node].ref_weak_pending);
-        assert!(st.nodes[node].ref_weak_dropped);
-        assert!(!binder_ref_work_pending(&st, "owner"));
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        binder_adjust_remote_ref(&mut st, node, "client", false, false);
-        materialize_ref_notices(&mut st, "owner");
-        assert!(st.procs["owner"].inbound.is_empty());
-        assert!(!st.nodes[node].ref_weak_told && !st.nodes[node].ref_weak_pending);
-    }
-
-    #[test]
-    fn worker_dropped_acquire_cancels_strong_state_but_keeps_delivered_weak_state() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", false, true);
-        materialize_ref_notices(&mut st, "owner");
-        let increfs = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        shield_ref_pairs(&mut st, "owner", 7, increfs);
-        let done = ref_pair(BC_INCREFS_DONE, 0x1110, 0x2220);
-        process_write_stream(&mut st, "owner", 7, &done);
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        materialize_ref_notices(&mut st, "owner");
-        let acquire = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        let delivered = shield_ref_pairs(&mut st, "owner", 7, acquire);
-        assert_eq!(u32_at(&delivered, 0), BR_ACQUIRE);
-        assert!(st.nodes[node].ref_strong_told && st.nodes[node].ref_strong_pending);
-
-        let (filtered, dropped) = filter_live_ref_pairs(delivered, |_, _, _| false);
-        assert!(filtered.is_empty());
-        assert_eq!(
-            dropped,
-            vec![DroppedRefNotice {
-                cmd: BR_ACQUIRE,
-                ptr: 0x1110,
-                cookie: 0x2220
-            }]
-        );
-        assert!(binder_cancel_dropped_ref_notices(
-            &mut st, "owner", &dropped
-        ));
-        assert!(!st.nodes[node].ref_strong_told && !st.nodes[node].ref_strong_pending);
-        assert!(st.nodes[node].ref_weak_told);
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        materialize_ref_notices(&mut st, "owner");
-        assert!(st.procs["owner"].inbound.is_empty());
-        binder_adjust_remote_ref(&mut st, node, "client", false, false);
-        materialize_ref_notices(&mut st, "owner");
-        assert_eq!(u32_at(&st.procs["owner"].inbound, 0), BR_DECREFS);
-    }
-
-    #[test]
-    fn pending_acquire_suppresses_release_until_acquire_done() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        st.nodes[node].ref_weak_told = true;
-        let mut acquire = BR_ACQUIRE.to_le_bytes().to_vec();
-        acquire.extend_from_slice(&0x1110u32.to_le_bytes());
-        acquire.extend_from_slice(&0x2220u32.to_le_bytes());
-        let delivered = shield_ref_pairs(&mut st, "owner", 7, acquire);
-        assert_eq!(delivered.len(), 12);
-        assert!(st.nodes[node].ref_strong_pending);
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        assert!(!binder_ref_work_pending(&st, "owner"));
-
-        let mut stream = BC_ACQUIRE_DONE.to_le_bytes().to_vec();
-        stream.extend_from_slice(&0x1110u32.to_le_bytes());
-        stream.extend_from_slice(&0x2220u32.to_le_bytes());
-        process_write_stream(&mut st, "owner", 7, &stream);
-        assert!(!st.nodes[node].ref_strong_pending);
-        assert!(binder_ref_work_pending(&st, "owner"));
-
-        materialize_ref_notices(&mut st, "owner");
-        let inbound = &st.procs["owner"].inbound;
-        assert_eq!(u32_at(inbound, 0), BR_RELEASE);
-        assert_eq!(u32_at(inbound, 4), 0x1110);
-        assert_eq!(u32_at(inbound, 8), 0x2220);
-        let release = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        shield_ref_pairs(&mut st, "owner", 7, release);
-        materialize_ref_notices(&mut st, "owner");
-        assert_eq!(u32_at(&st.procs["owner"].inbound, 0), BR_DECREFS);
-    }
-
-    #[test]
-    fn ref_notice_order_matches_kernel_acquire_and_release_priority() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-
-        materialize_ref_notices(&mut st, "owner");
-        let inc_refs = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        assert_eq!(u32_at(&inc_refs, 0), BR_INCREFS);
-        assert_eq!(inc_refs.len(), 12);
-        shield_ref_pairs(&mut st, "owner", 7, inc_refs);
-
-        materialize_ref_notices(&mut st, "owner");
-        let acquire = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        assert_eq!(u32_at(&acquire, 0), BR_ACQUIRE);
-        assert_eq!(acquire.len(), 12);
-        shield_ref_pairs(&mut st, "owner", 7, acquire);
-
-        let mut done = BC_INCREFS_DONE.to_le_bytes().to_vec();
-        done.extend_from_slice(&0x1110u32.to_le_bytes());
-        done.extend_from_slice(&0x2220u32.to_le_bytes());
-        done.extend_from_slice(&BC_ACQUIRE_DONE.to_le_bytes());
-        done.extend_from_slice(&0x1110u32.to_le_bytes());
-        done.extend_from_slice(&0x2220u32.to_le_bytes());
-        process_write_stream(&mut st, "owner", 7, &done);
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        materialize_ref_notices(&mut st, "owner");
-
-        let release = std::mem::take(&mut st.procs.get_mut("owner").unwrap().inbound);
-        assert_eq!(u32_at(&release, 0), BR_RELEASE);
-        assert_eq!(release.len(), 12);
-        shield_ref_pairs(&mut st, "owner", 7, release);
-        materialize_ref_notices(&mut st, "owner");
-        assert_eq!(u32_at(&st.procs["owner"].inbound, 0), BR_DECREFS);
-    }
-
-    #[test]
-    fn reference_crossing_reversed_before_read_cancels_queued_notice() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-
-        materialize_ref_notices(&mut st, "owner");
-        assert_eq!(u32_at(&st.procs["owner"].inbound, 0), BR_INCREFS);
-        assert!(st.nodes[node].ref_weak_queued && !st.nodes[node].ref_strong_queued);
-
-        binder_adjust_remote_ref(&mut st, node, "client", true, false);
-        materialize_ref_notices(&mut st, "owner");
-        assert!(st.procs["owner"].inbound.is_empty());
-        assert!(!st.nodes[node].ref_weak_queued && !st.nodes[node].ref_strong_queued);
-    }
-
-    #[test]
-    fn pending_node_work_wakes_a_parked_looper_before_bytes_exist() {
-        let mut st = BinderState::default();
-        let node = st.node_for_local("owner", 0x1110, 0x2220);
-        st.procs.insert("owner".to_string(), test_binder_proc());
-        binder_adjust_remote_ref(&mut st, node, "client", true, true);
-        st.thread_arena.insert(7, "owner".to_string());
-        st.parked.insert(
-            7,
-            ParkedIoctl {
-                bwr: 0,
-                read_buf: 0,
-                read_size: 64,
-                write_consumed: 0,
-            },
-        );
-        st.procs.get_mut("owner").unwrap().loopers.insert(7);
-
-        assert_eq!(binder_wake_candidates(&st, "owner"), vec![7]);
-        assert!(st.procs["owner"].inbound.is_empty());
-    }
 }
