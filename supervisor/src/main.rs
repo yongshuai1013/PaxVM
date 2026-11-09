@@ -4552,7 +4552,12 @@ fn binder_translate(
 /// Copy a translated parcel into the target arena and queue
 /// the BR_TRANSACTION / BR_REPLY carrying it. On failure the
 /// Err names the exact stage, so a dead delivery explains
-/// itself in the log instead of hiding behind a bool.
+/// itself in the log instead of hiding behind a bool. On
+/// success the Ok carries the arena allocation offset the
+/// parcel landed at -- the slot identity the 0.9.127
+/// big-reply / big-txn delivery dumps print; callers that
+/// do not log it simply ignore the value, as they ignored
+/// the unit Ok before.
 fn binder_deliver(
     st: &mut BinderState,
     target: &str,
@@ -4570,7 +4575,7 @@ fn binder_deliver(
     // bytes must land in that thread's own queue, never in
     // the shared inbound stream.
     reply_to: Option<i32>,
-) -> Result<(), &'static str> {
+) -> Result<u32, &'static str> {
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
         return Err("alloc failed (no such arena state, or out of mapped space)");
@@ -4736,7 +4741,7 @@ fn binder_deliver(
             }
         }
     }
-    Ok(())
+    Ok(off)
 }
 
 /// Which parked threads of `arena` have work they may
@@ -4972,6 +4977,28 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 0.9.127 telemetry helper: the (ptr, cookie) of the
+/// node a reply wait's claim key names -- the wait's
+/// recorded target handle resolved in the sender's own
+/// handle table, exactly as binder_claim_fills resolves
+/// it (handle 0 names the context manager node, which
+/// lives outside every handle table). Falls back to the
+/// wait's raw (target_handle, cookie) words when the
+/// handle no longer resolves. Read-only; log use only.
+fn claim_key_node(st: &BinderState, w: &ReplyWait) -> (u32, u32) {
+    let idx = if w.target_handle == 0 {
+        st.mgr_node
+    } else {
+        st.procs
+            .get(&w.sender_arena)
+            .and_then(|bp| bp.handles.get(&w.target_handle).copied())
+    };
+    match idx.and_then(|i| st.nodes.get(i)) {
+        Some(n) => (n.ptr, n.cookie),
+        None => (w.target_handle, w.cookie),
+    }
+}
+
 fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -5179,6 +5206,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             &fd_fixups,
             Some(w.sender_pid),
         );
+        let delivered_off = delivered.as_ref().ok().copied();
         let delivered_ok = delivered.is_ok();
         if let Err(why) = delivered {
             notes.push(format!("REPLY delivery failed: {why}"));
@@ -5208,6 +5236,38 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 tdata.len(),
                 hex_head(&tdata, 32),
                 n_outstanding
+            );
+        }
+        // 0.9.127 telemetry: photograph every large
+        // parcel actually delivered at reply position,
+        // with the claim key of the wait it answered
+        // (sender / node / code, the identity the serving
+        // thread claimed it by) and the slot it landed in
+        // (the allocation offset in the waiter's arena --
+        // the key of that arena's used/parcels tables; the
+        // allocator keeps no generation counter). The
+        // 0.9.126 field run's one app-thread kill was a
+        // 672B parcel delivered at reply position whose
+        // first word was a cookie value (0x41dd91b0),
+        // claimed cleanly, no miss / unmatched / dump --
+        // its origin (arena slot recycling residue vs a
+        // genuine transaction whose claim key collided)
+        // could not be read back from that package. The
+        // big-txn dump in binder_send_txn is the same
+        // photograph on the transaction side, so the two
+        // can be joined on (key_sender, key_node,
+        // key_code, slot, head). Log only, after the
+        // delivery above; nothing here feeds back.
+        if delivered_ok && tdata.len() >= 256 {
+            let (kptr, kcookie) = claim_key_node(st, &w);
+            bsup!(
+                "binder: big-reply dump waiter={} size={} key_sender={} key_node=0x{kptr:x}/0x{kcookie:x} key_code={} slot={} head={}",
+                w.sender_pid,
+                tdata.len(),
+                w.sender_pid,
+                w.code,
+                delivered_off.unwrap_or(0),
+                hex_head(&tdata, 32)
             );
         }
         notes.push(format!("REPLY -> pid {} ({}B)", w.sender_pid, tdata.len()));
@@ -5330,12 +5390,31 @@ fn binder_send_txn(
         &fd_fixups,
         None,
     );
+    let delivered_off = delivered.as_ref().ok().copied();
     if let Err(why) = delivered {
         if let Some(bp) = st.procs.get_mut(arena) {
             bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
         }
         notes.push(format!("TRANSACTION target cannot receive ({why}) -> DEAD_REPLY"));
         return;
+    }
+    // 0.9.127 telemetry: the transaction-side mirror of
+    // the big-reply dump in binder_handle_txn -- same
+    // field set, so a large transaction parcel and a
+    // large parcel delivered at reply position can be
+    // joined on (key_sender, key_node, key_code, slot,
+    // head). waiter= names the sending pid (the caller a
+    // two-way call leaves waiting; the receiving thread
+    // is only chosen inside delivery), slot= is the
+    // allocation offset in the receiving (owner) arena.
+    // Log only, after the delivery above.
+    if tdata.len() >= 256 {
+        bsup!(
+            "binder: big-txn dump waiter={pid} size={} key_sender={pid} key_node=0x{nptr:x}/0x{ncookie:x} key_code={code} slot={} head={}",
+            tdata.len(),
+            delivered_off.unwrap_or(0),
+            hex_head(&tdata, 32)
+        );
     }
     if flags & TF_ONE_WAY == 0 {
         st.waiters.entry(owner.to_string()).or_default().push(ReplyWait {
