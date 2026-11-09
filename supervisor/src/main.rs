@@ -5607,15 +5607,50 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                 let qpos = match (sender_arena, node_idx) {
                     (Some(sa), Some(ni)) => st.waiters.get(arena).and_then(|q| {
                         q.iter().position(|w| {
-                            w.sender_pid == sender_pid
-                                && w.sender_arena == sa
-                                && w.code == code
-                                && st
-                                    .procs
-                                    .get(&w.sender_arena)
-                                    .and_then(|bp| bp.handles.get(&w.target_handle))
-                                    .copied()
-                                    == Some(ni)
+                            if w.sender_pid != sender_pid
+                                || w.sender_arena != sa
+                                || w.code != code
+                            {
+                                return false;
+                            }
+                            if st
+                                .procs
+                                .get(&w.sender_arena)
+                                .and_then(|bp| bp.handles.get(&w.target_handle))
+                                .copied()
+                                == Some(ni)
+                            {
+                                return true;
+                            }
+                            // Context-manager lane (0.9.126):
+                            // a transaction addressed to
+                            // handle 0 is routed send-side
+                            // through mgr_node and its wait
+                            // recorded with target_handle 0,
+                            // but handle 0 is never stored in
+                            // any handles map (it is the
+                            // manager in every process), so
+                            // the resolution above can never
+                            // name the manager node and
+                            // 0.9.125 missed every
+                            // ServiceManager self-transaction
+                            // (6/6 on device; the callers
+                            // froze inside transact). Bind
+                            // this lane on the transaction's
+                            // own identity only: the parcel
+                            // target is the manager node
+                            // itself (0/0), the resolved node
+                            // IS the registered manager node,
+                            // the reader arena IS the
+                            // manager's, and the wait was
+                            // recorded against handle 0.
+                            // General node targets gain
+                            // nothing from this lane.
+                            w.target_handle == 0
+                                && tptr == 0
+                                && tcookie == 0
+                                && st.mgr_node == Some(ni)
+                                && st.mgr_arena.as_deref() == Some(arena)
                         })
                     }),
                     _ => None,
