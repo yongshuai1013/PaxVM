@@ -1941,6 +1941,17 @@ struct BinderProc {
     free_hit: u32,
     free_nobase: u32,
     free_stale: u32,
+    /// BC_FREE_BUFFER delivery-record outcome counters
+    /// (0.9.117), reported when the arena dies alongside
+    /// the 0.9.99 set: free_parcel_hit = the free removed
+    /// a live ParcelPrint (the delivery record), free_miss
+    /// = the freeing thread had no registered base and the
+    /// free was dropped -- the nobase path, counted under
+    /// this name so a tenure whose frees silently miss can
+    /// be told apart from one whose frees land; each miss
+    /// is also logged as it happens.
+    free_parcel_hit: u32,
+    free_miss: u32,
     /// handle -> node index (handle 0 is the context manager
     /// in every process and is never stored here)
     handles: HashMap<u32, usize>,
@@ -3366,6 +3377,8 @@ fn binder_open_arena(
                 free_hit: 0,
                 free_nobase: 0,
                 free_stale: 0,
+                free_parcel_hit: 0,
+                free_miss: 0,
                 handles: HashMap::new(),
                 next_handle: 1,
                 inbound: Vec::new(),
@@ -5259,13 +5272,20 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                                 bp.free.push((off, sz));
                                 if let Some(parcel) = bp.parcels.remove(&off) {
                                     released_refs = parcel.refs;
+                                    bp.free_parcel_hit += 1;
                                 }
                                 bp.free_hit += 1;
                             } else {
                                 bp.free_stale += 1;
                             }
                         }
-                        None => bp.free_nobase += 1,
+                        None => {
+                            bp.free_nobase += 1;
+                            bp.free_miss += 1;
+                            bsup!(
+                                "binder: free-buffer miss arena={arena} pid={pid} ptr=0x{ptr:x}"
+                            );
+                        }
                     }
                 }
                 let mut owners = HashSet::new();
@@ -6904,13 +6924,15 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
             bp.parcels.len(),
             st.notify_queued,
-            st.shield_drops
+            st.shield_drops,
+            bp.free_parcel_hit,
+            bp.free_miss
         );
     }
     // 0.9.116 death inventory (telemetry only: reads
@@ -7028,6 +7050,55 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
                 parts.join("; ")
             );
         }
+    }
+    // C2 death settlement (0.9.117): parcels delivered
+    // into this arena and never freed still hold the
+    // temporary remote refs they carried -- the refs
+    // BC_FREE_BUFFER would have released one by one.
+    // Settle them here, binder_discard_failed_parcel
+    // style (drop the buffer, return each carried ref
+    // through binder_adjust_remote_ref), BEFORE the
+    // wholesale remote_refs reconciliation below zeroes
+    // what remains of this arena's counts (its own
+    // BpBinder counts), so every parcel-held ref goes
+    // back through the ordinary decrement path and its
+    // owner gets woken. Only this arena's parcels and
+    // its own refcounts are touched: no node is
+    // destroyed, no other arena's parcels move, and the
+    // death-notice firing loop further down runs
+    // exactly as before.
+    {
+        let mut settled_refs: Vec<(usize, bool)> = Vec::new();
+        let mut settled_parcels = 0usize;
+        if let Some(bp) = st.procs.get_mut(arena) {
+            let offs: Vec<u32> = bp.parcels.keys().copied().collect();
+            for off in offs {
+                if let Some(sz) = bp.used.remove(&off) {
+                    bp.free.push((off, sz));
+                }
+                if let Some(pp) = bp.parcels.remove(&off) {
+                    settled_parcels += 1;
+                    settled_refs.extend(pp.refs);
+                }
+            }
+        }
+        let mut nodes_touched: HashSet<usize> = HashSet::new();
+        let mut settle_owners: HashSet<String> = HashSet::new();
+        let mut refs_returned = 0usize;
+        for (node, strong) in settled_refs {
+            nodes_touched.insert(node);
+            if let Some(owner) = binder_adjust_remote_ref(st, node, arena, strong, false) {
+                refs_returned += 1;
+                settle_owners.insert(owner);
+            }
+        }
+        for owner in settle_owners {
+            binder_maybe_wake_pids(st, &owner, wakes);
+        }
+        bsup!(
+            "binder: arena {arena} death-settle parcels={settled_parcels} refs_returned={refs_returned} nodes_touched={}",
+            nodes_touched.len()
+        );
     }
     // Queued manager transactions from this arena's
     // senders die with it (0.9.24).
@@ -10774,6 +10845,8 @@ mod fd_fixup_tests {
             free_hit: 0,
             free_nobase: 0,
             free_stale: 0,
+            free_parcel_hit: 0,
+            free_miss: 0,
             handles: HashMap::new(),
             next_handle: 1,
             inbound: Vec::new(),
