@@ -4416,6 +4416,16 @@ fn slot_dump(data: &[u8], offs: &[u8]) -> String {
     s
 }
 
+/// First `n` bytes of `b` as lowercase hex (all of `b`
+/// when shorter); 0.9.124 reply-pair dump helper.
+fn hex_head(b: &[u8], n: usize) -> String {
+    let mut s = String::with_capacity(b.len().min(n) * 2);
+    for byte in b.iter().take(n) {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
 /// The driver's parcel translation: local objects become
 /// nodes, handles resolve through the sender's table, and
 /// everything is re-expressed in the receiver's view. FD
@@ -5019,6 +5029,10 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 );
             }
         }
+        // 0.9.124: waiter count before this pop (the
+        // pairing line's definition), for the reply-pair
+        // dump printed at delivery below.
+        let n_outstanding = st.waiters.get(arena).map_or(0, |v| v.len());
         let w = st
             .waiters
             .get_mut(arena)
@@ -5057,6 +5071,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             &fd_fixups,
             Some(w.sender_pid),
         );
+        let delivered_ok = delivered.is_ok();
         if let Err(why) = delivered {
             notes.push(format!("REPLY delivery failed: {why}"));
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
@@ -5069,6 +5084,24 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             tdata.len(),
             w.sender_pid
         );
+        // 0.9.124 telemetry: photograph any parcel this
+        // pairing path actually sent out as a reply whose
+        // size falls outside the honest reply set {4, 8,
+        // 16} (s9-app-crash: FIFO pairing under
+        // concurrency hands a waiter some other caller's
+        // parcel and the receiver dies on the garbage
+        // first word; the donor parcel's head bytes are
+        // its fingerprint). Pairing, delivery and every
+        // result stay byte-identical -- log only.
+        if delivered_ok && !matches!(tdata.len(), 4 | 8 | 16) {
+            bsup!(
+                "binder: reply-pair dump waiter={} size={} head={} outstanding={}",
+                w.sender_pid,
+                tdata.len(),
+                hex_head(&tdata, 32),
+                n_outstanding
+            );
+        }
         notes.push(format!("REPLY -> pid {} ({}B)", w.sender_pid, tdata.len()));
         return;
     }
