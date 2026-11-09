@@ -2056,9 +2056,15 @@ struct ReplyWait {
 /// owes an answer; Other = a transaction that owes none
 /// (one-way, or a two-way parcel whose wait record could
 /// not be claimed -- the miss is logged at fill time and
-/// the orphan wait stays in the shared queue).
+/// the orphan wait stays in the shared queue). The
+/// Reply frame's second field is the claim sequence
+/// number (0.9.128, BinderState::claim_seq): stamped at
+/// claim time so the claim / reply-pop / big-reply
+/// dumps can be joined on it. Telemetry only -- it is
+/// written here and printed by those dumps, never read
+/// by any pairing or delivery decision.
 enum ServingFrame {
-    Reply(ReplyWait),
+    Reply(ReplyWait, u64),
     Other,
 }
 
@@ -2129,6 +2135,17 @@ struct BinderState {
     /// shared queue). Global like shield_drops; reported
     /// at arena death alongside the free counters.
     reply_unmatched: u64,
+    /// 0.9.128: global claim sequence counter. Every
+    /// successful claim in binder_claim_fills takes the
+    /// next number and stamps it on the ServingFrame it
+    /// pushes; the claim, reply-pop and big-reply dumps
+    /// print it so one delivered reply traces back to
+    /// the exact claim that sourced its frame
+    /// (s9-127-big-reply Q5: separating fill-claim
+    /// aliasing, wrong-frame pops and replier-side
+    /// buffer aliasing). Written here and on frames,
+    /// printed by dumps, never read by any decision.
+    claim_seq: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -3280,7 +3297,7 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
     // arena's last, keeps each wait's failure single).
     if let Some(stack) = st.serving.remove(&pid) {
         for fr in stack.frames {
-            if let ServingFrame::Reply(w) = fr {
+            if let ServingFrame::Reply(w, _) = fr {
                 if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                     bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
                 }
@@ -5121,16 +5138,23 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // length before this pairing (unclaimed waits
         // only, now that claimed ones live on stacks).
         let n_outstanding = st.waiters.get(arena).map_or(0, |v| v.len());
-        let mut claimed: Option<ReplyWait> = None;
+        let mut claimed: Option<(ReplyWait, u64)> = None;
+        // 0.9.128 telemetry: frames this pop consumed to
+        // reach its Reply frame and the stack depth it
+        // left behind, for the reply-pop dump below.
+        let mut pop_count = 0usize;
+        let mut pop_depth = 0usize;
         if let Some(stack) = st.serving.get_mut(&pid) {
             while let Some(fr) = stack.frames.pop() {
-                if let ServingFrame::Reply(w) = fr {
-                    claimed = Some(w);
+                pop_count += 1;
+                if let ServingFrame::Reply(w, seq) = fr {
+                    claimed = Some((w, seq));
                     break;
                 }
             }
+            pop_depth = stack.frames.len();
         }
-        let Some(w) = claimed else {
+        let Some((w, claim_seq)) = claimed else {
             // No claimed wait: this reply answers nothing
             // this thread was ever handed. Drop it and
             // count it -- pairing it with a stranger from
@@ -5150,6 +5174,25 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             );
             return;
         };
+        // 0.9.128 telemetry: photograph the pop itself --
+        // the claim sequence of the frame this BC_REPLY
+        // is answering (its source claim, stamped in
+        // binder_claim_fills), how many frames the pop
+        // consumed to reach it, the stack depth left
+        // behind, and the reply parcel's first word and
+        // size as the replier wrote them. Joined with the
+        // claim dump and the big-reply dump's claim_seq,
+        // one delivered reply traces claim -> pop ->
+        // delivery, which is what separates a wrong-frame
+        // pop from the other two substitution candidates
+        // (s9-127-big-reply Q5). Log only.
+        {
+            let first = if data.len() >= 4 { u32_at(&data, 0) } else { 0 };
+            bsup!(
+                "binder: reply-pop dump replier={pid} claim_seq={claim_seq} popped={pop_count} depth={pop_depth} first=0x{first:x} size={}",
+                data.len()
+            );
+        }
         // The 0.9.100 concurrency line, kept truthful:
         // it now fires when this reply pairs while other
         // waits for the same arena are still outstanding
@@ -5164,7 +5207,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                     others += stack
                         .frames
                         .iter()
-                        .filter(|fr| matches!(fr, ServingFrame::Reply(_)))
+                        .filter(|fr| matches!(fr, ServingFrame::Reply(..)))
                         .count();
                 }
             }
@@ -5258,10 +5301,13 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // can be joined on (key_sender, key_node,
         // key_code, slot, head). Log only, after the
         // delivery above; nothing here feeds back.
+        // 0.9.128: the line also carries the popped
+        // frame's claim_seq, joining it to that claim's
+        // claim dump and this delivery's reply-pop dump.
         if delivered_ok && tdata.len() >= 256 {
             let (kptr, kcookie) = claim_key_node(st, &w);
             bsup!(
-                "binder: big-reply dump waiter={} size={} key_sender={} key_node=0x{kptr:x}/0x{kcookie:x} key_code={} slot={} head={}",
+                "binder: big-reply dump waiter={} size={} key_sender={} key_node=0x{kptr:x}/0x{kcookie:x} key_code={} claim_seq={claim_seq} slot={} head={}",
                 w.sender_pid,
                 tdata.len(),
                 w.sender_pid,
@@ -5678,6 +5724,11 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             let flags = u32_at(bytes, i + 16);
             let sender_pid = u32_at(bytes, i + 20) as i32;
             let mut frame = ServingFrame::Other;
+            // 0.9.128 telemetry: the claimed wait's key
+            // scalars and its frame's claim sequence
+            // number, copied out before the wait moves
+            // into the frame (claim dump after the push).
+            let mut claimed_key: Option<(u64, i32, u32, u32, u32, u32)> = None;
             if flags & TF_ONE_WAY == 0 {
                 let sender_arena = st.thread_arena.get(&sender_pid).cloned();
                 let node_idx = st.nodes.iter().position(|n| {
@@ -5737,7 +5788,23 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                 match qpos {
                     Some(j) => {
                         let w = st.waiters.get_mut(arena).unwrap().remove(j);
-                        frame = ServingFrame::Reply(w);
+                        // 0.9.128: stamp the frame with
+                        // the next claim sequence number
+                        // and keep the wait's key for the
+                        // claim dump (node resolved by the
+                        // same helper the big-reply dump
+                        // uses, so the two lines join).
+                        st.claim_seq += 1;
+                        let (kptr, kcookie) = claim_key_node(st, &w);
+                        claimed_key = Some((
+                            st.claim_seq,
+                            w.sender_pid,
+                            kptr,
+                            kcookie,
+                            w.code,
+                            w.target_handle,
+                        ));
+                        frame = ServingFrame::Reply(w, st.claim_seq);
                     }
                     None => {
                         bsup!(
@@ -5746,14 +5813,31 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                     }
                 }
             }
-            st.serving
-                .entry(pid)
-                .or_insert_with(|| ServingStack {
-                    arena: arena.to_string(),
-                    frames: Vec::new(),
-                })
-                .frames
-                .push(frame);
+            let stack = st.serving.entry(pid).or_insert_with(|| ServingStack {
+                arena: arena.to_string(),
+                frames: Vec::new(),
+            });
+            stack.frames.push(frame);
+            // 0.9.128 telemetry: photograph the claim
+            // event itself -- the fill entry's own read
+            // identity (sender / target / code exactly as
+            // read out of the BR_TRANSACTION) beside the
+            // key of the wait it claimed, the serving
+            // thread and its stack depth after the push.
+            // The 0.9.127 dumps record only the claimed
+            // wait's key and the delivered parcel's head,
+            // never the fill entry that triggered the
+            // claim, so fill-claim aliasing, a wrong-frame
+            // pop and replier-side buffer aliasing could
+            // not be separated (s9-127-big-reply Q5).
+            // Log only; the push above is the last state
+            // change in this iteration either way.
+            if let Some((seq, wsender, kptr, kcookie, wcode, whandle)) = claimed_key {
+                bsup!(
+                    "binder: claim dump claim_seq={seq} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
+                    stack.frames.len()
+                );
+            }
         }
         i += adv;
     }
@@ -6655,7 +6739,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // them, failing their callers, before this ran.
     for stack in st.serving.values_mut() {
         stack.frames.retain(|fr| match fr {
-            ServingFrame::Reply(w) => w.sender_arena != arena,
+            ServingFrame::Reply(w, _) => w.sender_arena != arena,
             ServingFrame::Other => true,
         });
     }
