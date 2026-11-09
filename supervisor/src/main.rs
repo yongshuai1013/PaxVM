@@ -2068,18 +2068,54 @@ enum ServingFrame {
     Other,
 }
 
+/// One read fill's worth of frames on a serving stack
+/// (0.9.130): every frame binder_claim_fills pushed for
+/// a single fill, in claim (stream) order. See
+/// ServingStack for why fills are kept apart.
+struct ServingGroup {
+    /// Fill sequence number (BinderState::fill_seq):
+    /// one number per fill that claimed at least one
+    /// frame, printed by the claim / reply-pop dumps so
+    /// a delivered reply can be joined to its fill
+    /// batch. Telemetry only.
+    fill_id: u64,
+    frames: Vec<ServingFrame>,
+}
+
 /// A serving thread's transaction stack (0.9.125): the
 /// supervisor-side mirror of the kernel's per-thread
 /// transaction stack. A two-way wait lives in the shared
 /// per-arena queue only until a read fill hands the
 /// transaction parcel to a serving thread; the claim
 /// (binder_claim_fills) moves it here, and the thread's
-/// later BC_REPLY answers the newest Reply frame --
-/// never a stranger picked off the shared queue.
+/// later BC_REPLY answers a claimed wait -- never a
+/// stranger picked off the shared queue.
+///
+/// Pairing discipline (0.9.130): groups are answered
+/// newest-first (a fill that arrives while an older
+/// call is still open is a deeper serving level --
+/// the old stack order across fills), but frames
+/// WITHIN one group are answered in claim order
+/// (FIFO). A guest thread that read several
+/// transactions in one fill serves them in buffer
+/// order and sends its BC_REPLYs in that same order;
+/// the 0.9.125 flat stack popped a batch LIFO and
+/// swapped the batch's replies (s9-130-provider-data
+/// line one: pinyin's getContentProvider was answered
+/// with phone's PackageInfo, read as a ProviderInfo --
+/// NPE, crash report, ignition).
 struct ServingStack {
     /// Arena the serving thread belongs to.
     arena: String,
-    frames: Vec<ServingFrame>,
+    groups: Vec<ServingGroup>,
+}
+
+impl ServingStack {
+    /// Total frames across all groups (the depth the
+    /// claim / reply-pop dumps print).
+    fn depth(&self) -> usize {
+        self.groups.iter().map(|g| g.frames.len()).sum()
+    }
 }
 
 #[derive(Default)]
@@ -2156,6 +2192,13 @@ struct BinderState {
     /// buffer aliasing). Written here and on frames,
     /// printed by dumps, never read by any decision.
     claim_seq: u64,
+    /// 0.9.130: global fill sequence counter. Each
+    /// binder_claim_fills call that pushes at least one
+    /// frame takes the next number as its ServingGroup's
+    /// fill_id; the claim and reply-pop dumps print it
+    /// so a batch's claims can be told apart from a
+    /// nested fill's. Telemetry only, like claim_seq.
+    fill_seq: u64,
     /// Virtual ashmem (S6b): canonical backing-file path ->
     /// region record. The host kernel's /dev/ashmem is
     /// policy-denied to app-domain processes on the Android
@@ -3306,7 +3349,11 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
     // first, for every exiting thread including the
     // arena's last, keeps each wait's failure single).
     if let Some(stack) = st.serving.remove(&pid) {
-        for fr in stack.frames {
+        // 0.9.130: groups oldest-first, frames in claim
+        // order -- the flat stack's iteration order, so
+        // every claimed wait is still failed exactly
+        // once, in the order it was claimed.
+        for fr in stack.groups.into_iter().flat_map(|g| g.frames) {
             if let ServingFrame::Reply(w, _) = fr {
                 if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                     bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
@@ -5133,10 +5180,12 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // by queue position. The wait this reply answers
         // was claimed onto the replier thread's own serving
         // stack when a read fill handed it the transaction
-        // parcel (binder_claim_fills); pop to the newest
-        // claimed wait. Other frames above it are
-        // transactions that owed no reply and are complete
-        // by the time the thread answers an older one.
+        // parcel (binder_claim_fills). 0.9.130: the pop
+        // walks groups newest-first but consumes each
+        // group from the front (see ServingStack) -- one
+        // fill's transactions are served and answered in
+        // buffer order, so a batch's first reply answers
+        // its earliest claimed wait, not its latest.
         // The shared queue's FIFO pop is gone: under
         // concurrency it handed waiters other callers'
         // parcels (0.9.124's reply-pair dump photographed
@@ -5152,17 +5201,47 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // 0.9.128 telemetry: frames this pop consumed to
         // reach its Reply frame and the stack depth it
         // left behind, for the reply-pop dump below.
+        // 0.9.130 adds the answered frame's fill_id.
         let mut pop_count = 0usize;
         let mut pop_depth = 0usize;
+        let mut claimed_fill = 0u64;
         if let Some(stack) = st.serving.get_mut(&pid) {
-            while let Some(fr) = stack.frames.pop() {
-                pop_count += 1;
-                if let ServingFrame::Reply(w, seq) = fr {
-                    claimed = Some((w, seq));
-                    break;
+            // 0.9.130 pairing: newest group first (a fill
+            // claimed while an older call is still open is
+            // a deeper serving level -- the old stack
+            // order across fills), within the group from
+            // the FRONT: the guest serves one fill's
+            // transactions in buffer order and replies in
+            // that order, so the batch's first reply
+            // answers its earliest claimed wait. Other
+            // frames ahead of it in the group are one-way
+            // work already finished by the time the thread
+            // replies; consume them on the way, as the
+            // flat stack consumed the frames above its
+            // Reply. A group drained without a Reply is
+            // dropped and the search falls to the next
+            // group down; groups left empty are removed,
+            // so a group on the stack always holds frames.
+            while claimed.is_none() {
+                let gi = match stack.groups.len() {
+                    0 => break,
+                    n => n - 1,
+                };
+                let gfill = stack.groups[gi].fill_id;
+                while !stack.groups[gi].frames.is_empty() {
+                    let fr = stack.groups[gi].frames.remove(0);
+                    pop_count += 1;
+                    if let ServingFrame::Reply(w, seq) = fr {
+                        claimed = Some((w, seq));
+                        claimed_fill = gfill;
+                        break;
+                    }
+                }
+                if stack.groups[gi].frames.is_empty() {
+                    stack.groups.remove(gi);
                 }
             }
-            pop_depth = stack.frames.len();
+            pop_depth = stack.depth();
         }
         let Some((w, claim_seq)) = claimed else {
             // No claimed wait: this reply answers nothing
@@ -5200,7 +5279,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         {
             let first = first_word;
             bsup!(
-                "binder: reply-pop dump replier={pid} claim_seq={claim_seq} popped={pop_count} depth={pop_depth} first=0x{first:x} size={}",
+                "binder: reply-pop dump replier={pid} claim_seq={claim_seq} fill_id={claimed_fill} popped={pop_count} depth={pop_depth} first=0x{first:x} size={}",
                 data.len()
             );
         }
@@ -5229,8 +5308,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             for (tpid, stack) in st.serving.iter() {
                 if stack.arena == arena && *tpid != pid {
                     others += stack
-                        .frames
+                        .groups
                         .iter()
+                        .flat_map(|g| g.frames.iter())
                         .filter(|fr| matches!(fr, ServingFrame::Reply(..)))
                         .count();
                 }
@@ -5782,7 +5862,8 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
 /// time -- so the thread's later BC_REPLY is paired
 /// with the transaction it actually executed, the
 /// kernel's per-thread transaction-stack routing.
-/// Frames are pushed in stream order; one-way
+/// Frames are pushed in stream order, grouped per
+/// fill (0.9.130, see ServingStack); one-way
 /// transactions and unclaimable parcels push Other so
 /// the stack's depth keeps matching what the thread
 /// executed. A claim miss leaves the wait in the shared
@@ -5792,6 +5873,14 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
 /// the fill-side parcel disagreed, which should not
 /// happen and must not pass silently.
 fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8]) {
+    // 0.9.130: this call IS one fill (both call sites
+    // hand over exactly one command-boundary-cut fill),
+    // so the group id is a per-call lazy allocation:
+    // taken at the fill's first transaction -- every
+    // transaction pushes exactly one frame below, so an
+    // allocated id always names a real group, and a
+    // fill carrying no transaction burns no id.
+    let mut fill_id: Option<u64> = None;
     let mut i = 0usize;
     while i + 4 <= bytes.len() {
         let cmd = u32_at(bytes, i);
@@ -5800,6 +5889,14 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             break;
         }
         if cmd == BR_TRANSACTION {
+            let fid = match fill_id {
+                Some(f) => f,
+                None => {
+                    st.fill_seq += 1;
+                    fill_id = Some(st.fill_seq);
+                    st.fill_seq
+                }
+            };
             let tptr = u32_at(bytes, i + 4);
             let tcookie = u32_at(bytes, i + 8);
             let code = u32_at(bytes, i + 12);
@@ -5897,9 +5994,19 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             }
             let stack = st.serving.entry(pid).or_insert_with(|| ServingStack {
                 arena: arena.to_string(),
-                frames: Vec::new(),
+                groups: Vec::new(),
             });
-            stack.frames.push(frame);
+            // 0.9.130: this fill's frames form the top
+            // group, in claim order. Open the group at
+            // the fill's first frame; later frames of
+            // the same fill (same fid on top) append.
+            if stack.groups.last().map_or(true, |g| g.fill_id != fid) {
+                stack.groups.push(ServingGroup {
+                    fill_id: fid,
+                    frames: Vec::new(),
+                });
+            }
+            stack.groups.last_mut().unwrap().frames.push(frame);
             // 0.9.128 telemetry: photograph the claim
             // event itself -- the fill entry's own read
             // identity (sender / target / code exactly as
@@ -5916,8 +6023,8 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // change in this iteration either way.
             if let Some((seq, wsender, kptr, kcookie, wcode, whandle)) = claimed_key {
                 bsup!(
-                    "binder: claim dump claim_seq={seq} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
-                    stack.frames.len()
+                    "binder: claim dump claim_seq={seq} fill_id={fid} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
+                    stack.depth()
                 );
             }
         }
@@ -6821,10 +6928,16 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // need no handling here: binder_thread_exit drained
     // them, failing their callers, before this ran.
     for stack in st.serving.values_mut() {
-        stack.frames.retain(|fr| match fr {
-            ServingFrame::Reply(w, _) => w.sender_arena != arena,
-            ServingFrame::Other => true,
-        });
+        // 0.9.130: the same retain, per group; groups
+        // the scrub empties are removed (a group on the
+        // stack always holds frames).
+        for group in stack.groups.iter_mut() {
+            group.frames.retain(|fr| match fr {
+                ServingFrame::Reply(w, _) => w.sender_arena != arena,
+                ServingFrame::Other => true,
+            });
+        }
+        stack.groups.retain(|g| !g.frames.is_empty());
     }
     let mut dead_nodes: Vec<usize> = Vec::new();
     for (i, n) in st.nodes.iter_mut().enumerate() {
