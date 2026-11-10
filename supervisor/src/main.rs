@@ -2283,6 +2283,19 @@ struct BinderState {
     /// arena-death free-counters line.
     second_reads: u64,
     second_read_differs: u64,
+    /// 0.9.134: fd fixup resolution account (see
+    /// resolve_fd_fixups_core): failures routed to the
+    /// delivery-failure path instead of being written
+    /// into the parcel as -1 / a foreign number, low-
+    /// slot results dupped up out of the stdio range,
+    /// and write-back verifications passed. The work is
+    /// tracer-side; the counts arrive by MSG_ONEWAY_FD_
+    /// FAIL / MSG_ONEWAY_FD_STATS. Global like
+    /// shield4_drops; reported on the arena-death
+    /// free-counters line.
+    fd_fixup_failed: u64,
+    fd_fixup_dupped: u64,
+    fd_fixup_verified: u64,
     /// 0.9.128: global claim sequence counter. Every
     /// successful claim in binder_claim_fills takes the
     /// next number and stamps it on the ServingFrame it
@@ -2367,6 +2380,19 @@ struct FdFixup {
     file_off: u64,
     sender_pid: i32,
     sender_fd: i32,
+    /// 0.9.134: guest VA of the owning parcel's data in
+    /// the receiver (base + allocation offset, recorded
+    /// by binder_deliver). The resolution site finds the
+    /// BR command carrying this parcel in the batch it
+    /// is settling by matching this VA against the
+    /// commands' data pointers -- no base arithmetic
+    /// tracer-side, and the match survives the ref-pair
+    /// filters, which only ever drop INCREFS/ACQUIRE
+    /// commands. Used when a resolution failure converts
+    /// the delivery to FAILED_REPLY (see
+    /// fd_convert_in_stream); never consulted on the
+    /// success path.
+    data_va: u32,
 }
 
 impl BinderState {
@@ -2511,6 +2537,18 @@ const MSG_ONEWAY_DUMP_REQ: u8 = 32;
 // resolves the pair's node, counts it and logs it.
 // Telemetry only -- the pair is delivered regardless.
 const MSG_ONEWAY_SHIELD_COOKIE_SUSPECT: u8 = 33;
+// 0.9.134: a fixup resolution failed tracer-side; the
+// coordinator counts it and, per the disposition the
+// tracer reports, either does nothing (converted in
+// the tracer's own batch), fails the dropped
+// transaction's waiting sender, or converts the
+// delivery in its own queues. See fd_fail_convert_*.
+const MSG_ONEWAY_FD_FAIL: u8 = 34;
+// 0.9.134: per-resolution fixup statistics deltas
+// (low-slot dups performed, verifications passed),
+// counted coordinator-side for the arena-death
+// free-counters line.
+const MSG_ONEWAY_FD_STATS: u8 = 35;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
@@ -2623,6 +2661,7 @@ impl Enc {
         self.u64(f.file_off);
         self.i32(f.sender_pid);
         self.i32(f.sender_fd);
+        self.u32(f.data_va);
     }
     fn fixups(&mut self, fs: &[FdFixup]) {
         self.u32(fs.len() as u32);
@@ -2755,6 +2794,7 @@ impl<'a> Dec<'a> {
             file_off: self.u64(),
             sender_pid: self.i32(),
             sender_fd: self.i32(),
+            data_va: self.u32(),
         }
     }
     fn fixups(&mut self) -> Vec<FdFixup> {
@@ -2830,17 +2870,20 @@ enum ParkedOutcome {
 }
 
 /// Cache entries a fixup resolution learned: present
-/// in the resolution's map afterwards, absent from the
-/// seed it started with. Those are exactly the inserts
-/// the inline resolver used to make in the driver's
-/// fd_cache, owed back to the coordinator before any
-/// later decision reads the cache again.
+/// in the resolution's map afterwards, but absent from
+/// the seed it started with or carrying a different
+/// value than the seed's (0.9.134: a seeded entry whose
+/// fd sat in the stdio slots is dupped upward in
+/// place). Those are exactly the inserts the inline
+/// resolver used to make in the driver's fd_cache,
+/// owed back to the coordinator before any later
+/// decision reads the cache again.
 fn learned_entries(
     map: &std::collections::HashMap<CacheKey, i32>,
-    seed: &std::collections::HashSet<CacheKey>,
+    seed: &std::collections::HashMap<CacheKey, i32>,
 ) -> Vec<(CacheKey, i32)> {
     map.iter()
-        .filter(|(k, _)| !seed.contains(*k))
+        .filter(|(k, v)| seed.get(*k) != Some(*v))
         .map(|(k, v)| (k.clone(), *v))
         .collect()
 }
@@ -3259,6 +3302,46 @@ impl CoordClient {
         let mut e = Enc::new();
         e.cache(entries);
         self.send(MSG_ONEWAY_FD_CACHE_PUT, &e.0);
+    }
+
+    /// 0.9.134: report one failed fixup group to the
+    /// coordinator (counting, plus whatever finishing
+    /// the disposition names -- see fd_fail_convert_
+    /// local and the MSG_ONEWAY_FD_FAIL handler).
+    #[allow(clippy::too_many_arguments)]
+    fn oneway_fd_fail(
+        &mut self,
+        arena: &str,
+        data_va: u32,
+        sender_pid: i32,
+        sender_fd: i32,
+        nfail: u32,
+        disp: u8,
+        fail_pid: i32,
+        code: u32,
+        why: &str,
+    ) {
+        let mut e = Enc::new();
+        e.string(arena);
+        e.u32(data_va);
+        e.i32(sender_pid);
+        e.i32(sender_fd);
+        e.u32(nfail);
+        e.u8(disp);
+        e.i32(fail_pid);
+        e.u32(code);
+        e.string(why);
+        self.send(MSG_ONEWAY_FD_FAIL, &e.0);
+    }
+
+    /// 0.9.134: per-resolution fixup statistics deltas
+    /// (low-slot dups performed, write-back
+    /// verifications passed).
+    fn oneway_fd_stats(&mut self, dupped: u32, verified: u32) {
+        let mut e = Enc::new();
+        e.u32(dupped);
+        e.u32(verified);
+        self.send(MSG_ONEWAY_FD_STATS, &e.0);
     }
 
     fn oneway_park_remove(&mut self, pid: i32) {
@@ -4206,7 +4289,119 @@ impl CoordServer {
             }
             MSG_ONEWAY_FD_CACHE_PUT => {
                 for (k, fd) in d.cache() {
-                    self.st.fd_cache.insert(k, fd);
+                    // 0.9.134: a negative value is an
+                    // eviction (a cached fd that failed
+                    // verification tracer-side), not an
+                    // entry.
+                    if fd < 0 {
+                        self.st.fd_cache.remove(&k);
+                    } else {
+                        self.st.fd_cache.insert(k, fd);
+                    }
+                }
+            }
+            MSG_ONEWAY_FD_STATS => {
+                let dupped = d.u32();
+                let verified = d.u32();
+                self.st.fd_fixup_dupped += dupped as u64;
+                self.st.fd_fixup_verified += verified as u64;
+            }
+            MSG_ONEWAY_FD_FAIL => {
+                let arena = d.string();
+                let data_va = d.u32();
+                let fd_sender_pid = d.i32();
+                let fd_sender_fd = d.i32();
+                let nfail = d.u32();
+                let disp = d.u8();
+                let fail_pid = d.i32();
+                let code = d.u32();
+                let why = d.string();
+                self.st.fd_fixup_failed += nfail as u64;
+                // Disposition 0 (converted in the
+                // tracer's batch) is counted above and
+                // logged tracer-side; nothing is owed
+                // here.
+                let mut wake = 0;
+                if disp == FD_DISP_FAIL_SENDER {
+                    // The tracer dropped a transaction
+                    // from its batch; fail its waiting
+                    // sender from here, with the same
+                    // push_to + wake the delivery-failure
+                    // branch in binder_handle_txn uses.
+                    if fail_pid > 0 {
+                        if let Some(sarena) = self.st.thread_arena.get(&fail_pid).cloned() {
+                            if let Some(bp) = self.st.procs.get_mut(&sarena) {
+                                bp.push_to(fail_pid, &BR_FAILED_REPLY.to_le_bytes());
+                            }
+                            evidence_tag(
+                                &mut self.st,
+                                &sarena,
+                                format!("failed-reply fd-fail code={code}"),
+                            );
+                            wake = fail_pid;
+                        }
+                    }
+                    bsup!(
+                        "binder: fd-fixup-convert txn sender failed pid={fail_pid} code={code} arena={arena} data_va=0x{data_va:x} fixups={nfail} why={why}"
+                    );
+                } else if disp == FD_DISP_QUEUED {
+                    // The fixups were settled by a
+                    // sibling thread's batch, so the
+                    // owning delivery never passed through
+                    // the reporting tracer's hands: search
+                    // this arena's queues for it.
+                    let mut outcome = FdConvert::NotFound;
+                    if let Some(bp) = self.st.procs.get_mut(&arena) {
+                        for q in bp.queues.values_mut() {
+                            let c = fd_convert_in_stream(q, data_va);
+                            if !matches!(c, FdConvert::NotFound) {
+                                outcome = c;
+                                break;
+                            }
+                        }
+                        if matches!(outcome, FdConvert::NotFound) {
+                            let c = fd_convert_in_stream(&mut bp.inbound, data_va);
+                            if !matches!(c, FdConvert::NotFound) {
+                                outcome = c;
+                            }
+                        }
+                    }
+                    match outcome {
+                        FdConvert::Reply => {
+                            bsup!(
+                                "binder: fd-fixup-convert queued arena={arena} data_va=0x{data_va:x} cmd=BR_REPLY -> FAILED_REPLY fixups={nfail} why={why}"
+                            );
+                        }
+                        FdConvert::Txn {
+                            fail_pid: fp,
+                            code: c2,
+                        } => {
+                            if fp > 0 {
+                                if let Some(sarena) = self.st.thread_arena.get(&fp).cloned() {
+                                    if let Some(bp) = self.st.procs.get_mut(&sarena) {
+                                        bp.push_to(fp, &BR_FAILED_REPLY.to_le_bytes());
+                                    }
+                                    evidence_tag(
+                                        &mut self.st,
+                                        &sarena,
+                                        format!("failed-reply fd-fail code={c2}"),
+                                    );
+                                    wake = fp;
+                                }
+                            }
+                            bsup!(
+                                "binder: fd-fixup-convert queued arena={arena} data_va=0x{data_va:x} cmd=BR_TRANSACTION code={c2} -> dropped; failing sender pid={fp} fixups={nfail} why={why}"
+                            );
+                        }
+                        FdConvert::NotFound => {
+                            bsup!(
+                                "binder: fd-fixup-fail-late arena={arena} data_va=0x{data_va:x} sender_pid={fd_sender_pid} sender_fd={fd_sender_fd} fixups={nfail} why={why} (owning command in no queue; delivery already consumed, parcel word left unwritten)"
+                            );
+                        }
+                    }
+                }
+                if wake > 0 {
+                    self.push_wake(wake);
                 }
             }
             MSG_ONEWAY_PARK_REMOVE => {
@@ -4560,7 +4755,7 @@ fn exec_binder_actions(
             }
         }
     }
-    for (i, j) in pairs {
+    for &(i, j) in &pairs {
         let (baddr, newlen) = match &mut actions[i] {
             BAction::WriteMem { addr, bytes } => {
                 let filtered = shield_live_pairs(pid, std::mem::take(bytes), coord);
@@ -4574,9 +4769,23 @@ fn exec_binder_actions(
             bytes[16..20].copy_from_slice(&newlen.to_le_bytes());
         }
     }
-    for a in actions {
+    // 0.9.134: the identified fill's action indices,
+    // remembered so a ResolveFdFixupsInline later in the
+    // list can convert a failed fixup's delivery inside
+    // the batch it rode in on (see that arm).
+    let batch_idx = pairs.first().map(|&(i, _)| i);
+    let wb_idx = pairs.first().map(|&(_, j)| j);
+    let mut batch_snap: Option<(u64, Vec<u8>)> = None;
+    let mut wb_addr: Option<u64> = None;
+    for (ai, a) in actions.into_iter().enumerate() {
         match a {
             BAction::WriteMem { addr, bytes } => {
+                if Some(ai) == batch_idx {
+                    batch_snap = Some((addr, bytes.clone()));
+                }
+                if Some(ai) == wb_idx {
+                    wb_addr = Some(addr);
+                }
                 let _ = write_mem(pid, addr, &bytes);
             }
             BAction::SkipSyscall(v) => skip_syscall(pid, regs, pend, v),
@@ -4596,13 +4805,51 @@ fn exec_binder_actions(
                 }
             }
             BAction::ResolveFdFixupsInline { arena, fixups, cache } => {
-                let seed: std::collections::HashSet<CacheKey> =
-                    cache.iter().map(|(k, _)| k.clone()).collect();
+                let seed: HashMap<CacheKey, i32> = cache.iter().cloned().collect();
                 let mut cmap: HashMap<CacheKey, i32> = cache.into_iter().collect();
-                let rides =
-                    resolve_fd_fixups_core(pid, compat, &mut cmap, &arena, &fixups, regs);
-                coord.oneway_fd_cache_put(&learned_entries(&cmap, &seed));
-                if rides > 0 {
+                let res = resolve_fd_fixups_core(pid, compat, &mut cmap, &arena, &fixups, regs);
+                // Learned entries ride back as inserts;
+                // evictions (0.9.134) as -1 removals.
+                let mut put = learned_entries(&cmap, &seed);
+                for k in &res.evictions {
+                    put.push((k.clone(), -1));
+                }
+                coord.oneway_fd_cache_put(&put);
+                if res.dupped > 0 || res.verified > 0 {
+                    coord.oneway_fd_stats(res.dupped, res.verified);
+                }
+                if !res.failed.is_empty() {
+                    // 0.9.134 (fix (a)): convert the
+                    // failed deliveries inside the batch
+                    // this decision just wrote into the
+                    // guest. The guest has not run yet --
+                    // the whole action list executes at
+                    // its entry stop -- so repair the
+                    // read buffer and the writeback's
+                    // read_consumed in place, and the
+                    // guest consumes the converted stream,
+                    // never the failed parcels. With no
+                    // identified batch the conversion
+                    // finds nothing locally and every
+                    // failure is handed to the
+                    // coordinator's queue search.
+                    let mut snap: Vec<u8> = batch_snap
+                        .as_ref()
+                        .map(|(_, b)| b.clone())
+                        .unwrap_or_default();
+                    if fd_fail_convert_local(coord, &arena, pid, &mut snap, &res.failed) {
+                        if let (Some((baddr, _)), Some(wb)) = (&batch_snap, &wb_addr) {
+                            let _ = write_mem(pid, *baddr, &snap);
+                            let _ = write_mem(
+                                pid,
+                                wb + 16,
+                                &(snap.len() as u32).to_le_bytes(),
+                            );
+                            fill = Some((*baddr as u32, snap.len() as u32));
+                        }
+                    }
+                }
+                if res.rides > 0 {
                     regs.set_retval(0);
                     if set_regs(pid, regs) {
                         pend.applied = true;
@@ -4865,6 +5112,24 @@ fn binder_deliver(
     let Some(off) = st.alloc(target, total.max(8)) else {
         return Err("alloc failed (no such arena state, or out of mapped space)");
     };
+    // 0.9.134: the base is read before the fixups are
+    // queued so each fixup can carry the parcel's guest
+    // VA (data_va, see FdFixup). Same value the delivery
+    // below names in its transaction words; the error
+    // behaviour is unchanged (the lookup simply moved
+    // ahead of the fixup queueing, which no failure path
+    // could observe: a missing arena state or base fails
+    // the delivery either way, before any byte is
+    // queued).
+    let base = {
+        let Some(bp) = st.procs.get(target) else {
+            return Err("arena state vanished after alloc");
+        };
+        let Some(&base) = bp.base.values().next() else {
+            return Err("target arena has no recorded mmap base");
+        };
+        base
+    };
     for (rel, sfd) in fd_fixups {
         st.fd_pending
             .entry(target.to_string())
@@ -4873,13 +5138,11 @@ fn binder_deliver(
                 file_off: off as u64 + *rel as u64,
                 sender_pid,
                 sender_fd: *sfd,
+                data_va: base + off,
             });
     }
     let Some(bp) = st.procs.get_mut(target) else {
         return Err("arena state vanished after alloc");
-    };
-    let Some(&base) = bp.base.values().next() else {
-        return Err("target arena has no recorded mmap base");
     };
     if bp.file.write_all_at(data, off as u64).is_err()
         || bp.file.write_all_at(offs, (off + ((data.len() as u32 + 3) & !3)) as u64).is_err()
@@ -7209,17 +7472,17 @@ fn wait_one_syscall_stop(pid: i32) -> Option<()> {
     None
 }
 
-/// Run one openat("/proc/<sender>/fd/<n>") inside a tracee
-/// stopped at a syscall stop and return the new fd (or a
-/// negative value). The first ride uses the stop we are
-/// already sitting on; later rides rewind the PC to the svc
-/// instruction and drive entry+exit privately. On return
-/// `regs` holds the exit-stop registers of the injected
-/// call.
-fn inject_openat(
+/// Run one syscall inside a tracee stopped at a syscall
+/// stop and return its result (or a negative value). The
+/// first ride uses the stop we are already sitting on;
+/// later rides rewind the PC to the svc instruction and
+/// drive entry+exit privately. On return `regs` holds
+/// the exit-stop registers of the injected call.
+fn inject_syscall(
     pid: i32,
     compat: bool,
-    path_addr: u64,
+    nr: u64,
+    args: [u64; 4],
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
@@ -7227,16 +7490,14 @@ fn inject_openat(
     if rewind {
         regs.set_pc(entry_pc);
     }
-    let nr_openat: u64 = if compat { 322 } else { 56 };
-    regs.set_nr(nr_openat);
-    regs.set_arg(0, (-100i32) as i64 as u64); // AT_FDCWD
-    regs.set_arg(1, path_addr);
-    regs.set_arg(2, 2); // O_RDWR
-    regs.set_arg(3, 0);
+    regs.set_nr(nr);
+    for (i, a) in args.iter().enumerate() {
+        regs.set_arg(i, *a);
+    }
     if !set_regs(pid, regs) {
         return -1;
     }
-    if !set_syscallno(pid, nr_openat as i32) {
+    if !set_syscallno(pid, nr as i32) {
         sup!("binder: fd injection NT_ARM_SYSTEM_CALL failed pid={pid}");
         return -1;
     }
@@ -7262,6 +7523,308 @@ fn inject_openat(
     }
 }
 
+/// inject_syscall specialised to the fixup resolver's
+/// founding call: openat an already-scratch-written
+/// "/proc/<sender>/fd/<n>" path in the receiver.
+fn inject_openat(
+    pid: i32,
+    compat: bool,
+    path_addr: u64,
+    entry_pc: u64,
+    rewind: bool,
+    regs: &mut Regs,
+) -> i64 {
+    let nr_openat: u64 = if compat { 322 } else { 56 };
+    inject_syscall(
+        pid,
+        compat,
+        nr_openat,
+        [(-100i32) as i64 as u64, path_addr, 2, 0], // AT_FDCWD, path, O_RDWR, mode
+        entry_pc,
+        rewind,
+        regs,
+    )
+}
+
+/// 0.9.134: fcntl(fd, F_DUPFD, min) inside the receiver:
+/// the lowest free descriptor at or above `min`, naming
+/// the same open file as `fd`. Retires a resolved fd
+/// out of the stdio slots (see resolve_fd_fixups_core,
+/// fix (c)).
+fn inject_dupfd_min(
+    pid: i32,
+    compat: bool,
+    fd: i32,
+    min: i32,
+    entry_pc: u64,
+    rewind: bool,
+    regs: &mut Regs,
+) -> i64 {
+    let nr_fcntl: u64 = if compat { 55 } else { 25 };
+    inject_syscall(
+        pid,
+        compat,
+        nr_fcntl,
+        [fd as u64, 0, min as u64, 0], // F_DUPFD = 0
+        entry_pc,
+        rewind,
+        regs,
+    )
+}
+
+/// 0.9.134: close(fd) inside the receiver -- retiring
+/// the sub-3 original after a low-slot dup.
+fn inject_close(
+    pid: i32,
+    compat: bool,
+    fd: i32,
+    entry_pc: u64,
+    rewind: bool,
+    regs: &mut Regs,
+) -> i64 {
+    let nr_close: u64 = if compat { 6 } else { 57 };
+    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs)
+}
+
+/// 0.9.134 (s9-133-verify Q2, fix (b)): before a resolved
+/// fd is written into the parcel, prove from the host
+/// side that the number names, in the receiver, the same
+/// open file the sender's number names in the sender --
+/// the mirror image of the sender-side check fd_obj_dump
+/// photographs. It catches the resolver producing a
+/// number that was never opened (the .133 run's
+/// pid-value word) and cache entries the guest has since
+/// closed or whose slot has been recycled onto another
+/// file. A sender that has already exited cannot be
+/// compared; existence in the receiver is the whole
+/// check then (a fresh open of a dead sender's fd fails
+/// on its own, so the un-comparable case is the cache
+/// hit, whose fd was opened legitimately while the
+/// sender lived).
+fn fd_verify(recv_pid: i32, sender_pid: i32, sender_fd: i32, fd: i32) -> Result<(), &'static str> {
+    let rt = std::fs::read_link(format!("/proc/{recv_pid}/fd/{fd}"))
+        .map_err(|_| "verify-recv-missing")?;
+    if let Ok(st) = std::fs::read_link(format!("/proc/{sender_pid}/fd/{sender_fd}")) {
+        if st != rt {
+            return Err("verify-target-mismatch");
+        }
+    }
+    Ok(())
+}
+
+/// A BR_TRANSACTION / BR_REPLY command located in a
+/// byte stream by the guest VA of its parcel data.
+struct FdCmdLoc {
+    off: usize,
+    cmd: u32,
+    code: u32,
+    flags: u32,
+    sender_pid: i32,
+}
+
+/// Walk a BR command stream for the transaction/reply
+/// whose data pointer equals `data_va`. The last match
+/// wins: if an arena slot was recycled inside one
+/// stream, the live delivery is the later command, and
+/// it is the one the pending fixup belongs to.
+fn fd_locate_cmd(bytes: &[u8], data_va: u32) -> Option<FdCmdLoc> {
+    let mut found = None;
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            break;
+        }
+        if (cmd == BR_TRANSACTION || cmd == BR_REPLY) && len == 44 {
+            if u32_at(bytes, off + 36) == data_va {
+                found = Some(FdCmdLoc {
+                    off,
+                    cmd,
+                    code: u32_at(bytes, off + 12),
+                    flags: u32_at(bytes, off + 16),
+                    sender_pid: u32_at(bytes, off + 20) as i32,
+                });
+            }
+        }
+        off += len;
+    }
+    found
+}
+
+/// What converting one failed delivery did to a stream.
+enum FdConvert {
+    /// BR_REPLY replaced in place by BR_FAILED_REPLY:
+    /// the receiver is the waiter and has its answer.
+    Reply,
+    /// BR_TRANSACTION removed; its synchronous sender
+    /// (fail_pid; 0 when the call was one-way) still
+    /// has to be failed by whoever owns the queues.
+    Txn { fail_pid: i32, code: u32 },
+    NotFound,
+}
+
+/// 0.9.134 (s9-133-verify Q2, fix (a)): convert the
+/// delivery whose parcel data lives at `data_va` inside
+/// `bytes` to the delivery-failure path, in place --
+/// the same BR_FAILED_REPLY answer the shield drops and
+/// the binder_deliver error branch give a waiter,
+/// applied to a delivery that only fails at
+/// fd-resolution time. The stream stays command-aligned
+/// throughout: a reply shrinks to the 4-byte
+/// BR_FAILED_REPLY, a transaction is cut out whole. Used
+/// on the tracer's own batch (both fill paths) and on
+/// the coordinator's queues.
+fn fd_convert_in_stream(bytes: &mut Vec<u8>, data_va: u32) -> FdConvert {
+    let Some(loc) = fd_locate_cmd(bytes, data_va) else {
+        return FdConvert::NotFound;
+    };
+    if loc.cmd == BR_REPLY {
+        bytes[loc.off..loc.off + 4].copy_from_slice(&BR_FAILED_REPLY.to_le_bytes());
+        bytes.drain(loc.off + 4..loc.off + 44);
+        FdConvert::Reply
+    } else {
+        let fail_pid = if loc.flags & TF_ONE_WAY == 0 {
+            loc.sender_pid
+        } else {
+            0
+        };
+        bytes.drain(loc.off..loc.off + 44);
+        FdConvert::Txn {
+            fail_pid,
+            code: loc.code,
+        }
+    }
+}
+
+/// One fixup whose resolution failed (0.9.134, fix (a)).
+/// Its parcel word is left unwritten -- never -1, never
+/// a foreign number -- and the owning delivery is
+/// converted by fd_fail_convert_local (tracer batch) or
+/// by the coordinator (queued deliveries).
+struct FdFail {
+    sender_pid: i32,
+    sender_fd: i32,
+    data_va: u32,
+    file_off: u64,
+    why: String,
+}
+
+/// The outcome of one resolve_fd_fixups_core pass:
+/// rides taken (the callers' stop bookkeeping keys off
+/// it exactly as it keyed off the old return value),
+/// the failures to convert, the cache keys to evict
+/// (cached fds that failed verification), and the
+/// statistics the coordinator counts.
+#[derive(Default)]
+struct FdResolution {
+    rides: usize,
+    failed: Vec<FdFail>,
+    evictions: Vec<CacheKey>,
+    dupped: u32,
+    verified: u32,
+}
+
+/// Dispositions reported to the coordinator with each
+/// failed fixup group (MSG_ONEWAY_FD_FAIL, see
+/// fd_fail_convert_local).
+const FD_DISP_LOCAL: u8 = 0; // converted in the tracer's batch; counted only
+const FD_DISP_FAIL_SENDER: u8 = 1; // txn dropped from the batch; coordinator fails its sender
+const FD_DISP_QUEUED: u8 = 2; // not in the batch; coordinator searches its queues
+
+/// 0.9.134 (fix (a)): route one resolution's failures to
+/// the delivery-failure path. `bytes` is the batch the
+/// tracer is about to hand the receiver (either fill
+/// path); each failed parcel's owning command is
+/// converted in it via fd_convert_in_stream, and every
+/// failure group is reported to the coordinator, which
+/// counts it and finishes whatever the batch could not
+/// (failing a dropped transaction's waiting sender, or
+/// finding the delivery in its queues when a sibling
+/// thread of the arena settled the fixups first).
+/// Returns true when the batch changed.
+fn fd_fail_convert_local(
+    coord: &mut CoordClient,
+    arena: &str,
+    recv_pid: i32,
+    bytes: &mut Vec<u8>,
+    failed: &[FdFail],
+) -> bool {
+    // Group by parcel: several failed fixups can ride
+    // one delivery (the .133 three-object groups), and
+    // a delivery converts once.
+    let mut groups: Vec<(u32, Vec<&FdFail>)> = Vec::new();
+    for f in failed {
+        if let Some(g) = groups.iter_mut().find(|(va, _)| *va == f.data_va) {
+            g.1.push(f);
+        } else {
+            groups.push((f.data_va, vec![f]));
+        }
+    }
+    let mut changed = false;
+    for (va, group) in groups {
+        let first = group[0];
+        let nfail = group.len() as u32;
+        match fd_convert_in_stream(bytes, va) {
+            FdConvert::Reply => {
+                changed = true;
+                sup!(
+                    "binder: fd-fixup-convert recv_pid={recv_pid} data_va=0x{va:x} file_off=0x{:x} cmd=BR_REPLY -> FAILED_REPLY fixups={nfail} why={}",
+                    first.file_off,
+                    first.why
+                );
+                coord.oneway_fd_fail(
+                    arena, va, first.sender_pid, first.sender_fd, nfail, FD_DISP_LOCAL, 0, 0,
+                    &first.why,
+                );
+            }
+            FdConvert::Txn { fail_pid, code } => {
+                changed = true;
+                if fail_pid > 0 {
+                    sup!(
+                        "binder: fd-fixup-convert recv_pid={recv_pid} data_va=0x{va:x} file_off=0x{:x} cmd=BR_TRANSACTION code={code} -> dropped; failing sender pid={fail_pid} fixups={nfail} why={}",
+                        first.file_off,
+                        first.why
+                    );
+                    coord.oneway_fd_fail(
+                        arena,
+                        va,
+                        first.sender_pid,
+                        first.sender_fd,
+                        nfail,
+                        FD_DISP_FAIL_SENDER,
+                        fail_pid,
+                        code,
+                        &first.why,
+                    );
+                } else {
+                    sup!(
+                        "binder: fd-fixup-convert recv_pid={recv_pid} data_va=0x{va:x} file_off=0x{:x} cmd=BR_TRANSACTION code={code} -> dropped (one-way) fixups={nfail} why={}",
+                        first.file_off,
+                        first.why
+                    );
+                    coord.oneway_fd_fail(
+                        arena, va, first.sender_pid, first.sender_fd, nfail, FD_DISP_LOCAL, 0,
+                        code, &first.why,
+                    );
+                }
+            }
+            FdConvert::NotFound => {
+                sup!(
+                    "binder: fd-fixup-convert recv_pid={recv_pid} data_va=0x{va:x} file_off=0x{:x} not in batch; asking coordinator to search its queues fixups={nfail} why={}",
+                    first.file_off,
+                    first.why
+                );
+                coord.oneway_fd_fail(
+                    arena, va, first.sender_pid, first.sender_fd, nfail, FD_DISP_QUEUED, 0, 0,
+                    &first.why,
+                );
+            }
+        }
+    }
+    changed
+}
+
 /// Resolve one wake's FD fixups: make the receiver open
 /// each sender fd itself, patch the parcel words in its
 /// arena file, then settle its parked call. The rides
@@ -7272,11 +7835,40 @@ fn inject_openat(
 /// is a cache hit nothing is ridden and the ordinary flow
 /// is left untouched.
 /// Core of the fixup resolution: have the receiver open
-/// each sender fd (cache first), patch the parcel words in
-/// the arena file, and return how many injection rides were
-/// needed. Settling the receiver's stop state differs
-/// between callers (parked wake vs WRITE_READ entry), so it
-/// stays with them.
+/// each sender fd (cache first), verify the result,
+/// keep it out of the stdio slots, and only then patch
+/// the parcel word in the arena file. Settling the
+/// receiver's stop state differs between callers
+/// (parked wake vs WRITE_READ entry), so it stays with
+/// them; what comes back is the FdResolution.
+///
+/// 0.9.134 rewrites the failure semantics wholesale
+/// (s9-133-verify Q2: of 53 resolutions, 8 were
+/// defective and two of them killed their receiver at
+/// the same pc in libsurfaceflinger_client -- one of
+/// them a system_server tenure -- because the old code
+/// wrote whatever the resolver produced into the
+/// parcel, including -1 for a failed open and, once, a
+/// value equal to the receiver's own pid):
+/// (a) a failed resolution writes NOTHING into the
+/// parcel. The failure is returned to the caller,
+/// which converts the whole delivery to the
+/// delivery-failure path (fd_fail_convert_local) --
+/// the honest error the shield drops give a waiter,
+/// instead of a fabricated fd it then dereferences.
+/// (b) before any write-back, the candidate fd is
+/// verified host-side (fd_verify): in the receiver it
+/// must name the same open file the sender's fd names.
+/// A cached entry that fails is evicted, here and with
+/// the coordinator.
+/// (c) a result below 3 is dupped up to the first free
+/// slot at or above 3 and the original closed: the
+/// resolver's open lands on the lowest free descriptor,
+/// which in a freshly forked guest whose stdio is not
+/// redirected yet is slot 0 -- the .133 three-object
+/// groups resolved their middle pipe to 0 in five of
+/// five tenures, and the guest's later stdio redirect
+/// silently overwrote the slot.
 fn resolve_fd_fixups_core(
     pid: i32,
     compat: bool,
@@ -7284,39 +7876,128 @@ fn resolve_fd_fixups_core(
     arena: &str,
     fixups: &[FdFixup],
     regs: &mut Regs,
-) -> usize {
+) -> FdResolution {
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
-    let mut rides = 0;
+    let mut res = FdResolution::default();
     for fx in fixups {
         let cache_key = (arena.to_string(), fx.sender_pid, fx.sender_fd);
-        let newfd: i64 = if let Some(fd) = cache.get(&cache_key) {
-            *fd as i64
+        let from_cache = cache.contains_key(&cache_key);
+        // Obtain a candidate: the cache's number, or a
+        // fresh open of the sender's fd ridden in the
+        // receiver.
+        let mut candidate: Option<i32> = None;
+        let mut why: Option<String> = None;
+        if let Some(fd) = cache.get(&cache_key) {
+            candidate = Some(*fd);
         } else {
             let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
-            let fd = match scratch_write(pid, &mut cursor, &path) {
-                Some(addr) => inject_openat(pid, compat, addr, entry_pc, rides > 0, &mut *regs),
+            let r = match scratch_write(pid, &mut cursor, &path) {
+                Some(addr) => {
+                    inject_openat(pid, compat, addr, entry_pc, res.rides > 0, &mut *regs)
+                }
                 None => -1,
             };
-            rides += 1;
-            if fd >= 0 {
-                cache.insert(cache_key, fd as i32);
+            res.rides += 1;
+            if r >= 0 {
+                candidate = Some(r as i32);
+            } else {
+                why = Some(format!("open_ret={r}"));
             }
-            fd
-        };
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(arena) {
-            use std::os::unix::fs::FileExt;
-            let _ = f.write_all_at(&(newfd as u32).to_le_bytes(), fx.file_off);
         }
-        sup!(
-            "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup)",
-            fx.sender_fd,
-            fx.sender_pid,
-            newfd,
-            pid
-        );
+        if let Some(fd0) = candidate {
+            match fd_verify(pid, fx.sender_pid, fx.sender_fd, fd0) {
+                Ok(()) => {
+                    res.verified += 1;
+                    let mut fd = fd0;
+                    // Fix (c): the stdio slot ban.
+                    if fd < 3 {
+                        let d = inject_dupfd_min(
+                            pid,
+                            compat,
+                            fd,
+                            3,
+                            entry_pc,
+                            res.rides > 0,
+                            &mut *regs,
+                        );
+                        res.rides += 1;
+                        if d >= 3 {
+                            // The dup names the same
+                            // file by construction; the
+                            // original is retired so the
+                            // guest's stdio redirect finds
+                            // the slot free, as it would
+                            // have been had the fd never
+                            // landed there.
+                            let _ = inject_close(pid, compat, fd, entry_pc, true, &mut *regs);
+                            res.rides += 1;
+                            sup!(
+                                "binder: fd-fixup dup sender_pid={} sender_fd={} fd {} -> {} in pid {} (low slot)",
+                                fx.sender_pid,
+                                fx.sender_fd,
+                                fd,
+                                d,
+                                pid
+                            );
+                            res.dupped += 1;
+                            fd = d as i32;
+                            if std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).is_err() {
+                                why = Some("dup-verify-missing".to_string());
+                            }
+                        } else {
+                            why = Some(format!("dup_ret={d}"));
+                        }
+                    }
+                    if why.is_none() {
+                        cache.insert(cache_key, fd);
+                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(arena) {
+                            use std::os::unix::fs::FileExt;
+                            let _ = f.write_all_at(&(fd as u32).to_le_bytes(), fx.file_off);
+                        }
+                        sup!(
+                            "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup)",
+                            fx.sender_fd,
+                            fx.sender_pid,
+                            fd,
+                            pid
+                        );
+                    }
+                }
+                Err(w) => {
+                    why = Some(w.to_string());
+                    if from_cache {
+                        // The cached number no longer
+                        // names the sender's file in
+                        // this process (closed since, or
+                        // the slot recycled): evict it
+                        // here and with the coordinator,
+                        // so the next delivery re-opens
+                        // instead of re-trusting it.
+                        cache.remove(&cache_key);
+                        res.evictions.push(cache_key);
+                    }
+                }
+            }
+        }
+        if let Some(w) = why {
+            sup!(
+                "binder: fd-fixup-fail sender_pid={} sender_fd={} recv_pid={pid} data_va=0x{:x} file_off=0x{:x} why={w}",
+                fx.sender_pid,
+                fx.sender_fd,
+                fx.data_va,
+                fx.file_off
+            );
+            res.failed.push(FdFail {
+                sender_pid: fx.sender_pid,
+                sender_fd: fx.sender_fd,
+                data_va: fx.data_va,
+                file_off: fx.file_off,
+                why: w,
+            });
+        }
     }
-    rides
+    res
 }
 
 fn resolve_fd_fixups(
@@ -7326,21 +8007,30 @@ fn resolve_fd_fixups(
     arena: &str,
     fixups: &[FdFixup],
     cache_seed: Vec<(CacheKey, i32)>,
-) {
+) -> FdResolution {
     let Some(proc0) = procs.get(&pid) else {
-        return;
+        return FdResolution::default();
     };
     let compat = proc0.compat;
     let Some(mut regs) = get_regs(pid, compat) else {
-        return;
+        return FdResolution::default();
     };
-    let seed: std::collections::HashSet<CacheKey> =
-        cache_seed.iter().map(|(k, _)| k.clone()).collect();
+    let seed: HashMap<CacheKey, i32> = cache_seed.iter().cloned().collect();
     let mut cache: HashMap<CacheKey, i32> = cache_seed.into_iter().collect();
-    let rides = resolve_fd_fixups_core(pid, compat, &mut cache, arena, fixups, &mut regs);
-    coord.oneway_fd_cache_put(&learned_entries(&cache, &seed));
-    if rides == 0 {
-        return;
+    let res = resolve_fd_fixups_core(pid, compat, &mut cache, arena, fixups, &mut regs);
+    // Learned entries ride back as inserts; evictions
+    // (0.9.134) ride back as -1 values, which the
+    // coordinator's cache-put handler reads as removals.
+    let mut put = learned_entries(&cache, &seed);
+    for k in &res.evictions {
+        put.push((k.clone(), -1));
+    }
+    coord.oneway_fd_cache_put(&put);
+    if res.dupped > 0 || res.verified > 0 {
+        coord.oneway_fd_stats(res.dupped, res.verified);
+    }
+    if res.rides == 0 {
+        return res;
     }
     if let Some(proc) = procs.get_mut(&pid) {
         if let Some(pend) = proc.pending.as_mut() {
@@ -7358,6 +8048,7 @@ fn resolve_fd_fixups(
         }
         proc.expect_exit = false;
     }
+    res
 }
 
 /// Finish a parked binder ioctl now that its arena has
@@ -7373,7 +8064,25 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let ParkedOutcome::Complete { park, bytes, fixups } = outcome else {
         return;
     };
-    let bytes = shield_live_pairs(pid, bytes, coord);
+    let mut bytes = shield_live_pairs(pid, bytes, coord);
+    // 0.9.134: FD fixups resolve BEFORE the batch is
+    // written into the guest. They used to resolve after
+    // the writes; the parcel words they patch live in the
+    // arena file either way, but a resolution failure now
+    // has to convert its delivery inside this byte stream
+    // (a BR_REPLY becomes BR_FAILED_REPLY, see
+    // fd_fail_convert_local), and that is only possible
+    // while the stream is still ours. The rides still
+    // ride the parked call's entry->exit transition and
+    // resolve_fd_fixups still applies its recorded inject
+    // exactly as before; on the success path nothing the
+    // guest can observe changes.
+    if let Some((arena, fx, cache)) = fixups {
+        let res = resolve_fd_fixups(pid, procs, coord, &arena, &fx, cache);
+        if !res.failed.is_empty() {
+            fd_fail_convert_local(coord, &arena, pid, &mut bytes, &res.failed);
+        }
+    }
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
     }
@@ -7393,13 +8102,6 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     // applies the 0 and retains the record, the late SIGSYS
     // is rescued and consumes it. (No regs surgery here: the
     // exit stop applies the inject itself.)
-    // FD fixups, if this delivery carried any, resolve while
-    // the receiver is still parked: it opens the senders'
-    // fds itself under supervisor control, and its parked
-    // call is settled by the resolver (see resolve_fd_fixups).
-    if let Some((arena, fixups, cache)) = fixups {
-        resolve_fd_fixups(pid, procs, coord, &arena, &fixups, cache);
-    }
     cont_syscall(pid, 0);
 }
 
@@ -7427,7 +8129,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     st.write_audit.retain(|r| r.arena != arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -7445,7 +8147,10 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.shield4_stack,
             st.shield4_other,
             st.second_reads,
-            st.second_read_differs
+            st.second_read_differs,
+            st.fd_fixup_failed,
+            st.fd_fixup_dupped,
+            st.fd_fixup_verified
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
@@ -10813,7 +11518,12 @@ fn tracer_loop(ctx: TracerCtx) {
                 // bytes at the data registers show what the
                 // code was about to touch (e.g. the
                 // pixelflinger JIT's emission pointer).
-                if sig == 11 {
+                // 0.9.134: the dump extends to SIGILL --
+                // at a SIGILL the pc bytes are the whole
+                // question (garbage jumped to, vs code the
+                // JIT emitted), and the register windows
+                // come free.
+                if sig == 11 || sig == 4 {
                     if let Some(r) = &fregs {
                         let hexat = |addr: u64, n: usize| -> String {
                             match read_mem_vec(pid, addr, n) {
@@ -10871,6 +11581,77 @@ fn tracer_loop(ctx: TracerCtx) {
                                 }
                             }
                         }
+                    }
+                }
+                // 0.9.134: SIGILL page forensics
+                // (s9-133-verify Q5). Two SIGILL deaths so
+                // far, both system_server threads in
+                // app-start traffic, both killing the
+                // tenure outright -- and both undecidable
+                // between (a) a Dalvik JIT compatibility
+                // gap (the thread legitimately executed
+                // into its own compiled-code page, whose
+                // encoding the supervisor's CPU model
+                // mishandles) and (b) a (c)-family
+                // corrupted pointer (the thread was thrown
+                // into a data page). The deciding evidence
+                // is the page itself: compiled code reads
+                // as code with a literal pool, image/data
+                // bytes read as data. Dump the whole pc
+                // page (256B reads, stopping at the first
+                // unreadable chunk) plus the raw maps entry
+                // for it -- permissions and backing name
+                // included -- so the next occurrence is
+                // decidable from the log alone. Print only;
+                // nothing here feeds any decision.
+                if sig == 4 {
+                    let page = pc & !0xfffu64;
+                    let mut mapline = "none".to_string();
+                    if let Ok(maps) =
+                        std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                    {
+                        for line in maps.lines() {
+                            let mut it = line.split_whitespace();
+                            let Some(range) = it.next() else { continue };
+                            let Some((lo, hi)) = range.split_once('-') else {
+                                continue;
+                            };
+                            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+                            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+                            if pc >= lo && pc < hi {
+                                mapline = line.trim().to_string();
+                                break;
+                            }
+                        }
+                    }
+                    sup!(
+                        "FATAL sigill-page pid={pid} pc=0x{pc:x} page=0x{page:x} map=[{mapline}]"
+                    );
+                    let mut off = 0usize;
+                    while off < 4096 {
+                        match read_mem_vec(pid, page + off as u64, 256) {
+                            Some(b) => {
+                                for (i, chunk) in b.chunks(32).enumerate() {
+                                    let hex: String = chunk
+                                        .iter()
+                                        .map(|x| format!("{x:02x}"))
+                                        .collect::<Vec<_>>()
+                                        .concat();
+                                    sup!(
+                                        "FATAL sigill-page pid={pid} +0x{:03x}: {}",
+                                        off + i * 32,
+                                        hex
+                                    );
+                                }
+                            }
+                            None => {
+                                sup!(
+                                    "FATAL sigill-page pid={pid} +0x{off:03x}: <unreadable; page dump truncated>"
+                                );
+                                break;
+                            }
+                        }
+                        off += 256;
                     }
                 }
                 // Name the guest library the crash pc lives
