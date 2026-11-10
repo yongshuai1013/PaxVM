@@ -2156,6 +2156,26 @@ struct PidEvidence {
     tags: VecDeque<String>,
 }
 
+/// One supervisor delivery write into a guest arena,
+/// kept for the 0.9.132 write-overlap audit (telemetry
+/// only): the arena-file offset and total length of
+/// the parcel image binder_deliver laid down, plus
+/// its first 64 bytes exactly as written. The audit
+/// (write_audit_check) compares a poisoned reply's
+/// source range against these records to separate
+/// "the guest assembled garbage from its own memory"
+/// from "an earlier supervisor delivery write landed
+/// on the very bytes later read back as poison"
+/// (s9-132-spec section 2.3). Records are written at
+/// the delivery site and read only by the audit; they
+/// feed no decision.
+struct WriteAuditRec {
+    arena: String,
+    off: u32,
+    len: u32,
+    head: Vec<u8>,
+}
+
 #[derive(Default)]
 struct BinderState {
     procs: HashMap<String, BinderProc>,
@@ -2219,6 +2239,24 @@ struct BinderState {
     /// shield3. Global like shield_drops; reported at
     /// arena death alongside the free counters.
     shield4_drops: u64,
+    /// 0.9.132: shield4 drops bucketed by the rejected
+    /// first word's shape (cookie domain / libc domain /
+    /// stack domain / fragment-other), so the next
+    /// field run's intercept account can be reconciled
+    /// shape by shape. Counters only; reported on the
+    /// arena-death free-counters line beside
+    /// shield4_drops.
+    shield4_cookie: u64,
+    shield4_libc: u64,
+    shield4_stack: u64,
+    shield4_other: u64,
+    /// 0.9.132: the write-overlap audit's table of the
+    /// supervisor's own delivery writes (see
+    /// WriteAuditRec). Global FIFO, capped at
+    /// WRITE_AUDIT_CAP records; an arena's records are
+    /// dropped when the arena dies (binder_on_proc_exit),
+    /// beside its evidence ring. Telemetry only.
+    write_audit: VecDeque<WriteAuditRec>,
     /// 0.9.128: global claim sequence counter. Every
     /// successful claim in binder_claim_fills takes the
     /// next number and stamps it on the ServingFrame it
@@ -4763,6 +4801,7 @@ fn binder_deliver(
     {
         return Err("arena file write failed");
     }
+    let wa_rec: Option<WriteAuditRec>;
     {
         // 0.9.99: fingerprint the parcel image exactly as
         // it now lies in the arena file, so dump_mgr_read
@@ -4799,6 +4838,17 @@ fn binder_deliver(
                 txn_cookie: cookie,
             },
         );
+        // 0.9.132: keep this delivery write in the
+        // write-overlap audit's table (record only; the
+        // write above is untouched). The record is
+        // pushed after the borrow of bp ends, just
+        // before the return below.
+        wa_rec = Some(WriteAuditRec {
+            arena: target.to_string(),
+            off,
+            len: total,
+            head: img[..img.len().min(64)].to_vec(),
+        });
     }
     if !offs.is_empty() {
         let bases: Vec<String> = bp
@@ -4901,6 +4951,15 @@ fn binder_deliver(
                     bp.inbound.extend_from_slice(&txn);
                 }
             }
+        }
+    }
+    // 0.9.132: file this delivery in the write-overlap
+    // audit table (see WriteAuditRec). Global FIFO with
+    // a hard cap; the oldest records fall off first.
+    if let Some(rec) = wa_rec {
+        st.write_audit.push_back(rec);
+        while st.write_audit.len() > WRITE_AUDIT_CAP {
+            st.write_audit.pop_front();
         }
     }
     Ok(off)
@@ -5273,6 +5332,149 @@ fn binder_ignition_dump(st: &BinderState, pid: i32, trigger: &str) {
     bsup!("binder: ignition dump end pid={pid}");
 }
 
+/// Cap on the write-overlap audit table (0.9.132):
+/// the most recent delivery writes kept, across all
+/// arenas. Each record costs at most 64 bytes of head
+/// plus the arena name, so the table stays under
+/// roughly 40KB however long the run.
+const WRITE_AUDIT_CAP: usize = 384;
+
+/// 0.9.132 shield4 judgement: a reply's first word is
+/// legal only if it matches one of the five shapes an
+/// honest reply header can take. The two-range
+/// blacklist this replaces (guest heap-pointer domain,
+/// libc domain) provably leaked: the .130/.131 census
+/// of 3,317 reply pops found four poisoned first words
+/// already delivered outside both ranges -- three
+/// stack-domain words and one string fragment
+/// ("/dat") -- each followed immediately by the
+/// waiter's crash report. Poison is "arbitrary
+/// replier memory", so no enumeration of bad domains
+/// can close it; enumerate the good shapes instead
+/// (s9-132-spec section 1.3). Retrospective check of
+/// this exact predicate against both field censuses:
+/// flagged 17 (the 13 the old shields caught plus the
+/// 4 leaks), honest replies misjudged 0 of 3,300.
+fn shield4_legal_first(w: u32) -> bool {
+    w == 0 // no-exception header / zero return value
+        || w >= 0xFFFF_FF00 // -256..=-1: exception codes, negative errno
+        || w <= 0x0000_FFFF // small positive counts / lengths / status
+        // flat_binder_object type words, the full
+        // BINDER_TYPE_* family from the binder protocol
+        // constants: BINDER / WEAK_BINDER / HANDLE /
+        // WEAK_HANDLE / FD. The census observed BINDER,
+        // HANDLE and FD; the two weak constants were
+        // never observed and are admitted as same-family.
+        || matches!(
+            w,
+            0x7362_2A85 | 0x7762_2A85 | 0x7368_2A85 | 0x7768_2A85 | 0x6664_2A85
+        )
+        || w == 0x504F_4E47 // 'PONG', the paxsvc PING reply magic
+}
+
+/// Which bucket a shield4-rejected first word counts
+/// into (settlement telemetry, s9-132-spec 1.4). The
+/// boundaries are descriptive, not judgemental: the
+/// first two are the old blacklist's domains, the
+/// third is the stack range the .130/.131 leaks fell
+/// in, and everything else is fragment/other.
+fn shield4_bucket(w: u32) -> &'static str {
+    if (0x4000_0000..0x5000_0000).contains(&w) {
+        "cookie"
+    } else if (0xafd0_0000..0xb100_0000).contains(&w) {
+        "libc"
+    } else if (0xe800_0000..0xf400_0000).contains(&w) {
+        "stack"
+    } else {
+        "other"
+    }
+}
+
+/// 0.9.132 write-overlap audit (telemetry only; see
+/// WriteAuditRec). Fires at a shield intercept on the
+/// reply path, where the poison parcel's source --
+/// the replier's arena, its guest address daddr and
+/// the copied bytes -- is in hand. The source range is
+/// converted to arena-file offsets through the
+/// replier's recorded mmap base and compared against
+/// every delivery write the supervisor itself made
+/// into that arena: an overlap whose recorded head
+/// bytes match the poison bytes over the comparable
+/// span means one of our own delivery writes landed
+/// on the range later read back as poison (case (b)
+/// in s9-132-spec 2.3); zero overlap means the range
+/// was never ours (case (a)). Prints exactly one line
+/// and feeds nothing.
+fn write_audit_check(
+    st: &BinderState,
+    arena: &str,
+    replier: i32,
+    daddr: u32,
+    data: &[u8],
+    trigger: &str,
+    claim_seq: u64,
+) {
+    let base = st
+        .procs
+        .get(arena)
+        .and_then(|bp| bp.base.get(&replier))
+        .copied();
+    let Some(src_off) = base.and_then(|b| daddr.checked_sub(b)) else {
+        bsup!(
+            "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} verdict=no-base",
+            data.len()
+        );
+        return;
+    };
+    let src_end = src_off.saturating_add(data.len() as u32);
+    let mut records = 0usize;
+    let mut overlaps = 0usize;
+    let mut compared = 0usize;
+    let mut mismatch = 0usize;
+    for rec in &st.write_audit {
+        if rec.arena != arena {
+            continue;
+        }
+        records += 1;
+        let rec_end = rec.off.saturating_add(rec.len);
+        let o_start = src_off.max(rec.off);
+        let o_end = src_end.min(rec_end);
+        if o_start >= o_end {
+            continue;
+        }
+        overlaps += 1;
+        // Bytes are comparable only where the record's
+        // kept head (the write's first 64 bytes)
+        // reaches into the overlap.
+        let head_reach = (rec.off as usize + rec.head.len()).min(o_end as usize);
+        if o_start as usize >= head_reach {
+            continue;
+        }
+        let n = head_reach - o_start as usize;
+        let d_at = (o_start - src_off) as usize;
+        let r_at = (o_start - rec.off) as usize;
+        for k in 0..n {
+            compared += 1;
+            if data[d_at + k] != rec.head[r_at + k] {
+                mismatch += 1;
+            }
+        }
+    }
+    let verdict = if overlaps == 0 {
+        "no-overlap"
+    } else if compared == 0 {
+        "overlap-uncovered"
+    } else if mismatch == 0 {
+        "overlap-bytes-match"
+    } else {
+        "overlap-bytes-differ"
+    };
+    bsup!(
+        "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} src_off=0x{src_off:x} records={records} overlaps={overlaps} compared={compared} mismatch={mismatch} verdict={verdict}",
+        data.len()
+    );
+}
+
 fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -5540,6 +5742,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 data.len(),
                 offs.len()
             );
+            // 0.9.132: an intercept is the write-overlap
+            // audit's trigger (telemetry only).
+            write_audit_check(st, arena, pid, daddr, &data, "shield3", claim_seq);
             // 0.9.131: the intercept is an event in the
             // waiter's evidence ring (s9-130-swap-verify
             // Q4's open question (ii): what follows a
@@ -5577,8 +5782,8 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             }
         }
         // 0.9.129 shield, fourth layer: a reply whose
-        // first word is a guest pointer is not a reply at
-        // all. The 0.9.128 field run's three poisoned
+        // first word is not a reply header at all is not
+        // a reply. The 0.9.128 field run's three poisoned
         // replies (claim_seq 1040/1434/1618) were copied
         // verbatim from the replier's own memory at its
         // (daddr, dsize): the size was the honest size of
@@ -5597,16 +5802,30 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // Judged on the copied bytes; a reply shorter
         // than 4B carries no first word and is never
         // judged.
-        let poisoned = data.len() >= 4
-            && ((0x4000_0000..0x5000_0000).contains(&first_word)
-                || (0xafd0_0000..0xb100_0000).contains(&first_word));
+        // 0.9.132: the judgement itself is now the
+        // whitelist of shield4_legal_first (the two-range
+        // blacklist it replaces leaked stack-domain and
+        // string-fragment poison in .130/.131; see the
+        // helper's comment). Judgement point, FAILED_REPLY
+        // disposal and counting are otherwise unchanged.
+        let poisoned = data.len() >= 4 && !shield4_legal_first(first_word);
         if poisoned {
             st.shield4_drops += 1;
+            let bucket = shield4_bucket(first_word);
+            match bucket {
+                "cookie" => st.shield4_cookie += 1,
+                "libc" => st.shield4_libc += 1,
+                "stack" => st.shield4_stack += 1,
+                _ => st.shield4_other += 1,
+            }
             bsup!(
-                "binder: shield4 poisoned reply dropped claim_seq={claim_seq} replier={pid} waiter={} size={} first=0x{first_word:x} -> FAILED_REPLY",
+                "binder: shield4 poisoned reply dropped claim_seq={claim_seq} replier={pid} waiter={} size={} first=0x{first_word:x} bucket={bucket} -> FAILED_REPLY",
                 w.sender_pid,
                 data.len()
             );
+            // 0.9.132: same write-overlap audit trigger
+            // as shield3 (telemetry only).
+            write_audit_check(st, arena, pid, daddr, &data, "shield4", claim_seq);
             // 0.9.131: same evidence-ring tag as shield3.
             evidence_tag(
                 st,
@@ -7022,9 +7241,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // above held while sibling threads remained); its
     // ignition evidence ring dies with it.
     st.evidence.remove(arena);
+    // 0.9.132: its write-overlap audit records die with
+    // it too, so a later arena can never be audited
+    // against a dead one's writes.
+    st.write_audit.retain(|r| r.arena != arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -7036,7 +7259,11 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             bp.free_rescued,
             st.shield_cookie_suspects,
             st.reply_unmatched,
-            st.shield4_drops
+            st.shield4_drops,
+            st.shield4_cookie,
+            st.shield4_libc,
+            st.shield4_stack,
+            st.shield4_other
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
