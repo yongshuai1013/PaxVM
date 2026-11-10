@@ -399,7 +399,21 @@ fn set_direct_log_dir(rootfs: &str, rotate: bool) {
     let _ = DIRECT_DIR.set(dir);
 }
 
+/// 0.9.141 (s9-141-desk S6): per-process count of
+/// lines handed to emit(); the servicer-face age
+/// field is the distance, in this worker's own
+/// emitted lines, between a tracee's last processed
+/// stop and the snapshot instant. Counted here so
+/// every emitter (sup!/sys!/direct writers) shares
+/// one sequence.
+static EMIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn emit_seq_now() -> u64 {
+    EMIT_SEQ.load(Ordering::Relaxed)
+}
+
 fn emit(tag: &str, msg: &str) {
+    EMIT_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut g = OUT.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(|| OutState {
         buf: String::new(),
@@ -1138,6 +1152,37 @@ struct ProcState {
     /// (shard_decided) burned with exec_path still None
     /// and no service ever handed off.
     exec_armed: bool,
+    /// 0.9.141 (s9-141-desk P3): tracer-side assembly
+    /// window profile for this thread (see WinProfile).
+    /// Telemetry only.
+    win: WinProfile,
+    /// 0.9.141 (s9-141-desk S6): this worker's emit
+    /// sequence at the last stop processed for this
+    /// tracee; the servicer-face age field reads it.
+    last_stop_seq: u64,
+}
+
+/// 0.9.141 (s9-141-desk P3): per-thread counters over
+/// the assembly window that ends at the thread's next
+/// forwarded BC_REPLY: syscall stops seen, futex WAIT
+/// entries, allocator syscalls (brk/mmap/munmap),
+/// binder parks, forwarded streams carrying at least
+/// one BC_TRANSACTION, and the deepest serving-stack
+/// level the supervisor itself drove this thread to
+/// in the window (fills delivered to it, less the
+/// replies it forwarded out). Maintained tracer-side;
+/// a snapshot rides each write_read request and the
+/// coordinator prints it on the reply-pop descriptor
+/// line. Telemetry only -- nothing reads it back.
+#[derive(Default, Clone, Copy)]
+struct WinProfile {
+    stops: u32,
+    futex: u32,
+    alloc: u32,
+    parks: u32,
+    sends: u32,
+    depth: i32,
+    maxdepth: u32,
 }
 
 impl ProcState {
@@ -1159,6 +1204,8 @@ impl ProcState {
             exec_armed: false,
             last_binder_read: None,
             sigsys_preentry: 0,
+            win: WinProfile::default(),
+            last_stop_seq: 0,
         }
     }
 }
@@ -2457,6 +2504,32 @@ struct BinderState {
     /// shield_drops; reported at arena death beside
     /// the free counters.
     crash_token_miss: u64,
+    /// 0.9.141 (s9-141-desk P1): global issuance
+    /// double-read account (see MSG_ONEWAY_ISSUANCE_
+    /// STATS): snapshots of BC_REPLY buffers taken at
+    /// the ioctl entry stop, and how many of them read
+    /// back different at the exit-side re-read -- a
+    /// nonzero differs count is a new poison sub-form
+    /// (the buffer changed inside the ioctl window).
+    /// Reported at arena death beside the free
+    /// counters. Telemetry only.
+    issuance_reads: u64,
+    issuance_differs: u64,
+    /// 0.9.141 (s9-141-desk P2): poisoned-reply first
+    /// words classified against the reply's own data
+    /// address (see poison_word0_class): [self-8,
+    /// self, self-page, heap-other, libc, stack,
+    /// other]. Global like shield4_drops; reported
+    /// at arena death on its own settlement line.
+    poison_word0: [u64; 7],
+    /// 0.9.141 (s9-141-desk P3): the assembly-window
+    /// profile attached to the write_read request
+    /// currently being served (stops, futex, alloc,
+    /// parks, sends, maxdepth); printed on the
+    /// reply-pop descriptor line. Set by the server
+    /// arm around binder_write_read, which is never
+    /// re-entered. Telemetry only.
+    cur_win: Option<(u32, u32, u32, u32, u32, u32)>,
     /// 0.9.135: per-thread rings for the reply-source
     /// collision check (see ClaimParcelRec /
     /// SendSrcRec) and its counters. Telemetry only,
@@ -2740,10 +2813,21 @@ const MSG_ONEWAY_FD_FAIL: u8 = 34;
 // counted coordinator-side for the arena-death
 // free-counters line.
 const MSG_ONEWAY_FD_STATS: u8 = 35;
+// 0.9.141 (s9-141-desk P1): per-worker deltas of the
+// reply-issuance double read (snapshots taken at the
+// ioctl entry stop, buffers found differing at the
+// exit-side re-read), counted coordinator-side for
+// the arena-death settlement lines.
+const MSG_ONEWAY_ISSUANCE_STATS: u8 = 36;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
 const MSG_PUSH_DUMP_STACKS: u8 = 43;
+// 0.9.141 (s9-141-desk S6): after a wedge chain dump
+// that found a frozen claimed wait, the coordinator
+// broadcasts the servicer pids so the worker owning
+// each prints its tracer-side face line.
+const MSG_PUSH_SERVICER_FACE: u8 = 44;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
@@ -3113,6 +3197,15 @@ enum Push {
     /// candidate acts (SIGQUIT, see tracer_loop's
     /// candidate bookkeeping), the rest drop it.
     DumpStacks,
+    /// 0.9.141 (s9-141-desk S6): broadcast after a
+    /// wedge chain dump; the worker owning one of
+    /// `pids` prints that servicer's tracer-side face
+    /// line (arena names the system_server arena the
+    /// dump was taken for).
+    ServicerFace {
+        arena: String,
+        pids: Vec<i32>,
+    },
 }
 
 /// The tracer's end of the coordinator channel. Every
@@ -3258,6 +3351,16 @@ impl CoordClient {
                 MSG_PUSH_DUMP_STACKS => {
                     self.inbox.push_back(Push::DumpStacks);
                 }
+                MSG_PUSH_SERVICER_FACE => {
+                    let mut d = Dec::new(&payload);
+                    let arena = d.string();
+                    let n = d.u32();
+                    let mut pids = Vec::new();
+                    for _ in 0..n {
+                        pids.push(d.i32());
+                    }
+                    self.inbox.push_back(Push::ServicerFace { arena, pids });
+                }
                 _ => self.queue.push_back((kind, payload)),
             }
         }
@@ -3347,6 +3450,7 @@ impl CoordClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_read(
         &mut self,
         pid: i32,
@@ -3356,6 +3460,7 @@ impl CoordClient {
         bwr_addr: u64,
         bwr: Option<Vec<u8>>,
         stream: Option<Vec<u8>>,
+        win: (u32, u32, u32, u32, u32, u32),
     ) -> (String, Vec<(String, String)>, Vec<BAction>) {
         let mut e = Enc::new();
         e.i32(pid);
@@ -3365,6 +3470,15 @@ impl CoordClient {
         e.u64(bwr_addr);
         e.opt_bytes(bwr.as_deref());
         e.opt_bytes(stream.as_deref());
+        // 0.9.141 (P3): the sender thread's assembly-
+        // window profile snapshot rides after the
+        // stream (both ends are this same build).
+        e.u32(win.0);
+        e.u32(win.1);
+        e.u32(win.2);
+        e.u32(win.3);
+        e.u32(win.4);
+        e.u32(win.5);
         let p = self.rpc(MSG_REQ_WRITE_READ, &e.0, MSG_RESP_ACTIONS);
         let mut d = Dec::new(&p);
         (d.string(), d.logs(), d.actions())
@@ -3441,7 +3555,11 @@ impl CoordClient {
     /// coordinator needs on the way (frozen ioctl
     /// write streams) ride the rpc's reverse channel,
     /// as with every other decision.
-    fn wedge_chain(&mut self, leader: i32, solo: i32) -> (Vec<(String, String)>, i32) {
+    fn wedge_chain(
+        &mut self,
+        leader: i32,
+        solo: i32,
+    ) -> (Vec<(String, String)>, i32, Vec<(String, i32)>) {
         let mut e = Enc::new();
         e.i32(leader);
         e.i32(solo);
@@ -3449,7 +3567,18 @@ impl CoordClient {
         let mut d = Dec::new(&p);
         let logs = d.logs();
         let holder = d.i32();
-        (logs, holder)
+        // 0.9.141 (S6): the servicers the chain named,
+        // for the coordinator's face broadcast record;
+        // the requesting worker itself does not consume
+        // them (the broadcast reaches it like everyone).
+        let n = d.u32();
+        let mut servicers = Vec::new();
+        for _ in 0..n {
+            let a = d.string();
+            let p = d.i32();
+            servicers.push((a, p));
+        }
+        (logs, holder, servicers)
     }
 
     fn set_context_mgr(
@@ -3562,6 +3691,16 @@ impl CoordClient {
         e.u32(retried);
         e.u32(retry_saved);
         self.send(MSG_ONEWAY_FD_STATS, &e.0);
+    }
+
+    /// 0.9.141 (s9-141-desk P1): issuance double-read
+    /// deltas from this worker (snapshots taken,
+    /// buffers found differing at the re-read).
+    fn oneway_issuance_stats(&mut self, reads: u32, differs: u32) {
+        let mut e = Enc::new();
+        e.u32(reads);
+        e.u32(differs);
+        self.send(MSG_ONEWAY_ISSUANCE_STATS, &e.0);
     }
 
     fn oneway_park_remove(&mut self, pid: i32) {
@@ -4318,6 +4457,25 @@ impl CoordServer {
         }
     }
 
+    /// 0.9.141 (s9-141-desk S6): broadcast the wedge
+    /// chain's servicer list to every worker (W0
+    /// included: a failed shard fork can leave a
+    /// service on W0, and the push is a no-op for any
+    /// worker that does not own a named pid).
+    fn push_servicer_face(&mut self, ss_arena: &str, servicers: &[(String, i32)]) {
+        let mut e = Enc::new();
+        e.string(ss_arena);
+        e.u32(servicers.len() as u32);
+        for (_, p) in servicers {
+            e.i32(*p);
+        }
+        for ci in 0..self.conns.len() {
+            if self.conns[ci].wid.is_some() {
+                self.send_to(ci, MSG_PUSH_SERVICER_FACE, &e.0);
+            }
+        }
+    }
+
     /// A connection died: drop its routes (its
     /// tracees are being EXITKILLed with it). W0's
     /// death ends the run: exit, and every worker
@@ -4357,6 +4515,10 @@ impl CoordServer {
                 let bwr_addr = d.u64();
                 let bwr = d.opt_bytes();
                 let stream = d.opt_bytes();
+                // 0.9.141 (P3): the sender thread's
+                // assembly-window profile snapshot,
+                // appended after the stream.
+                let win = (d.u32(), d.u32(), d.u32(), d.u32(), d.u32(), d.u32());
                 cap_clear();
                 let mut actions: Vec<BAction> = Vec::new();
                 let desc = {
@@ -4424,7 +4586,8 @@ impl CoordServer {
                             }
                         }
                     };
-                    binder_write_read(
+                    st.cur_win = Some(win);
+                    let desc = binder_write_read(
                         pid,
                         &arena,
                         bwr_addr,
@@ -4434,7 +4597,9 @@ impl CoordServer {
                         veuid,
                         &mut rd,
                         &mut actions,
-                    )
+                    );
+                    st.cur_win = None;
+                    desc
                 };
                 let mut e = Enc::new();
                 e.string(&desc);
@@ -4636,10 +4801,30 @@ impl CoordServer {
                     };
                     binder_wedge_chain(st, leader, solo, &mut rd)
                 };
+                let (holder, servicers) = holder;
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 e.i32(holder);
+                e.u32(servicers.len() as u32);
+                for (sa, sp) in &servicers {
+                    e.string(sa);
+                    e.i32(*sp);
+                }
                 self.send_to(ci, MSG_RESP_WEDGE_CHAIN, &e.0);
+                // 0.9.141 (S6): the servicer faces ride
+                // a broadcast so each servicer's owner
+                // prints its tracer-side line; sent
+                // after the reply so the chain dump's
+                // own lines stay ahead in the log.
+                if !servicers.is_empty() {
+                    let ss_arena = self
+                        .st
+                        .thread_arena
+                        .get(&leader)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.push_servicer_face(&ss_arena, &servicers);
+                }
             }
             MSG_ONEWAY_PARK => {
                 let pid = d.i32();
@@ -4691,6 +4876,12 @@ impl CoordServer {
                 self.st.fd_fixup_verified += verified as u64;
                 self.st.fd_fixup_retried += retried as u64;
                 self.st.fd_fixup_retry_saved += retry_saved as u64;
+            }
+            MSG_ONEWAY_ISSUANCE_STATS => {
+                let reads = d.u32();
+                let differs = d.u32();
+                self.st.issuance_reads += reads as u64;
+                self.st.issuance_differs += differs as u64;
             }
             MSG_ONEWAY_FD_FAIL => {
                 let arena = d.string();
@@ -5193,7 +5384,18 @@ fn exec_binder_actions(
             BAction::ResolveFdFixupsInline { arena, fixups, cache } => {
                 let seed: HashMap<CacheKey, i32> = cache.iter().cloned().collect();
                 let mut cmap: HashMap<CacheKey, i32> = cache.into_iter().collect();
-                let res = resolve_fd_fixups_core(pid, compat, &mut cmap, &arena, &fixups, regs);
+                // 0.9.141 (S3.3): the inline path holds
+                // no process table to read a sender
+                // face from; the field renders remote.
+                let res = resolve_fd_fixups_core(
+                    pid,
+                    compat,
+                    &mut cmap,
+                    &arena,
+                    &fixups,
+                    regs,
+                    &|_| "-/remote".to_string(),
+                );
                 // Learned entries ride back as inserts;
                 // evictions (0.9.134) as -1 removals.
                 let mut put = learned_entries(&cmap, &seed);
@@ -6177,41 +6379,82 @@ fn find_wait_for_sender(st: &BinderState, pid: i32) -> Option<(String, u32)> {
     None
 }
 
-/// 0.9.140 (M2): name the first two BC commands of
-/// the write stream a parked thread's frozen ioctl
-/// carried. A transaction that never completes
-/// otherwise leaves no trace in any log -- its write
-/// buffer was consumed at its entry stop and the
-/// completion line never prints -- so the frozen
-/// call's identity (target handle, code) is read
-/// back out of the guest's own buffer while the
-/// thread sits parked. Bounded: the bwr struct plus
-/// at most the first two commands' span. Decode
-/// advances exactly as batch_skeleton's walk does;
-/// an unknown command ends the decode.
-fn frozen_write_desc<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
+/// 0.9.141 (s9-141-desk S4): one decoded command of
+/// a parked thread's frozen write stream. `consumed`
+/// is the offset test against the frozen
+/// write_consumed: everything below it the
+/// supervisor already consumed at the entry stop,
+/// everything at or above it the guest presented
+/// but nothing has acted on.
+struct FrozenCmd {
+    name: String,
+    consumed: bool,
+    trunc: bool,
+    /// TRANSACTION/REPLY payload as read off the
+    /// stream: (target, code, flags, data_size).
+    txn: Option<(u32, u32, u32, u32)>,
+}
+
+/// The full decode of one frozen write stream
+/// (0.9.141 S4): the whole presented stream, up to
+/// 64KB and 64 commands, with no write_consumed==0
+/// early-out -- a parked thread whose stream the
+/// coordinator consumed in full can still be
+/// carrying the transaction it froze inside. This
+/// replaces the 0.9.140 two-command frozen_write_
+/// desc. Decode advances exactly as batch_
+/// skeleton's walk does; an unknown command ends
+/// the decode. Telemetry only: the synthesis below
+/// prints lines and feeds no decision.
+struct FrozenStream {
+    cmds: Vec<FrozenCmd>,
+    stream_trunc: bool,
+    cmds_trunc: bool,
+    unreadable: bool,
+}
+
+fn decode_frozen_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     rd: &mut R,
     pid: i32,
     park: &ParkedIoctl,
-) -> String {
-    if park.write_consumed == 0 {
-        return String::new();
-    }
+) -> FrozenStream {
+    let mut out = FrozenStream {
+        cmds: Vec::new(),
+        stream_trunc: false,
+        cmds_trunc: false,
+        unreadable: false,
+    };
     let Some(bwr) = rd(pid, park.bwr as u64, 24) else {
-        return "unreadable".to_string();
+        out.unreadable = true;
+        return out;
     };
     let ws = u32_at(&bwr, 0) as usize;
     let wb = u32_at(&bwr, 8);
     if ws == 0 {
-        return String::new();
+        return out;
     }
-    let want = ws.min(4 + 44 * 2 + 64);
+    out.stream_trunc = ws > 65536;
+    let want = ws.min(65536);
     let Some(stream) = rd(pid, wb as u64, want) else {
-        return "unreadable".to_string();
+        out.unreadable = true;
+        return out;
     };
-    let mut parts: Vec<String> = Vec::new();
+    let rd32 = |off: usize| -> u32 {
+        if off + 4 <= stream.len() {
+            u32_at(&stream, off)
+        } else {
+            0
+        }
+    };
     let mut cur = 0usize;
-    while parts.len() < 2 && cur + 4 <= stream.len() {
+    loop {
+        if cur + 4 > stream.len() {
+            break;
+        }
+        if out.cmds.len() >= 64 {
+            out.cmds_trunc = true;
+            break;
+        }
         let cmd = u32_at(&stream, cur);
         let (name, adv): (&str, usize) = match cmd {
             BC_ENTER_LOOPER => ("ENTER_LOOPER", 4),
@@ -6231,27 +6474,194 @@ fn frozen_write_desc<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             BC_TRANSACTION => ("TRANSACTION", 44),
             BC_REPLY => ("REPLY", 44),
             other => {
-                parts.push(format!("UNKNOWN(0x{other:08x})"));
-                return parts.join(" ");
+                out.cmds.push(FrozenCmd {
+                    name: format!("UNKNOWN(0x{other:08x})"),
+                    consumed: cur < park.write_consumed as usize,
+                    trunc: false,
+                    txn: None,
+                });
+                break;
             }
         };
-        if cur + adv > stream.len() {
-            parts.push(format!("{name}(trunc)"));
-            break;
-        }
-        if cmd == BC_TRANSACTION || cmd == BC_REPLY {
-            let target = u32_at(&stream, cur + 4);
-            let code = u32_at(&stream, cur + 12);
-            let flags = u32_at(&stream, cur + 16);
-            parts.push(format!(
-                "{name} code={code} target={target} flags=0x{flags:x}"
-            ));
+        let trunc = cur + adv > stream.len();
+        let txn = if cmd == BC_TRANSACTION || cmd == BC_REPLY {
+            Some((
+                rd32(cur + 4),
+                rd32(cur + 12),
+                rd32(cur + 16),
+                rd32(cur + 28),
+            ))
         } else {
-            parts.push(name.to_string());
+            None
+        };
+        out.cmds.push(FrozenCmd {
+            name: name.to_string(),
+            consumed: cur < park.write_consumed as usize,
+            trunc,
+            txn,
+        });
+        if trunc {
+            break;
         }
         cur += adv;
     }
-    parts.join(" ")
+    out
+}
+
+/// Render a decoded stream as the frozen_write
+/// skeleton: command names in order, transactions
+/// and replies with their code/target/flags/
+/// data_size, every command carrying its consumed
+/// flag. Past ten commands the line folds to the
+/// first eight and last two with the total named.
+fn frozen_skeleton(fs: &FrozenStream) -> String {
+    if fs.unreadable {
+        return "unreadable".to_string();
+    }
+    let render = |c: &FrozenCmd| -> String {
+        let nm = if c.trunc {
+            format!("{}(trunc)", c.name)
+        } else {
+            c.name.clone()
+        };
+        match &c.txn {
+            Some((t, code, flags, ds)) => format!(
+                "{nm} code={code} target={t} flags=0x{flags:x} data_size={ds} consumed={}",
+                c.consumed as u8
+            ),
+            None => format!("{nm} consumed={}", c.consumed as u8),
+        }
+    };
+    let n = fs.cmds.len();
+    let mut s = if n > 10 {
+        let mut parts: Vec<String> = fs.cmds[..8].iter().map(&render).collect();
+        parts.push("…".to_string());
+        parts.extend(fs.cmds[n - 2..].iter().map(&render));
+        format!("{} (total {n} cmds)", parts.join(" "))
+    } else {
+        fs.cmds
+            .iter()
+            .map(&render)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if fs.stream_trunc {
+        s.push_str(" stream_trunc=1");
+    }
+    if fs.cmds_trunc {
+        s.push_str(" cmds_trunc=1");
+    }
+    s
+}
+
+/// Resolve a decoded transaction's target handle
+/// to its owner arena the way the claim path does:
+/// handle 0 through the context-manager node, any
+/// other handle through the sender arena's own
+/// handle table into the node registry.
+fn frozen_target_owner(st: &BinderState, sender_arena: &str, target: u32) -> Option<String> {
+    let idx = if target == 0 {
+        st.mgr_node
+    } else {
+        st.procs
+            .get(sender_arena)
+            .and_then(|bp| bp.handles.get(&target).copied())
+    };
+    idx.and_then(|i| st.nodes.get(i)).map(|n| n.owner.clone())
+}
+
+/// Whether the wait tables -- the same tables
+/// find_wait_for_sender scans -- hold a wait from
+/// `pid` with this code toward `owner` (any target
+/// when the decoded handle did not resolve).
+fn frozen_wait_exists(st: &BinderState, pid: i32, code: u32, owner: Option<&str>) -> bool {
+    for (t_arena, q) in &st.waiters {
+        if owner.is_some() && Some(t_arena.as_str()) != owner {
+            continue;
+        }
+        if q.iter().any(|w| w.sender_pid == pid && w.code == code) {
+            return true;
+        }
+    }
+    for stack in st.serving.values() {
+        if owner.is_some() && Some(stack.arena.as_str()) != owner {
+            continue;
+        }
+        for g in &stack.groups {
+            for fr in &g.frames {
+                if let ServingFrame::Reply(w, _) = fr {
+                    if w.sender_pid == pid && w.code == code {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// One synthesized outstanding wait (0.9.141 S4):
+/// a BC_TRANSACTION decoded out of a parked
+/// thread's own stream that no registered wait
+/// corresponds to.
+struct InferredWait {
+    target_arena: Option<String>,
+    target: u32,
+    code: u32,
+    flags: u32,
+    data_size: u32,
+    consumed: bool,
+}
+
+fn frozen_inferred(
+    st: &BinderState,
+    sender_arena: &str,
+    pid: i32,
+    fs: &FrozenStream,
+) -> Vec<InferredWait> {
+    let mut out = Vec::new();
+    for c in &fs.cmds {
+        if c.name != "TRANSACTION" || c.trunc {
+            continue;
+        }
+        let Some((target, code, flags, ds)) = c.txn else {
+            continue;
+        };
+        let owner = frozen_target_owner(st, sender_arena, target);
+        if !frozen_wait_exists(st, pid, code, owner.as_deref()) {
+            out.push(InferredWait {
+                target_arena: owner,
+                target,
+                code,
+                flags,
+                data_size: ds,
+                consumed: c.consumed,
+            });
+        }
+    }
+    out
+}
+
+fn print_inferred(arena: &str, pid: i32, inf: &[InferredWait]) {
+    for w in inf {
+        match &w.target_arena {
+            Some(t) => bsup!(
+                "binder: wedge-pending-inferred arena={arena} pid={pid} target_arena={t} code={} flags=0x{:x} data_size={} consumed={} src=stream-decode",
+                w.code,
+                w.flags,
+                w.data_size,
+                w.consumed as u8
+            ),
+            None => bsup!(
+                "binder: wedge-pending-inferred arena={arena} pid={pid} target_arena=unresolved target=0x{:x} code={} flags=0x{:x} data_size={} consumed={} src=stream-decode",
+                w.target,
+                w.code,
+                w.flags,
+                w.data_size,
+                w.consumed as u8
+            ),
+        }
+    }
 }
 
 /// 0.9.140 (s9-140-desk-ignition M2/M3/M6): the
@@ -6267,13 +6677,18 @@ fn frozen_write_desc<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
 /// pairing, delivery, shield or settlement decision.
 /// Returns the holder the provisional verdict (M6)
 /// named, 0 when it named none; the tracer keeps it
-/// for the traces harvest (M5).
+/// for the traces harvest (M5). 0.9.141 (S4/S6)
+/// adds the full stream decode with synthesized
+/// pending lines and the servicer view; the
+/// verdict's inputs are exactly the 0.9.140 set,
+/// and the servicers the dump found ride the reply
+/// back for the face broadcast.
 fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     st: &BinderState,
     leader: i32,
     solo: i32,
     rd: &mut R,
-) -> i32 {
+) -> (i32, Vec<(String, i32)>) {
     let Some(arena) = st.thread_arena.get(&leader).cloned() else {
         bsup!(
             "binder: wedge-chain leader={leader} arena=- (leader holds no binder arena)"
@@ -6281,7 +6696,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-verdict arena=- class=unknown holder=- basis=none (provisional)"
         );
-        return 0;
+        return (0, Vec::new());
     };
     // (a) Serving stacks of this arena: every frame
     // the arena's threads are serving, in stack
@@ -6362,6 +6777,10 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             }
         }
     }
+    // 0.9.141 (S6): the servicers behind this
+    // arena's frozen claimed out-waits, collected
+    // alongside the waits scan below.
+    let mut servicer_hits: Vec<(String, i32)> = Vec::new();
     for (tpid, stack) in &st.serving {
         for g in &stack.groups {
             for fr in &g.frames {
@@ -6376,6 +6795,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                         format!("claimed serving_pid={tpid} claim_seq={seq}"),
                         "serving".to_string(),
                     ));
+                    servicer_hits.push((stack.arena.clone(), *tpid));
                 }
                 if stack.arena == arena {
                     in_waits.push((
@@ -6414,14 +6834,144 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     park_pids.sort_unstable();
     for ppid in &park_pids {
         let park = &st.parked[ppid];
+        // 0.9.141 (S4): the full stream decode, and
+        // the waits it implies that the tables do
+        // not hold. The synthesized lines are pure
+        // telemetry; the park kind is the only
+        // judgement they touch, and it judges from
+        // the same stream the lines were read off.
+        let fs = decode_frozen_stream(rd, *ppid, park);
+        let inferred = frozen_inferred(st, &arena, *ppid, &fs);
         let (kind, t_arena_s, code_s) = match find_wait_for_sender(st, *ppid) {
             Some((t, c)) => ("wait-reply", t, c.to_string()),
-            None => ("idle", "-".to_string(), "-".to_string()),
+            None => match inferred.first() {
+                Some(f) => (
+                    "wait-reply-inferred",
+                    f.target_arena
+                        .clone()
+                        .unwrap_or_else(|| "unresolved".to_string()),
+                    f.code.to_string(),
+                ),
+                None => ("idle", "-".to_string(), "-".to_string()),
+            },
         };
-        let frozen = frozen_write_desc(rd, *ppid, park);
+        let frozen = frozen_skeleton(&fs);
         bsup!(
             "binder: wedge-park arena={arena} pid={ppid} park_kind={kind} target_arena={t_arena_s} code={code_s} frozen_write=[{frozen}]"
         );
+        print_inferred(&arena, *ppid, &inferred);
+    }
+    // (S6) The servicer view (0.9.141): for each
+    // distinct servicer behind a frozen claimed
+    // out-wait (at most two), recompute the waits
+    // picture inside the servicer's own arena --
+    // its outstanding sends, the waits it has
+    // claimed, its serving stack -- and, when the
+    // servicer itself sits parked, its own full
+    // stream decode. Same tables, same line
+    // formats; nothing here feeds the verdict
+    // below, whose inputs stay the 0.9.140 set.
+    servicer_hits.sort();
+    servicer_hits.dedup();
+    servicer_hits.truncate(2);
+    for (s_arena, x) in &servicer_hits {
+        let x = *x;
+        bsup!(
+            "binder: wedge-servicer-waits arena={arena} servicer_arena={s_arena} pid={x}"
+        );
+        for (t_arena, q) in &st.waiters {
+            for w in q {
+                if w.sender_pid == x {
+                    let peer = match st.procs.get(t_arena) {
+                        Some(bp) if bp
+                            .parcels
+                            .values()
+                            .any(|pp| pp.from_pid == w.sender_pid && pp.code == w.code) =>
+                        {
+                            "received-unclaimed"
+                        }
+                        _ => "not-received",
+                    };
+                    bsup!(
+                        "binder: wedge-waits arena={s_arena} dir=out from={x} target_arena={t_arena} code={} state=queued peer={peer}",
+                        w.code
+                    );
+                }
+            }
+        }
+        for (tpid2, stack) in &st.serving {
+            if stack.arena != *s_arena {
+                continue;
+            }
+            for g in &stack.groups {
+                for fr in &g.frames {
+                    if let ServingFrame::Reply(w, seq) = fr {
+                        if w.sender_pid == x {
+                            bsup!(
+                                "binder: wedge-waits arena={s_arena} dir=out from={x} target_arena={s_arena} code={} state=claimed serving_pid={tpid2} claim_seq={seq} peer=serving",
+                                w.code
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(stack) = st.serving.get(&x) {
+            for g in &stack.groups {
+                for fr in &g.frames {
+                    if let ServingFrame::Reply(w, seq) = fr {
+                        bsup!(
+                            "binder: wedge-waits arena={s_arena} dir=in from={} sender_arena={} code={} state=claimed serving_pid={x} claim_seq={seq}",
+                            w.sender_pid, w.sender_arena, w.code
+                        );
+                    }
+                }
+            }
+        }
+        let (depth, frames) = match st.serving.get(&x) {
+            Some(stack) => {
+                let mut parts: Vec<String> = Vec::new();
+                for g in &stack.groups {
+                    for fr in &g.frames {
+                        match fr {
+                            ServingFrame::Reply(w, _) => {
+                                parts.push(format!("({},{})", w.sender_pid, w.code))
+                            }
+                            ServingFrame::Other => {
+                                parts.push("(-,oneway)".to_string())
+                            }
+                        }
+                    }
+                }
+                (stack.depth(), parts.join(","))
+            }
+            None => (0, String::new()),
+        };
+        bsup!(
+            "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={x} depth={depth} frames=[{frames}]"
+        );
+        if let Some(park) = st.parked.get(&x) {
+            let fs = decode_frozen_stream(rd, x, park);
+            let inferred = frozen_inferred(st, s_arena, x, &fs);
+            let (kind, t_s, c_s) = match find_wait_for_sender(st, x) {
+                Some((t, c)) => ("wait-reply", t, c.to_string()),
+                None => match inferred.first() {
+                    Some(f) => (
+                        "wait-reply-inferred",
+                        f.target_arena
+                            .clone()
+                            .unwrap_or_else(|| "unresolved".to_string()),
+                        f.code.to_string(),
+                    ),
+                    None => ("idle", "-".to_string(), "-".to_string()),
+                },
+            };
+            let skel = frozen_skeleton(&fs);
+            bsup!(
+                "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
+            );
+            print_inferred(s_arena, x, &inferred);
+        }
     }
     // (M6) The provisional verdict. Field forensics
     // re-judge every tenure against the decision
@@ -6467,7 +7017,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             "-".to_string()
         }
     );
-    holder
+    (holder, servicer_hits)
 }
 
 /// Cap on the write-overlap audit table (0.9.132):
@@ -6525,6 +7075,34 @@ fn shield4_bucket(w: u32) -> &'static str {
         "stack"
     } else {
         "other"
+    }
+}
+
+/// 0.9.141 (s9-141-desk P2): classify a poisoned
+/// reply's first word against the reply's own data
+/// address (the D2 test): a word pointing at the
+/// buffer itself, or eight bytes before it (the
+/// chunk header a stale head would carry), convicts
+/// the fat family's self-referential shape; a word
+/// inside the same page is the near form; anything
+/// else falls to the shield4 domain buckets under
+/// their class names. Returns the class name and
+/// its index in BinderState::poison_word0.
+fn poison_word0_class(w: u32, daddr: u32) -> (&'static str, usize) {
+    let delta = w as i64 - daddr as i64;
+    if delta == -8 {
+        ("self-8", 0)
+    } else if delta == 0 {
+        ("self", 1)
+    } else if delta.abs() < 4096 {
+        ("self-page", 2)
+    } else {
+        match shield4_bucket(w) {
+            "cookie" => ("heap-other", 3),
+            "libc" => ("libc", 4),
+            "stack" => ("stack", 5),
+            _ => ("other", 6),
+        }
     }
 }
 
@@ -7040,14 +7618,23 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // the remaining candidates starts with naming
         // the buffer the descriptor actually pointed
         // at and the batch it rode in on. Log only.
+        // 0.9.141 (P3): the replier's assembly-window
+        // profile rides the descriptor line's tail.
+        let win = st.cur_win.unwrap_or((0, 0, 0, 0, 0, 0));
         bsup!(
-            "binder: reply-pop desc claim_seq={claim_seq} fill_id={claimed_fill} replier={pid} arena={arena} waiter={} waiter_arena={} handle={} code={} txn_target={target} txn_code={code} txn_cookie=0x{cookie:x} flags=0x{flags:x} daddr=0x{daddr:x} dsize={dsize} oaddr=0x{oaddr:x} osize={osize} batch_reply={} batch=[{}]",
+            "binder: reply-pop desc claim_seq={claim_seq} fill_id={claimed_fill} replier={pid} arena={arena} waiter={} waiter_arena={} handle={} code={} txn_target={target} txn_code={code} txn_cookie=0x{cookie:x} flags=0x{flags:x} daddr=0x{daddr:x} dsize={dsize} oaddr=0x{oaddr:x} osize={osize} batch_reply={} batch=[{}] win=[stops={} futex={} alloc={} parks={} sends={} maxdepth={}]",
             w.sender_pid,
             w.sender_arena,
             w.target_handle,
             w.code,
             st.cur_batch_reply_ord,
-            st.cur_batch_skel
+            st.cur_batch_skel,
+            win.0,
+            win.1,
+            win.2,
+            win.3,
+            win.4,
+            win.5
         );
         // 0.9.135 telemetry: for the slots the foreign
         // family haunts (handle 10, the add codes
@@ -7269,6 +7856,60 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 w.sender_pid,
                 data.len()
             );
+            // 0.9.141 (P2): every poisoned pop -- not
+            // just the handle-10 subset -- gets its
+            // full head (first 128B of the copy in
+            // hand, reply-head128 format), the 16
+            // bytes in front of the buffer, and the
+            // first word's class against the buffer's
+            // own address (see poison_word0_class).
+            // Judgement, disposal and the bucket
+            // account above are untouched.
+            let (w0class, w0idx) = poison_word0_class(first_word, daddr);
+            st.poison_word0[w0idx] += 1;
+            let show = data.len().min(128);
+            bsup!(
+                "binder: poison-head128 claim_seq={claim_seq} replier={pid} waiter={} handle={} code={} daddr=0x{daddr:x} size={} shown={show} word0_rel={w0class}",
+                w.sender_pid, w.target_handle, w.code, data.len()
+            );
+            for (ci2, chunk) in data[..show].chunks(32).enumerate() {
+                let hexs: Vec<String> =
+                    chunk.iter().map(|b| format!("{b:02x}")).collect();
+                let asc: String = chunk
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                bsup!(
+                    "binder: poison-head128 +{:3} {} |{}|",
+                    ci2 * 32,
+                    hexs.join(" "),
+                    asc
+                );
+            }
+            if daddr >= 16 {
+                match rd(pid, (daddr - 16) as u64, 16) {
+                    Some(pre) if pre.len() == 16 => bsup!(
+                        "binder: poison-pre claim_seq={claim_seq} daddr=0x{daddr:x} pre=[0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}]",
+                        u32_at(&pre, 0),
+                        u32_at(&pre, 4),
+                        u32_at(&pre, 8),
+                        u32_at(&pre, 12)
+                    ),
+                    _ => bsup!(
+                        "binder: poison-pre claim_seq={claim_seq} daddr=0x{daddr:x} pre=unreadable"
+                    ),
+                }
+            } else {
+                bsup!(
+                    "binder: poison-pre claim_seq={claim_seq} daddr=0x{daddr:x} pre=unreadable"
+                );
+            }
             // 0.9.132: same write-overlap audit trigger
             // as shield3 (telemetry only).
             write_audit_check(st, arena, pid, daddr, &data, "shield4", claim_seq);
@@ -7837,6 +8478,26 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
         off += len;
     }
     off
+}
+
+/// 0.9.141 (P3): count the BR_TRANSACTION commands
+/// in a delivered fill (the serving-depth input to
+/// the window profile). Walks with br_one_len; an
+/// unknown command ends the count, as elsewhere.
+fn count_br_transactions(bytes: &[u8]) -> u32 {
+    // The fills counted here are batches the
+    // supervisor itself assembled, so every command
+    // in them is one br_one_len knows.
+    let mut n = 0u32;
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        if cmd == BR_TRANSACTION {
+            n += 1;
+        }
+        off += br_one_len(cmd);
+    }
+    n
 }
 
 /// 0.9.125: claim the transactions in a read fill for
@@ -8567,6 +9228,7 @@ fn svc_anchor_ok(pid: i32, compat: bool, addr: u64) -> bool {
 /// later rides rewind the PC to the svc instruction and
 /// drive entry+exit privately. On return `regs` holds
 /// the exit-stop registers of the injected call.
+#[allow(clippy::too_many_arguments)]
 fn inject_syscall(
     pid: i32,
     compat: bool,
@@ -8575,6 +9237,7 @@ fn inject_syscall(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
+    raw_r0: &mut Option<i64>,
 ) -> i64 {
     if rewind {
         // 0.9.139 (s9-138-verify Q2/Q5): entry_pc comes
@@ -8621,6 +9284,17 @@ fn inject_syscall(
                     match get_regs(pid, compat) {
                         Some(r) => {
                             *regs = r;
+                            // 0.9.141 (S3.3): the one
+                            // place a return value is
+                            // the guest's own r0 --
+                            // every other return path
+                            // of this function is a
+                            // synthetic -1, and the fd
+                            // telemetry's errno field
+                            // must never wear a
+                            // synthetic value as the
+                            // kernel's.
+                            *raw_r0 = Some(r.retval());
                             return r.retval();
                         }
                         None => return -1,
@@ -8700,10 +9374,11 @@ fn inject_openat(
     regs: &mut Regs,
     sender_pid: i32,
     sender_fd: i32,
-) -> i64 {
+) -> (i64, Option<i64>) {
     let nr_openat: u64 = if compat { 322 } else { 56 };
     let flags = sender_fd_open_flags(sender_pid, sender_fd);
-    inject_syscall(
+    let mut raw = None;
+    let r = inject_syscall(
         pid,
         compat,
         nr_openat,
@@ -8711,7 +9386,13 @@ fn inject_openat(
         entry_pc,
         rewind,
         regs,
-    )
+        &mut raw,
+    );
+    // 0.9.141 (S3.3): the raw guest r0 rides beside
+    // the collapsed return, so the resolver's errno
+    // rendering can tell a kernel errno from the
+    // ride's own synthetic -1.
+    (r, raw)
 }
 
 /// 0.9.134: fcntl(fd, F_DUPFD, min) inside the receiver:
@@ -8737,6 +9418,7 @@ fn inject_dupfd_min(
         entry_pc,
         rewind,
         regs,
+        &mut None,
     )
 }
 
@@ -8751,7 +9433,16 @@ fn inject_close(
     regs: &mut Regs,
 ) -> i64 {
     let nr_close: u64 = if compat { 6 } else { 57 };
-    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs)
+    inject_syscall(
+        pid,
+        compat,
+        nr_close,
+        [fd as u64, 0, 0, 0],
+        entry_pc,
+        rewind,
+        regs,
+        &mut None,
+    )
 }
 
 /// 0.9.134 (s9-133-verify Q2, fix (b)): before a resolved
@@ -9060,6 +9751,31 @@ fn fd_fail_convert_local(
 /// retried: they are structural (a pipe endpoint the
 /// /proc-open injection cannot materialise), not
 /// transient, and go to the failure path at once.
+/// 0.9.141 (s9-141-desk S3.3): render the errno an
+/// injected open failed with, from the ride's raw
+/// final r0. Only a value in [-4095, -1] is a
+/// kernel errno; anything else -- including the
+/// ride's own synthetic -1 on its failure paths,
+/// which never sets the raw slot -- renders na,
+/// never a fabricated 1.
+fn errno_of_raw(raw: Option<i64>) -> String {
+    match raw {
+        Some(r) if (-4095..=-1).contains(&r) => format!("{}", -r),
+        _ => "na".to_string(),
+    }
+}
+
+/// 0.9.141 (S3.3): what the sender's fd names on
+/// the host right now, read from /proc at the
+/// failure (or success) point.
+fn sender_link(sender_pid: i32, sender_fd: i32) -> String {
+    match std::fs::read_link(format!("/proc/{sender_pid}/fd/{sender_fd}")) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => format!("err{}", e.raw_os_error().unwrap_or(0)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_fd_fixups_core(
     pid: i32,
     compat: bool,
@@ -9067,6 +9783,7 @@ fn resolve_fd_fixups_core(
     arena: &str,
     fixups: &[FdFixup],
     regs: &mut Regs,
+    sender_face: &dyn Fn(i32) -> String,
 ) -> FdResolution {
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
@@ -9083,6 +9800,12 @@ fn resolve_fd_fixups_core(
         // at least one retry; a fixup that then reaches
         // its write-back counts as saved by the retry.
         let mut open_retried = false;
+        // 0.9.141 (S3.3): the errno the failing open
+        // itself produced, when the failure is the
+        // open's; later failure stages (verify, dup)
+        // have no kernel errno of their own and keep
+        // na.
+        let mut why_errno = "na".to_string();
         if let Some(fd) = cache.get(&cache_key) {
             candidate = Some(*fd);
         } else {
@@ -9110,7 +9833,7 @@ fn resolve_fd_fixups_core(
                 // stay on watch. The rides themselves are
                 // byte-for-byte the .139 ones.
                 let rw = res.rides > 0;
-                let r = match scratch_write(pid, &mut cursor, &path) {
+                let (r, raw_r0) = match scratch_write(pid, &mut cursor, &path) {
                     Some(addr) => inject_openat(
                         pid,
                         compat,
@@ -9121,7 +9844,7 @@ fn resolve_fd_fixups_core(
                         fx.sender_pid,
                         fx.sender_fd,
                     ),
-                    None => -1,
+                    None => (-1, None),
                 };
                 res.rides += 1;
                 if r >= 0 {
@@ -9129,17 +9852,27 @@ fn resolve_fd_fixups_core(
                     break;
                 }
                 let w = format!("open_ret={r}");
+                // 0.9.141 (S3.3): the failed attempt's
+                // own errno / sender link / sender
+                // face, appended to the retry line
+                // (and kept for the fail line when
+                // this failure is the final one).
+                let errno_s = errno_of_raw(raw_r0);
                 if attempt >= 3 {
+                    why_errno = errno_s;
                     why = Some(w);
                     break;
                 }
                 open_retried = true;
                 res.retried += 1;
                 sup!(
-                    "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} why={w}",
+                    "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} why={w} errno={errno_s} host_fd={} path_link={} sender_state={}",
                     fx.sender_pid,
                     fx.sender_fd,
-                    attempt + 1
+                    attempt + 1,
+                    fx.sender_fd,
+                    sender_link(fx.sender_pid, fx.sender_fd),
+                    sender_face(fx.sender_pid)
                 );
             }
         }
@@ -9201,11 +9934,12 @@ fn resolve_fd_fixups_core(
                             let _ = f.write_all_at(&(fd as u32).to_le_bytes(), fx.file_off);
                         }
                         sup!(
-                            "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup)",
+                            "binder: fd {} of pid {} -> fd {} in pid {} (parcel fixup) path_link={}",
                             fx.sender_fd,
                             fx.sender_pid,
                             fd,
-                            pid
+                            pid,
+                            sender_link(fx.sender_pid, fx.sender_fd)
                         );
                     }
                 }
@@ -9227,11 +9961,14 @@ fn resolve_fd_fixups_core(
         }
         if let Some(w) = why {
             sup!(
-                "binder: fd-fixup-fail sender_pid={} sender_fd={} recv_pid={pid} data_va=0x{:x} file_off=0x{:x} why={w}",
+                "binder: fd-fixup-fail sender_pid={} sender_fd={} recv_pid={pid} data_va=0x{:x} file_off=0x{:x} why={w} errno={why_errno} host_fd={} path_link={} sender_state={}",
                 fx.sender_pid,
                 fx.sender_fd,
                 fx.data_va,
-                fx.file_off
+                fx.file_off,
+                fx.sender_fd,
+                sender_link(fx.sender_pid, fx.sender_fd),
+                sender_face(fx.sender_pid)
             );
             res.failed.push(FdFail {
                 sender_pid: fx.sender_pid,
@@ -9262,7 +9999,40 @@ fn resolve_fd_fixups(
     };
     let seed: HashMap<CacheKey, i32> = cache_seed.iter().cloned().collect();
     let mut cache: HashMap<CacheKey, i32> = cache_seed.into_iter().collect();
-    let res = resolve_fd_fixups_core(pid, compat, &mut cache, arena, fixups, &mut regs);
+    // 0.9.141 (S3.3): the sender face for the fixup
+    // telemetry, from this worker's own account: a
+    // co-located sender renders its in-flight call
+    // and park state; a sender owned by another
+    // worker renders remote (its face comes from
+    // the S6 servicer channel, not from here).
+    let sender_face = |spid: i32| -> String {
+        match procs.get(&spid) {
+            Some(p) => match &p.pending {
+                Some(pd) if pd.binder_parked => {
+                    format!("{}({})/ioctl-park", nr_name(p.compat, pd.nr), pd.nr)
+                }
+                Some(pd) => {
+                    let park = if (p.compat && pd.nr == 240) || (!p.compat && pd.nr == 98) {
+                        "futex"
+                    } else {
+                        "syscall"
+                    };
+                    format!("{}({})/{}", nr_name(p.compat, pd.nr), pd.nr, park)
+                }
+                None => "-/running".to_string(),
+            },
+            None => "-/remote".to_string(),
+        }
+    };
+    let res = resolve_fd_fixups_core(
+        pid,
+        compat,
+        &mut cache,
+        arena,
+        fixups,
+        &mut regs,
+        &sender_face,
+    );
     // Learned entries ride back as inserts; evictions
     // (0.9.134) ride back as -1 values, which the
     // coordinator's cache-put handler reads as removals.
@@ -9345,6 +10115,16 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     }
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
+        // 0.9.141 (P3): the parked-path fill deepens
+        // this thread's serving window too.
+        let n = count_br_transactions(&bytes);
+        if n > 0 {
+            p.win.depth += n as i32;
+            let d = p.win.depth.max(0) as u32;
+            if d > p.win.maxdepth {
+                p.win.maxdepth = d;
+            }
+        }
     }
     let _ = write_mem(pid, park.read_buf as u64, &bytes);
     let _ = write_mem(pid, (park.bwr + 4) as u64, &park.write_consumed.to_le_bytes());
@@ -9432,6 +10212,23 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     bsup!(
         "binder: arena {arena} crash-report account: token_miss={}",
         st.crash_token_miss
+    );
+    // 0.9.141 (P1/P2): the issuance double-read and
+    // poison word0 accounts, at the same settlement
+    // on their own lines, like the account above.
+    bsup!(
+        "binder: arena {arena} issuance account: reads={} differs={}",
+        st.issuance_reads, st.issuance_differs
+    );
+    bsup!(
+        "binder: arena {arena} poison account: word0_rel self-8={} self={} self-page={} heap-other={} libc={} stack={} other={}",
+        st.poison_word0[0],
+        st.poison_word0[1],
+        st.poison_word0[2],
+        st.poison_word0[3],
+        st.poison_word0[4],
+        st.poison_word0[5],
+        st.poison_word0[6]
     );
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
@@ -11086,6 +11883,17 @@ fn next_stop(
                         }
                     }
                 }
+                Push::ServicerFace { arena, pids } => {
+                    // 0.9.141 (S6): the wedge chain in
+                    // the coordinator named servicers;
+                    // whichever worker owns one prints
+                    // its face from its own tables.
+                    for x in &pids {
+                        if procs.contains_key(x) {
+                            print_servicer_face(&arena, *x, procs);
+                        }
+                    }
+                }
             }
         }
         if acted {
@@ -11277,6 +12085,90 @@ fn do_handoff(
     sup!(
         "handoff: pid={pid} take-back FAILED errno={}; tracee left stopped",
         errno()
+    );
+}
+
+/// 0.9.141 (s9-141-desk S6): one servicer's
+/// tracer-side face, printed by the worker that
+/// owns it when the coordinator's wedge chain
+/// names it. Every field is read off this worker's
+/// own account for the thread: its in-flight call
+/// (the Pending captured at its entry stop), the
+/// futex face that call carries, its process
+/// family's futex group on the same uaddr, and an
+/// age in this worker's own emitted lines since
+/// the thread's last processed stop. Nothing is
+/// inferred across workers.
+fn print_servicer_face(ss_arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
+    let Some(proc) = procs.get(&x) else {
+        return;
+    };
+    // This thread's process root inside this
+    // worker: walk the parent chain to its top.
+    let leader_of = |mut p: i32| -> i32 {
+        for _ in 0..512 {
+            match procs.get(&p) {
+                Some(pr) if pr.parent != 0 && pr.parent != p && procs.contains_key(&pr.parent) => {
+                    p = pr.parent;
+                }
+                _ => break,
+            }
+        }
+        p
+    };
+    let leader = leader_of(x);
+    let (last_syscall, state, futex_uaddr, futex_grp, last_op) = match &proc.pending {
+        Some(pd) => {
+            let ls = format!("{}({})", nr_name(proc.compat, pd.nr), pd.nr);
+            let state = if pd.binder_parked {
+                "parked-binder"
+            } else if (proc.compat && pd.nr == 240) || (!proc.compat && pd.nr == 98) {
+                "futex"
+            } else {
+                "parked-other"
+            };
+            let (ua, grp, op) = match pd.last_futex {
+                Some((u, o, _)) => {
+                    let n = procs
+                        .iter()
+                        .filter(|(p, pr)| {
+                            **p != x
+                                && leader_of(**p) == leader
+                                && pr.pending
+                                    .as_ref()
+                                    .is_some_and(|q| q.last_futex.is_some_and(|(u2, _, _)| u2 == u))
+                        })
+                        .count()
+                        + 1;
+                    (
+                        format!("0x{u:x}"),
+                        if n == 1 {
+                            "solo".to_string()
+                        } else {
+                            n.to_string()
+                        },
+                        if o == 9 { "WAIT_BITSET" } else { "WAIT" },
+                    )
+                }
+                None => (
+                    "-".to_string(),
+                    "-".to_string(),
+                    if pd.last_wake.is_some() { "WAKE" } else { "-" },
+                ),
+            };
+            (ls, state, ua, grp, op)
+        }
+        None => (
+            "-".to_string(),
+            "running",
+            "-".to_string(),
+            "-".to_string(),
+            "-",
+        ),
+    };
+    let age = emit_seq_now().saturating_sub(proc.last_stop_seq);
+    sup!(
+        "binder: wedge-servicer-face arena={ss_arena} pid={x} last_syscall={last_syscall} state={state} futex_uaddr={futex_uaddr} futex_grp={futex_grp} last_op={last_op} age={age}"
     );
 }
 
@@ -11487,7 +12379,7 @@ fn fire_wedge_chain(
     wedge_leader: &mut Option<i32>,
     wedge_holder: &mut Option<i32>,
 ) {
-    let (logs, holder) = coord.wedge_chain(leader, solo.unwrap_or(0));
+    let (logs, holder, _servicers) = coord.wedge_chain(leader, solo.unwrap_or(0));
     replay_logs(logs);
     *wedge_leader = Some(leader);
     *wedge_holder = if holder > 0 { Some(holder) } else { None };
@@ -11513,6 +12405,19 @@ fn fire_wedge_chain(
 /// lines. A file that no longer holds this leader's
 /// section is a miss, printed as one, never papered
 /// over.
+/// 0.9.141 (s9-141-desk S5): the holder match is
+/// fixed -- block headers carry Dalvik tids (small
+/// integers) while the holder is a host pid, so the
+/// identity arm never fired in .140; the holder is
+/// now matched against the sysTid= each block body
+/// states, in the same number space. The main block
+/// is recognised by tid==1 or its name. Kept-block
+/// lines name the block by tid= (with systid= when
+/// the body states one). When the selection still
+/// keeps nothing, the whole section is excerpted
+/// instead: main first, then the monitor-graph
+/// blocks, then file order, 30 lines per block,
+/// 400 lines in total.
 fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     let path = format!("{rootfs}/data/anr/traces.txt");
     let text = match std::fs::read_to_string(&path) {
@@ -11553,8 +12458,11 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     // and run to the next block; a block's header
     // carries its guest tid as tid=<n>. The section's
     // preamble (header, Cmd line) belongs to no block
-    // and is skipped.
-    let mut blocks: Vec<(i32, String, Vec<&str>)> = Vec::new();
+    // and is skipped. 0.9.141: each block also yields
+    // the host-space sysTid= its body lines state
+    // (the "  | sysTid=<n> ..." group line), the
+    // number space holder pids live in.
+    let mut blocks: Vec<(i32, String, Vec<&str>, Option<i32>)> = Vec::new();
     for ln in section.lines() {
         if ln.starts_with('"') {
             let name = ln[1..].split('"').next().unwrap_or("").to_string();
@@ -11568,18 +12476,26 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
                 })
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0);
-            blocks.push((tid, name, Vec::new()));
+            blocks.push((tid, name, Vec::new(), None));
         }
         if let Some(b) = blocks.last_mut() {
             b.2.push(ln);
+            if b.3.is_none() {
+                if let Some(rest) = ln.split("sysTid=").nth(1) {
+                    let num: String =
+                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    b.3 = num.parse::<i32>().ok();
+                }
+            }
         }
     }
+    let is_main = |tid: i32, name: &str| tid == 1 || name == "main";
     let mut printed = 0usize;
     let mut kept = 0usize;
-    for (tid, name, blines) in &blocks {
+    for (tid, name, blines, systid) in &blocks {
         let body = blines.join("\n");
-        let keep = *tid == leader
-            || (holder > 0 && *tid == holder)
+        let keep = is_main(*tid, name)
+            || (holder > 0 && *systid == Some(holder))
             || body.contains("AppErrorResult")
             || body.contains("Surface")
             || body.contains("createSurfaceLocked");
@@ -11587,15 +12503,21 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
             continue;
         }
         kept += 1;
-        sup!(
-            "binder: wedge-traces arena={leader} pid={tid} name={name} lines={}",
-            blines.len()
-        );
+        match systid {
+            Some(s) => sup!(
+                "binder: wedge-traces arena={leader} tid={tid} systid={s} name={name} lines={}",
+                blines.len()
+            ),
+            None => sup!(
+                "binder: wedge-traces arena={leader} tid={tid} name={name} lines={}",
+                blines.len()
+            ),
+        }
         for ln in blines {
             if printed >= 200 {
                 break;
             }
-            sup!("binder: wedge-traces arena={leader} pid={tid} | {ln}");
+            sup!("binder: wedge-traces arena={leader} tid={tid} | {ln}");
             printed += 1;
         }
         if printed >= 200 {
@@ -11604,9 +12526,66 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
         }
     }
     if kept == 0 {
-        sup!(
-            "binder: wedge-traces arena={leader} (section found; no main, holder or keyword block in it)"
-        );
+        if blocks.is_empty() {
+            sup!(
+                "binder: wedge-traces arena={leader} (section found; no main, holder or keyword block in it)"
+            );
+        } else {
+            // 0.9.141 (S5): selection found nothing --
+            // excerpt the whole section instead of
+            // reporting an empty harvest: main blocks
+            // first, then the blocks carrying the
+            // monitor graph, then the rest in file
+            // order; 30 lines per block, 400 total.
+            sup!(
+                "binder: wedge-traces arena={leader} fallback=whole-section blocks={}",
+                blocks.len()
+            );
+            let mut order: Vec<usize> = Vec::new();
+            for (i, (tid, name, _, _)) in blocks.iter().enumerate() {
+                if is_main(*tid, name) {
+                    order.push(i);
+                }
+            }
+            for (i, (_, _, blines, _)) in blocks.iter().enumerate() {
+                if order.contains(&i) {
+                    continue;
+                }
+                let body = blines.join("\n");
+                if body.contains("waiting to lock") || body.contains("held by") {
+                    order.push(i);
+                }
+            }
+            for i in 0..blocks.len() {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+            let mut total = 0usize;
+            'fb: for i in order {
+                let (tid, name, blines, systid) = &blocks[i];
+                match systid {
+                    Some(s) => sup!(
+                        "binder: wedge-traces arena={leader} tid={tid} systid={s} name={name} lines={}",
+                        blines.len()
+                    ),
+                    None => sup!(
+                        "binder: wedge-traces arena={leader} tid={tid} name={name} lines={}",
+                        blines.len()
+                    ),
+                }
+                for ln in blines.iter().take(30) {
+                    if total >= 400 {
+                        sup!(
+                            "binder: wedge-traces arena={leader} fallback truncated at 400 lines"
+                        );
+                        break 'fb;
+                    }
+                    sup!("binder: wedge-traces arena={leader} tid={tid} | {ln}");
+                    total += 1;
+                }
+            }
+        }
     }
 }
 
@@ -11860,6 +12839,22 @@ fn tracer_loop(ctx: TracerCtx) {
                         }
                         _ => {}
                     }
+                }
+                // 0.9.141 (P3): assembly-window
+                // counters for this thread (see
+                // WinProfile): entry stops, futex
+                // WAIT entries and the allocator
+                // family. Pure bookkeeping on values
+                // already in hand.
+                proc.win.stops += 1;
+                proc.last_stop_seq = emit_seq_now();
+                if pend.last_futex.is_some() {
+                    proc.win.futex += 1;
+                }
+                if (proc.compat && matches!(nr, 45 | 91 | 192))
+                    || (!proc.compat && matches!(nr, 214 | 215 | 222))
+                {
+                    proc.win.alloc += 1;
                 }
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -12449,6 +13444,92 @@ fn tracer_loop(ctx: TracerCtx) {
                                 }
                                 None => None,
                             };
+                            // 0.9.141 (P1/P3): one walk
+                            // over the presented stream
+                            // before the rpc: count its
+                            // transactions and replies
+                            // for the window profile, and
+                            // snapshot up to four BC_
+                            // REPLY buffers (data VA,
+                            // declared size, first
+                            // min(size,128) bytes) as
+                            // the guest presented them.
+                            // The coordinator's copy of
+                            // a reply happens inside the
+                            // rpc; the re-read after the
+                            // actions have executed
+                            // brackets that instant --
+                            // the issuance window made
+                            // observable in this split.
+                            let mut win_ntxn = 0u32;
+                            let mut win_nreply = 0u32;
+                            let mut iss_snaps: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                            if let Some(s) = stream.as_deref() {
+                                let mut cur = 0usize;
+                                while cur + 4 <= s.len() {
+                                    let cmd = u32_at(s, cur);
+                                    let adv = match cmd {
+                                        BC_ENTER_LOOPER
+                                        | BC_REGISTER_LOOPER
+                                        | BC_EXIT_LOOPER => 4,
+                                        BC_FREE_BUFFER
+                                        | BC_INCREFS
+                                        | BC_ACQUIRE
+                                        | BC_RELEASE
+                                        | BC_DECREFS
+                                        | BC_DEAD_BINDER_DONE => 8,
+                                        BC_INCREFS_DONE
+                                        | BC_ACQUIRE_DONE
+                                        | BC_ATTEMPT_ACQUIRE
+                                        | BC_REQUEST_DEATH_NOTIFICATION
+                                        | BC_CLEAR_DEATH_NOTIFICATION => 12,
+                                        BC_TRANSACTION | BC_REPLY => 44,
+                                        _ => break,
+                                    };
+                                    if cur + adv > s.len() {
+                                        break;
+                                    }
+                                    if cmd == BC_TRANSACTION {
+                                        win_ntxn += 1;
+                                    }
+                                    if cmd == BC_REPLY {
+                                        win_nreply += 1;
+                                        if iss_snaps.len() < 4 {
+                                            let dsize = u32_at(s, cur + 28);
+                                            let daddr = u32_at(s, cur + 36);
+                                            let want =
+                                                (dsize as usize).min(128);
+                                            if want > 0 {
+                                                if let Some(bytes) =
+                                                    read_mem_vec(
+                                                        pid, daddr as u64, want,
+                                                    )
+                                                {
+                                                    iss_snaps.push((
+                                                        daddr, dsize, bytes,
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    cur += adv;
+                                }
+                            }
+                            let win_snap = (
+                                proc.win.stops,
+                                proc.win.futex,
+                                proc.win.alloc,
+                                proc.win.parks,
+                                proc.win.sends,
+                                proc.win.maxdepth,
+                            );
+                            if win_ntxn > 0 {
+                                proc.win.sends += 1;
+                            }
+                            if win_nreply > 0 {
+                                proc.win.depth =
+                                    (proc.win.depth - win_nreply as i32).max(0);
+                            }
                             let veuid = vcreds.get(&pid).copied().unwrap_or((0, 0)).0;
                             let (desc, logs, actions) = coord.write_read(
                                 pid,
@@ -12458,6 +13539,7 @@ fn tracer_loop(ctx: TracerCtx) {
                                 bwr_addr,
                                 bwr,
                                 stream,
+                                win_snap,
                             );
                             replay_logs(logs);
                             if let Some(f) = exec_binder_actions(
@@ -12470,6 +13552,85 @@ fn tracer_loop(ctx: TracerCtx) {
                                 &mut wakes,
                             ) {
                                 proc.last_binder_read = Some(f);
+                                // 0.9.141 (P3): the fill
+                                // just delivered deepens
+                                // this thread's serving
+                                // window by its trans-
+                                // action count.
+                                if let Some(fb) =
+                                    read_mem_vec(pid, f.0 as u64, f.1 as usize)
+                                {
+                                    let n = count_br_transactions(&fb);
+                                    if n > 0 {
+                                        proc.win.depth += n as i32;
+                                        let d = proc.win.depth.max(0) as u32;
+                                        if d > proc.win.maxdepth {
+                                            proc.win.maxdepth = d;
+                                        }
+                                    }
+                                }
+                            }
+                            // 0.9.141 (P1): re-read the
+                            // snapshotted reply buffers
+                            // now the decision (and its
+                            // copy) has completed, the
+                            // guest still stopped at
+                            // this entry stop. A buffer
+                            // that reads back different
+                            // changed inside the window
+                            // -- the issuance-time sub-
+                            // form of the poison family.
+                            if !iss_snaps.is_empty() {
+                                let mut differs = 0u32;
+                                for (daddr, dsize, entry) in &iss_snaps {
+                                    let Some(now) = read_mem_vec(
+                                        pid,
+                                        *daddr as u64,
+                                        entry.len(),
+                                    ) else {
+                                        continue;
+                                    };
+                                    if now != *entry {
+                                        differs += 1;
+                                        let ef = if entry.len() >= 4 {
+                                            u32_at(entry, 0)
+                                        } else {
+                                            0
+                                        };
+                                        let xf = if now.len() >= 4 {
+                                            u32_at(&now, 0)
+                                        } else {
+                                            0
+                                        };
+                                        sup!(
+                                            "binder: reply issuance differs pid={pid} daddr=0x{daddr:x} size={dsize} entry_first=0x{ef:08x} exit_first=0x{xf:08x} entry_head={} exit_head={}",
+                                            hex_head(entry, 32),
+                                            hex_head(&now, 32)
+                                        );
+                                    }
+                                }
+                                coord.oneway_issuance_stats(
+                                    iss_snaps.len() as u32,
+                                    differs,
+                                );
+                            }
+                            if win_nreply > 0 {
+                                // 0.9.141 (P3): the
+                                // window closes at this
+                                // thread's forwarded
+                                // reply; the counters
+                                // restart, the depth
+                                // carries over.
+                                proc.win.stops = 0;
+                                proc.win.futex = 0;
+                                proc.win.alloc = 0;
+                                proc.win.parks = 0;
+                                proc.win.sends = 0;
+                                proc.win.maxdepth =
+                                    proc.win.depth.max(0) as u32;
+                            }
+                            if pend.binder_parked {
+                                proc.win.parks += 1;
                             }
                             pend.desc = Some(desc);
                         }
@@ -12582,6 +13743,11 @@ fn tracer_loop(ctx: TracerCtx) {
                 }
             } else {
                 // ---- syscall-exit stop ----
+                // 0.9.141 (P3/S6): the exit half of the
+                // window stop count, and the tracee's
+                // last-activity mark for the face age.
+                proc.win.stops += 1;
+                proc.last_stop_seq = emit_seq_now();
                 if let Some(mut pend) = proc.pending.take() {
                     if let Some(mut regs) = get_regs(pid, proc.compat) {
                         let mut ret = regs.retval();
