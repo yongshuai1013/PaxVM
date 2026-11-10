@@ -3915,6 +3915,94 @@ fn ashmem_open_region(pid: i32, rootfs: &str, st: &mut BinderState) -> String {
 /// as before. What the tracer still owes is returned:
 /// the reply bytes to write into the guest, and the
 /// fixups with the cache entries they will consult.
+/// The parcel data VAs a BR byte stream carries: the
+/// data pointer of every BR_TRANSACTION / BR_REPLY
+/// record in it, walked with the same advance rules
+/// fd_locate_cmd uses.
+fn stream_data_vas(bytes: &[u8]) -> Vec<u32> {
+    let mut vas = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            break;
+        }
+        if (cmd == BR_TRANSACTION || cmd == BR_REPLY) && len == 44 {
+            vas.push(u32_at(bytes, off + 36));
+        }
+        off += len;
+    }
+    vas
+}
+
+/// 0.9.136: take the pending fd fixups that belong to
+/// one guest-bound batch -- the ones whose parcel data
+/// VA the batch's byte stream names -- and leave the
+/// rest queued for their own deliveries.
+///
+/// Both settle points (binder_complete_decision for a
+/// parked wake, binder_write_read for an inline fill)
+/// used to drain the arena's WHOLE fd_pending list into
+/// whichever completion or fill came first. A fixup
+/// settled by a sibling thread's batch was resolved in
+/// the sibling's context, and on failure its conversion
+/// searched the sibling's stream, missed, and fell to
+/// the coordinator's queue search -- which misses in
+/// turn when the owning delivery's bytes have already
+/// been drained by their own completion and are in
+/// flight to their worker: fd-fixup-fail-late, the one
+/// outcome where a guest can consume a parcel whose fd
+/// words were never settled. Selecting per delivery
+/// closes that by construction: a fixup is only ever
+/// settled by the decision handing its own delivery to
+/// the guest, in that guest's worker, before the batch
+/// is written or the tracee continued. (The .135
+/// field's three "late convert" cases were re-audited
+/// against this: all three took the parked path, where
+/// complete_parked already resolves and converts
+/// before write_mem and cont_syscall; the guest-side
+/// line interleaved between the fail and convert lines
+/// is the resolver wrapper's own parked-desc print at
+/// rides>0, not a guest read. The hole closed here is
+/// the cross-decision one above, which the field has
+/// not fired yet.)
+fn take_fixups_for(
+    st: &mut BinderState,
+    arena: &str,
+    vas: &[u32],
+) -> Option<(String, Vec<FdFixup>, Vec<(CacheKey, i32)>)> {
+    let pending = st.fd_pending.get_mut(arena)?;
+    if pending.is_empty() {
+        return None;
+    }
+    let mut taken: Vec<FdFixup> = Vec::new();
+    let mut left: Vec<FdFixup> = Vec::new();
+    for f in pending.drain(..) {
+        if vas.contains(&f.data_va) {
+            taken.push(f);
+        } else {
+            left.push(f);
+        }
+    }
+    *pending = left;
+    if taken.is_empty() {
+        return None;
+    }
+    // The resolver runs tracer-side but the cache lives
+    // here: attach the entries these fixups will
+    // consult; what it learns comes back before any
+    // later decision reads the cache again.
+    let cache: Vec<(CacheKey, i32)> = taken
+        .iter()
+        .filter_map(|f| {
+            let key: CacheKey = (arena.to_string(), f.sender_pid, f.sender_fd);
+            st.fd_cache.get(&key).map(|fd| (key, *fd))
+        })
+        .collect();
+    Some((arena.to_string(), taken, cache))
+}
+
 fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let Some(park) = st.parked.remove(&pid) else {
         return ParkedOutcome::Nothing;
@@ -3993,20 +4081,10 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         st.parked.insert(pid, park);
         return ParkedOutcome::Nothing;
     }
-    let fixups = st.fd_pending.remove(&arena).and_then(|fx| {
-        if fx.is_empty() {
-            None
-        } else {
-            let cache: Vec<(CacheKey, i32)> = fx
-                .iter()
-                .filter_map(|f| {
-                    let key: CacheKey = (arena.clone(), f.sender_pid, f.sender_fd);
-                    st.fd_cache.get(&key).map(|fd| (key, *fd))
-                })
-                .collect();
-            Some((arena.clone(), fx, cache))
-        }
-    });
+    // 0.9.136: only the fixups whose deliveries this
+    // completion's own bytes carry (see take_fixups_for);
+    // the rest stay queued for their own completions.
+    let fixups = take_fixups_for(st, &arena, &stream_data_vas(&bytes));
     ParkedOutcome::Complete { park, bytes, fixups }
 }
 
@@ -4991,6 +5069,17 @@ fn exec_binder_actions(
                         pend.applied = true;
                     }
                 }
+                // 0.9.136: the settle-before-wake audit
+                // mark, inline path: resolution and any
+                // failure conversion (with its in-place
+                // read-buffer repair above) are complete
+                // inside this entry stop's action list,
+                // before the handler continues the tracee.
+                sup!(
+                    "binder: fd-fixup-settled recv_pid={pid} path=inline fixups={} failed={}",
+                    fixups.len(),
+                    res.failed.len()
+                );
             }
         }
     }
@@ -7127,6 +7216,10 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         let bytes = shield_ref_pairs(st, &arena, pid, bytes);
         binder_claim_fills(st, &arena, pid, &bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
+        // 0.9.136: this fill's delivery VAs, taken before
+        // the bytes move into the action list; the fd
+        // fixup selection below keys off them.
+        let fill_vas = stream_data_vas(&bytes);
         let filled = bytes.len();
         actions.push(BAction::WriteMem {
             addr: rb as u64,
@@ -7137,40 +7230,30 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             bytes: writeback(filled as u32).to_vec(),
         });
         actions.push(BAction::SkipSyscall(0));
-        // Deliveries to this arena may have left fd fixups
-        // unresolved. They are normally settled when the
-        // receiver is woken out of a park; a thread that
-        // finds its reply already queued on entry never
-        // parks, and would go on to read the parcel with
-        // the senders' raw fds still in it (a received
-        // heap's client-side mmap then fails on a foreign
-        // fd). Settle them now, while this call sits in
-        // the same skipped state the parked path resolves
-        // from: rides consume this call's entry->exit
-        // transition, so the fake result is applied to the
-        // regs by the executor and the caller drops its
-        // exit-stop expectation (it keys that off
-        // pend.applied).
-        if let Some(fixups) = st.fd_pending.remove(&arena) {
-            if !fixups.is_empty() {
-                // The resolver runs tracer-side but the
-                // cache lives here now: attach the entries
-                // these fixups will consult; what it
-                // learns comes back before any later
-                // decision reads the cache again.
-                let cache: Vec<(CacheKey, i32)> = fixups
-                    .iter()
-                    .filter_map(|f| {
-                        let key: CacheKey = (arena.clone(), f.sender_pid, f.sender_fd);
-                        st.fd_cache.get(&key).map(|fd| (key, *fd))
-                    })
-                    .collect();
-                actions.push(BAction::ResolveFdFixupsInline {
-                    arena: arena.clone(),
-                    fixups,
-                    cache,
-                });
-            }
+        // Deliveries in this fill may have left fd
+        // fixups unresolved. They are normally settled
+        // when the receiver is woken out of a park; a
+        // thread that finds its reply already queued on
+        // entry never parks, and would go on to read the
+        // parcel with the senders' raw fds still in it
+        // (a received heap's client-side mmap then fails
+        // on a foreign fd). Settle them now, while this
+        // call sits in the same skipped state the parked
+        // path resolves from: rides consume this call's
+        // entry->exit transition, so the fake result is
+        // applied to the regs by the executor and the
+        // caller drops its exit-stop expectation (it keys
+        // that off pend.applied). 0.9.136: only the
+        // fixups whose deliveries THIS fill carries are
+        // settled here (see take_fixups_for); a fixup for
+        // a still-queued delivery stays pending for that
+        // delivery's own fill or wake.
+        if let Some((_, fixups, cache)) = take_fixups_for(st, &arena, &fill_vas) {
+            actions.push(BAction::ResolveFdFixupsInline {
+                arena: arena.clone(),
+                fixups,
+                cache,
+            });
         }
         notes.push(format!("read filled {}B", filled));
     } else if rs > 0 {
@@ -8545,6 +8628,21 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
         if !res.failed.is_empty() {
             fd_fail_convert_local(coord, &arena, pid, &mut bytes, &res.failed);
         }
+        // 0.9.136: the settle-before-wake audit mark.
+        // Printed at the exact point the invariant
+        // becomes true: every fixup of the deliveries in
+        // this batch is resolved (parcel words patched)
+        // or converted (stream rewritten) and the batch
+        // has neither been written to the guest nor the
+        // tracee continued. An offline audit can assert
+        // every fd-fixup-fail group is covered by one of
+        // these lines for its recv_pid before that pid's
+        // next guest-visible line.
+        sup!(
+            "binder: fd-fixup-settled recv_pid={pid} path=parked fixups={} failed={}",
+            fx.len(),
+            res.failed.len()
+        );
     }
     if let Some(p) = procs.get_mut(&pid) {
         p.last_binder_read = Some((park.read_buf, bytes.len() as u32));
@@ -8590,6 +8688,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // it too, so a later arena can never be audited
     // against a dead one's writes.
     st.write_audit.retain(|r| r.arena != arena);
+    // 0.9.136: pending fd fixups belong to this arena's
+    // deliveries; with per-delivery selection an
+    // unsettled one can only name a delivery nobody
+    // consumed, and it must not survive into a later
+    // tenure of the same arena path (its data_va could
+    // coincide with a fresh parcel's).
+    st.fd_pending.remove(arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
             "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={} reply_collide_checks={} reply_collide_hits={}",
