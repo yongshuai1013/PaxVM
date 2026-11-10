@@ -2404,6 +2404,12 @@ struct BinderState {
     fd_fixup_failed: u64,
     fd_fixup_dupped: u64,
     fd_fixup_verified: u64,
+    /// 0.9.137: settle-point retries of the injected
+    /// open and the fixups they saved (see
+    /// resolve_fd_fixups_core). Same account and
+    /// arrival path as the three counters above.
+    fd_fixup_retried: u64,
+    fd_fixup_retry_saved: u64,
     /// 0.9.135: per-thread rings for the reply-source
     /// collision check (see ClaimParcelRec /
     /// SendSrcRec) and its counters. Telemetry only,
@@ -3466,11 +3472,15 @@ impl CoordClient {
 
     /// 0.9.134: per-resolution fixup statistics deltas
     /// (low-slot dups performed, write-back
-    /// verifications passed).
-    fn oneway_fd_stats(&mut self, dupped: u32, verified: u32) {
+    /// verifications passed). 0.9.137 appends the
+    /// injected-open retry deltas (retries performed,
+    /// fixups saved by one).
+    fn oneway_fd_stats(&mut self, dupped: u32, verified: u32, retried: u32, retry_saved: u32) {
         let mut e = Enc::new();
         e.u32(dupped);
         e.u32(verified);
+        e.u32(retried);
+        e.u32(retry_saved);
         self.send(MSG_ONEWAY_FD_STATS, &e.0);
     }
 
@@ -4517,8 +4527,12 @@ impl CoordServer {
             MSG_ONEWAY_FD_STATS => {
                 let dupped = d.u32();
                 let verified = d.u32();
+                let retried = d.u32();
+                let retry_saved = d.u32();
                 self.st.fd_fixup_dupped += dupped as u64;
                 self.st.fd_fixup_verified += verified as u64;
+                self.st.fd_fixup_retried += retried as u64;
+                self.st.fd_fixup_retry_saved += retry_saved as u64;
             }
             MSG_ONEWAY_FD_FAIL => {
                 let arena = d.string();
@@ -5029,8 +5043,8 @@ fn exec_binder_actions(
                     put.push((k.clone(), -1));
                 }
                 coord.oneway_fd_cache_put(&put);
-                if res.dupped > 0 || res.verified > 0 {
-                    coord.oneway_fd_stats(res.dupped, res.verified);
+                if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 {
+                    coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved);
                 }
                 if !res.failed.is_empty() {
                     // 0.9.134 (fix (a)): convert the
@@ -8269,6 +8283,13 @@ struct FdResolution {
     evictions: Vec<CacheKey>,
     dupped: u32,
     verified: u32,
+    /// 0.9.137: injected-open retries performed at
+    /// this settle point, and the fixups a retry
+    /// carried all the way to a successful write-back
+    /// (without it they would have been converted to
+    /// the delivery-failure path).
+    retried: u32,
+    retry_saved: u32,
 }
 
 /// Dispositions reported to the coordinator with each
@@ -8415,6 +8436,22 @@ fn fd_fail_convert_local(
 /// groups resolved their middle pipe to 0 in five of
 /// five tenures, and the guest's later stdio redirect
 /// silently overwrote the slot.
+///
+/// 0.9.137 adds one behaviour inside the obtain step:
+/// the injected open itself is retried, in place at
+/// the same settle point, up to three attempts in
+/// total. Its failure is the one transient class on
+/// record -- both HEAP_ID cases (.134/.135) failed
+/// exactly once here with open_ret=-1 on an ashmem fd
+/// that resolved fine for other receivers afterwards,
+/// and GB's assertReallyMapped swallows the honest
+/// FAILED_REPLY this failure would produce and poisons
+/// its cached control block anyway
+/// (s9-136-desk-failedreply), so on that path the only
+/// lever is not failing. Verify verdicts are NOT
+/// retried: they are structural (a pipe endpoint the
+/// /proc-open injection cannot materialise), not
+/// transient, and go to the failure path at once.
 fn resolve_fd_fixups_core(
     pid: i32,
     compat: bool,
@@ -8434,21 +8471,50 @@ fn resolve_fd_fixups_core(
         // receiver.
         let mut candidate: Option<i32> = None;
         let mut why: Option<String> = None;
+        // 0.9.137: set when this fixup's open consumed
+        // at least one retry; a fixup that then reaches
+        // its write-back counts as saved by the retry.
+        let mut open_retried = false;
         if let Some(fd) = cache.get(&cache_key) {
             candidate = Some(*fd);
         } else {
             let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
-            let r = match scratch_write(pid, &mut cursor, &path) {
-                Some(addr) => {
-                    inject_openat(pid, compat, addr, entry_pc, res.rides > 0, &mut *regs)
+            // 0.9.137: retry the injected open in place,
+            // up to three attempts in total (see the
+            // header comment). Only this step retries:
+            // its failure means the sender's fd was never
+            // even opened -- the transient class. Each
+            // retry rides exactly like the first attempt
+            // and is counted and logged as it launches,
+            // so the fd-fixup-retry lines and the
+            // fd_fixup_retried counter reconcile 1:1.
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let r = match scratch_write(pid, &mut cursor, &path) {
+                    Some(addr) => {
+                        inject_openat(pid, compat, addr, entry_pc, res.rides > 0, &mut *regs)
+                    }
+                    None => -1,
+                };
+                res.rides += 1;
+                if r >= 0 {
+                    candidate = Some(r as i32);
+                    break;
                 }
-                None => -1,
-            };
-            res.rides += 1;
-            if r >= 0 {
-                candidate = Some(r as i32);
-            } else {
-                why = Some(format!("open_ret={r}"));
+                let w = format!("open_ret={r}");
+                if attempt >= 3 {
+                    why = Some(w);
+                    break;
+                }
+                open_retried = true;
+                res.retried += 1;
+                sup!(
+                    "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} why={w}",
+                    fx.sender_pid,
+                    fx.sender_fd,
+                    attempt + 1
+                );
             }
         }
         if let Some(fd0) = candidate {
@@ -8496,6 +8562,13 @@ fn resolve_fd_fixups_core(
                         }
                     }
                     if why.is_none() {
+                        // 0.9.137: the fixup completed;
+                        // had its open not been retried it
+                        // would have been converted to the
+                        // delivery-failure path instead.
+                        if open_retried {
+                            res.retry_saved += 1;
+                        }
                         cache.insert(cache_key, fd);
                         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(arena) {
                             use std::os::unix::fs::FileExt;
@@ -8572,8 +8645,8 @@ fn resolve_fd_fixups(
         put.push((k.clone(), -1));
     }
     coord.oneway_fd_cache_put(&put);
-    if res.dupped > 0 || res.verified > 0 {
-        coord.oneway_fd_stats(res.dupped, res.verified);
+    if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 {
+        coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved);
     }
     if res.rides == 0 {
         return res;
@@ -8697,7 +8770,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     st.fd_pending.remove(arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={} reply_collide_checks={} reply_collide_hits={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={} fd_fixup_retried={} fd_fixup_retry_saved={} reply_collide_checks={} reply_collide_hits={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -8719,6 +8792,8 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.fd_fixup_failed,
             st.fd_fixup_dupped,
             st.fd_fixup_verified,
+            st.fd_fixup_retried,
+            st.fd_fixup_retry_saved,
             st.reply_collide_checks,
             st.reply_collide_hits
         );
