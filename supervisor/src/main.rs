@@ -2158,20 +2158,32 @@ struct PidEvidence {
 
 /// One supervisor delivery write into a guest arena,
 /// kept for the 0.9.132 write-overlap audit (telemetry
-/// only): the arena-file offset and total length of
-/// the parcel image binder_deliver laid down, plus
-/// its first 64 bytes exactly as written. The audit
-/// (write_audit_check) compares a poisoned reply's
-/// source range against these records to separate
-/// "the guest assembled garbage from its own memory"
-/// from "an earlier supervisor delivery write landed
-/// on the very bytes later read back as poison"
+/// only): the guest virtual-address interval and total
+/// length of the parcel image binder_deliver laid
+/// down, plus its first 64 bytes exactly as written.
+/// The audit (write_audit_check) compares a poisoned
+/// reply's source range against these records to
+/// separate "the guest assembled garbage from its own
+/// memory" from "an earlier supervisor delivery write
+/// landed on the very bytes later read back as poison"
 /// (s9-132-spec section 2.3). Records are written at
 /// the delivery site and read only by the audit; they
 /// feed no decision.
+/// 0.9.133 coordinate fix (s9-132-verify Q3): the
+/// record used to keep the arena-FILE offset, but a
+/// poisoned reply's source is a heap Parcel buffer in
+/// the replier's own address space -- the two domains
+/// never intersect by construction, so every check
+/// died at the base conversion (verdict=no-base 8/8)
+/// without comparing a single byte. The record now
+/// keeps the guest VA interval the delivery actually
+/// landed at (the target's registered mmap base plus
+/// the file offset, exactly the address the delivered
+/// BR_TRANSACTION/BR_REPLY names), and the check
+/// compares VA against VA.
 struct WriteAuditRec {
     arena: String,
-    off: u32,
+    va: u64,
     len: u32,
     head: Vec<u8>,
 }
@@ -2257,6 +2269,20 @@ struct BinderState {
     /// dropped when the arena dies (binder_on_proc_exit),
     /// beside its evidence ring. Telemetry only.
     write_audit: VecDeque<WriteAuditRec>,
+    /// 0.9.133: judgement-point second-read counters
+    /// (telemetry only). The pre-0.9.133 re-read hook
+    /// covered only replies of 256B+, so the 8B poison
+    /// family was never re-read at all and its read-
+    /// window race question stayed open (s9-132-verify
+    /// Q3); the hook at the shield4 judgement point now
+    /// re-reads the first min(size, 64B) of every judged
+    /// reply and counts the comparisons here, printing
+    /// a line only when one differs. The second read is
+    /// never consulted by the judgement or the delivery.
+    /// Global like shield4_drops; reported on the
+    /// arena-death free-counters line.
+    second_reads: u64,
+    second_read_differs: u64,
     /// 0.9.128: global claim sequence counter. Every
     /// successful claim in binder_claim_fills takes the
     /// next number and stamps it on the ServingFrame it
@@ -4749,6 +4775,65 @@ fn binder_translate(
     out
 }
 
+/// 0.9.133 fd-object telemetry (log only; see
+/// s9-132-verify Q4 item 1): photograph every FD-type
+/// flat object a translation just carried, on both
+/// the transaction and the reply path. The field's
+/// biggest ignition family is now systemui dying in
+/// InputQueue.registerInputChannel after WMS replies,
+/// and an input channel crosses as exactly one of
+/// these objects; until now the log named FD fixups
+/// only at wake-time resolution, never at the parcel
+/// that carried them. For each fixup this prints the
+/// recipient (arena, and the waiter/sender pid where
+/// the site knows it), the call code, the object's
+/// offset in the parcel, the fd word before
+/// translation (the sender's guest fd -- translation
+/// leaves the word untouched; the receiver-side
+/// patch happens later, in resolve_fd_fixups, whose
+/// own log line names the resulting fd) and after,
+/// read back from the translated bytes, plus the
+/// host-side standing of the sender's fd at this
+/// moment: the /proc/<sender>/fd/<n> link target
+/// (socket / pipe / file / ashmem path), or the errno
+/// when the link cannot be read -- the supervisor
+/// cannot fcntl another process's descriptor, and
+/// the proc link is the read-only equivalent check.
+/// FD objects are rare in this traffic (a few dozen
+/// per run), so every one prints. Nothing here feeds
+/// translation, the fixup list or delivery.
+fn fd_obj_dump(
+    site: &str,
+    from_pid: i32,
+    to_arena: &str,
+    to_pid: Option<i32>,
+    code: u32,
+    out: &[u8],
+    fixups: &[(usize, i32)],
+) {
+    for &(rel, gfd) in fixups {
+        let obj_off = rel.saturating_sub(8);
+        let post = if rel + 4 <= out.len() {
+            u32_at(out, rel)
+        } else {
+            gfd as u32
+        };
+        let host = match std::fs::read_link(format!("/proc/{from_pid}/fd/{gfd}")) {
+            Ok(t) => format!("ok target={}", t.display()),
+            Err(e) => match e.raw_os_error() {
+                Some(c) => format!("invalid errno={c}"),
+                None => format!("invalid kind={:?}", e.kind()),
+            },
+        };
+        let to_pid_s = to_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        bsup!(
+            "binder: fd-obj dump site={site} from_pid={from_pid} to={to_arena} to_pid={to_pid_s} code={code} off={obj_off} guest_fd={gfd} word_pre={gfd} word_post={post} host={host}"
+        );
+    }
+}
+
 /// Copy a translated parcel into the target arena and queue
 /// the BR_TRANSACTION / BR_REPLY carrying it. On failure the
 /// Err names the exact stage, so a dead delivery explains
@@ -4845,7 +4930,11 @@ fn binder_deliver(
         // before the return below.
         wa_rec = Some(WriteAuditRec {
             arena: target.to_string(),
-            off,
+            // 0.9.133: guest VA interval, not the file
+            // offset -- base here is the very base the
+            // delivery's txn words name (base + off is
+            // where the parcel lives in the receiver).
+            va: base as u64 + off as u64,
             len: total,
             head: img[..img.len().min(64)].to_vec(),
         });
@@ -5394,9 +5483,7 @@ fn shield4_bucket(w: u32) -> &'static str {
 /// WriteAuditRec). Fires at a shield intercept on the
 /// reply path, where the poison parcel's source --
 /// the replier's arena, its guest address daddr and
-/// the copied bytes -- is in hand. The source range is
-/// converted to arena-file offsets through the
-/// replier's recorded mmap base and compared against
+/// the copied bytes -- is in hand; compared against
 /// every delivery write the supervisor itself made
 /// into that arena: an overlap whose recorded head
 /// bytes match the poison bytes over the comparable
@@ -5405,6 +5492,30 @@ fn shield4_bucket(w: u32) -> &'static str {
 /// in s9-132-spec 2.3); zero overlap means the range
 /// was never ours (case (a)). Prints exactly one line
 /// and feeds nothing.
+/// 0.9.133 coordinate fix (s9-132-verify Q3): the
+/// comparison now runs in guest VA space end to end --
+/// records carry VA intervals (see WriteAuditRec) and
+/// the poison source [daddr, daddr+len) is already a
+/// guest VA, so no base conversion stands between the
+/// two. The old file-offset form converted the source
+/// through the replier thread's registered binder
+/// mmap base; heap Parcel buffers sit gigabases below
+/// that window, the subtraction underflowed on every
+/// field intercept (8/8), and the audit compared
+/// nothing. What remains of the base here is
+/// diagnostic: the line prints the arena's full
+/// registered base set (all threads of one process
+/// share one mmap, so the set should hold one value;
+/// the replier thread's own key is named separately),
+/// and src_rel names where the source sits against
+/// the lowest registered base -- below-base is the
+/// old underflow case, now compared instead of
+/// refused, and for heap-sourced poison the expected
+/// outcome is no-overlap. verdict=no-base survives
+/// only where there is nothing to compare against:
+/// branch=no-proc (the arena's proc state is gone)
+/// or branch=no-key (no thread ever registered a
+/// base for this arena).
 fn write_audit_check(
     st: &BinderState,
     arena: &str,
@@ -5414,19 +5525,40 @@ fn write_audit_check(
     trigger: &str,
     claim_seq: u64,
 ) {
-    let base = st
-        .procs
-        .get(arena)
-        .and_then(|bp| bp.base.get(&replier))
-        .copied();
-    let Some(src_off) = base.and_then(|b| daddr.checked_sub(b)) else {
+    let Some(bp) = st.procs.get(arena) else {
         bsup!(
-            "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} verdict=no-base",
+            "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} verdict=no-base branch=no-proc base=none",
             data.len()
         );
         return;
     };
-    let src_end = src_off.saturating_add(data.len() as u32);
+    let mut bases: Vec<u32> = bp.base.values().copied().collect();
+    bases.sort_unstable();
+    bases.dedup();
+    if bases.is_empty() {
+        bsup!(
+            "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} verdict=no-base branch=no-key base=none",
+            data.len()
+        );
+        return;
+    }
+    let bases_str = bases
+        .iter()
+        .map(|b| format!("0x{b:x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key_base = bp
+        .base
+        .get(&replier)
+        .map(|b| format!("0x{b:x}"))
+        .unwrap_or_else(|| "none".to_string());
+    let src_rel = if (daddr as u64) < bases[0] as u64 {
+        "below-base"
+    } else {
+        "at-or-above-base"
+    };
+    let src_start = daddr as u64;
+    let src_end = src_start.saturating_add(data.len() as u64);
     let mut records = 0usize;
     let mut overlaps = 0usize;
     let mut compared = 0usize;
@@ -5436,8 +5568,8 @@ fn write_audit_check(
             continue;
         }
         records += 1;
-        let rec_end = rec.off.saturating_add(rec.len);
-        let o_start = src_off.max(rec.off);
+        let rec_end = rec.va.saturating_add(rec.len as u64);
+        let o_start = src_start.max(rec.va);
         let o_end = src_end.min(rec_end);
         if o_start >= o_end {
             continue;
@@ -5446,13 +5578,13 @@ fn write_audit_check(
         // Bytes are comparable only where the record's
         // kept head (the write's first 64 bytes)
         // reaches into the overlap.
-        let head_reach = (rec.off as usize + rec.head.len()).min(o_end as usize);
-        if o_start as usize >= head_reach {
+        let head_reach = (rec.va + rec.head.len() as u64).min(o_end);
+        if o_start >= head_reach {
             continue;
         }
-        let n = head_reach - o_start as usize;
-        let d_at = (o_start - src_off) as usize;
-        let r_at = (o_start - rec.off) as usize;
+        let n = (head_reach - o_start) as usize;
+        let d_at = (o_start - src_start) as usize;
+        let r_at = (o_start - rec.va) as usize;
         for k in 0..n {
             compared += 1;
             if data[d_at + k] != rec.head[r_at + k] {
@@ -5470,7 +5602,7 @@ fn write_audit_check(
         "overlap-bytes-differ"
     };
     bsup!(
-        "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} src_off=0x{src_off:x} records={records} overlaps={overlaps} compared={compared} mismatch={mismatch} verdict={verdict}",
+        "binder: write-audit trigger={trigger} claim_seq={claim_seq} replier={replier} arena={arena} daddr=0x{daddr:x} size={} src_va=0x{src_start:x} bases=[{bases_str}] key_base={key_base} src_rel={src_rel} records={records} overlaps={overlaps} compared={compared} mismatch={mismatch} verdict={verdict}",
         data.len()
     );
 }
@@ -5781,6 +5913,39 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 }
             }
         }
+        // 0.9.133 (telemetry only): the second read
+        // above never covered small replies -- its
+        // 256B floor left the 8B poison family (five of
+        // the .132 run's eight intercepts) entirely
+        // un-re-read, so for small poison the "garbage
+        // sat static before our first read" verdict had
+        // no evidence either way (s9-132-verify Q3).
+        // At this same judgement-adjacent point, now
+        // re-read the first min(size, 64B) of EVERY
+        // judged reply and compare the whole span
+        // against the copy: agreement extends the
+        // pre-existing-corruption evidence to the small
+        // family; a difference would put the read
+        // window itself back under suspicion. A
+        // differing span prints one line; agreement
+        // only moves the settlement counters. Read
+        // only -- the judgement below and the delivery
+        // after it use the copied bytes, never this.
+        if data.len() >= 4 {
+            st.second_reads += 1;
+            let span = data.len().min(64);
+            if let Some(v) = rd(pid, daddr as u64, span) {
+                let m = v.len().min(span);
+                if m > 0 && v[..m] != data[..m] {
+                    st.second_read_differs += 1;
+                    let second = if v.len() >= 4 { u32_at(&v, 0) } else { 0 };
+                    bsup!(
+                        "binder: reply second-read differs seq={claim_seq} size={} first=0x{first_word:x} second=0x{second:x} span={span}",
+                        data.len()
+                    );
+                }
+            }
+        }
         // 0.9.129 shield, fourth layer: a reply whose
         // first word is not a reply header at all is not
         // a reply. The 0.9.128 field run's three poisoned
@@ -5844,6 +6009,13 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         }
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
         let tdata = binder_translate(st, arena, &w.sender_arena, &data, &offs, actions, &mut fd_fixups);
+        // 0.9.133: photograph any FD objects this reply
+        // carries before delivery (telemetry only; see
+        // fd_obj_dump). The WMS -> systemui relayout
+        // replies this exists for travel this path.
+        if !fd_fixups.is_empty() {
+            fd_obj_dump("reply", pid, &w.sender_arena, Some(w.sender_pid), w.code, &tdata, &fd_fixups);
+        }
         let delivered = binder_deliver(
             st,
             &w.sender_arena,
@@ -6075,6 +6247,14 @@ fn binder_send_txn(
     }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
     let tdata = binder_translate(st, arena, &owner, &data, &offs, actions, &mut fd_fixups);
+    // 0.9.133: same FD-object photograph on the
+    // transaction path (telemetry only; see
+    // fd_obj_dump). The receiving thread is chosen
+    // inside delivery, so the recipient here is the
+    // owner arena alone.
+    if !fd_fixups.is_empty() {
+        fd_obj_dump("txn", pid, &owner, None, code, &tdata, &fd_fixups);
+    }
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
         &fd_fixups,
@@ -7247,7 +7427,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     st.write_audit.retain(|r| r.arena != arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -7263,7 +7443,9 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.shield4_cookie,
             st.shield4_libc,
             st.shield4_stack,
-            st.shield4_other
+            st.shield4_other,
+            st.second_reads,
+            st.second_read_differs
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
@@ -10572,6 +10754,27 @@ fn tracer_loop(ctx: TracerCtx) {
                 // of reconstructed from the whole log.
                 if sig == 11 && (DVMABORT_PC_LO..DVMABORT_PC_HI).contains(&pc) {
                     let logs = coord.ignition_dump(pid, "dvmabort");
+                    replay_logs(logs);
+                }
+                // 0.9.133 ignition forensics, trigger C:
+                // a SIGILL death gets the same evidence
+                // ring treatment. The .132 run's T8 was
+                // a new species: an SS thread mprotect'd
+                // an image-data page EXEC and jumped
+                // into it, and the fatal signal killed
+                // system_server outright in ~9.8K lines
+                // -- the fastest tenure death on record,
+                // with no wedge and no crash report to
+                // anchor on, and its cause (Dalvik JIT
+                // cache incompatibility vs a (c)-family
+                // corrupted function pointer) undecidable
+                // from what was captured. n=1: capture
+                // first, fix later (s9-132-verify Q4).
+                // This site only ever runs for guest
+                // tracees, so sig == 4 here is a guest
+                // process's SIGILL by construction.
+                if sig == 4 {
+                    let logs = coord.ignition_dump(pid, "sigill");
                     replay_logs(logs);
                 }
                 // 0.9.102: dump the tracee's binder input
