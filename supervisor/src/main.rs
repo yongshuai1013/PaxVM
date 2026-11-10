@@ -8081,6 +8081,25 @@ struct RidePhoto {
     exit_sysno: Option<i32>,
 }
 
+/// 0.9.139 (s9-138-verify Q2/Q5): is the 4-byte word at
+/// `addr` in the tracee an svc instruction? The rewind
+/// landing is only released once this proves the tracee
+/// will re-execute an svc there. A32 form: bits 27..24
+/// are 1111 (the SWI/SVC encoding space, any cond/imm).
+/// A64 form: SVC is 1101 0100 000 imm16 00001.
+fn svc_anchor_ok(pid: i32, compat: bool, addr: u64) -> bool {
+    let mut b = [0u8; 4];
+    if read_mem(pid, addr, &mut b) != Ok(4) {
+        return false;
+    }
+    let w = u32::from_le_bytes(b);
+    if compat {
+        w & 0x0F00_0000 == 0x0F00_0000
+    } else {
+        w & 0xFFE0_001F == 0xD400_0001
+    }
+}
+
 /// Run one syscall inside a tracee stopped at a syscall
 /// stop and return its result (or a negative value). The
 /// first ride uses the stop we are already sitting on;
@@ -8098,7 +8117,28 @@ fn inject_syscall(
     mut photo: Option<&mut RidePhoto>,
 ) -> i64 {
     if rewind {
-        regs.set_pc(entry_pc);
+        // 0.9.139 (s9-138-verify Q2/Q5): entry_pc comes
+        // from the parked syscall-entry stop, whose pc
+        // has already advanced PAST the svc (svc+4 -- the
+        // exception link register semantics on both
+        // personalities). Rewinding to entry_pc itself
+        // therefore never re-executed the svc: the tracee
+        // ran its stub epilogue on the injected args, then
+        // its own clock_gettime/writev, and the ride's
+        // two-stop budget harvested those (13/13 in the
+        // .138 photographs). Land on the svc itself
+        // (entry_pc - 4) and prove the landing before
+        // releasing: if the word there is not an svc
+        // encoding, fail this obtain honestly instead of
+        // releasing the tracee into the wrong instruction.
+        let landing = entry_pc.saturating_sub(4);
+        if !svc_anchor_ok(pid, compat, landing) {
+            sup!(
+                "binder: fd injection rewind-anchor-bad pid={pid} nr={nr} entry_pc=0x{entry_pc:x} landing=0x{landing:x}; obtain aborted"
+            );
+            return -1;
+        }
+        regs.set_pc(landing);
     }
     regs.set_nr(nr);
     for (i, a) in args.iter().enumerate() {
@@ -8143,17 +8183,67 @@ fn inject_syscall(
                 // entry stop. The kernel has loaded the
                 // dispatch number by now; read both
                 // sources before continuing past it.
+                let entry_sysno = get_syscallno(pid);
                 if let Some(ph) = photo.as_mut() {
                     if let Some(r) = get_regs(pid, compat) {
                         ph.entry_r7 = Some(r.nr());
                     }
-                    ph.entry_sysno = get_syscallno(pid);
+                    ph.entry_sysno = entry_sysno;
+                }
+                // 0.9.139 guardrail (s9-138-verify Q5):
+                // if the number loaded at this entry stop
+                // provably is not the one this ride
+                // injected, the stops ahead belong to a
+                // guest syscall, not to our call -- fail
+                // the obtain here rather than harvesting
+                // its exit as our candidate. (An unreadable
+                // syscallno proves nothing and keeps the
+                // pre-.139 path.)
+                if let Some(n) = entry_sysno {
+                    if n != nr as i32 {
+                        sup!(
+                            "binder: fd injection ride-entry-mismatch pid={pid} nr={nr} entry_sysno={n}; obtain aborted"
+                        );
+                        return -1;
+                    }
                 }
                 cont_syscall(pid, 0);
             }
             None => return -1,
         }
     }
+}
+
+/// 0.9.139 (s9-137-desk / s9-138-verify Q5): the access
+/// mode to open the sender's fd with, read host-side
+/// from the sender's fdinfo flags (the low two bits are
+/// O_ACCMODE). A real binder driver's delivered fd
+/// shares the sender's struct file, so its direction is
+/// the sender's: the read end of a pipe is read-only,
+/// the write end write-only. Opening everything O_RDWR
+/// (the pre-.139 shape) silently downgrades the
+/// channel-teardown detection (EOF/POLLHUP/EPIPE) that
+/// keys off the delivered end's direction. Falls back
+/// to O_RDWR when the mode cannot be read or is O_RDWR
+/// itself.
+fn sender_fd_open_flags(sender_pid: i32, sender_fd: i32) -> u64 {
+    const O_RDWR: u64 = 2;
+    let Ok(info) = std::fs::read_to_string(format!("/proc/{sender_pid}/fdinfo/{sender_fd}"))
+    else {
+        return O_RDWR;
+    };
+    for line in info.lines() {
+        if let Some(v) = line.strip_prefix("flags:") {
+            if let Ok(flags) = u64::from_str_radix(v.trim(), 8) {
+                return match flags & 0o3 {
+                    0 => 0, // O_RDONLY
+                    1 => 1, // O_WRONLY
+                    _ => O_RDWR,
+                };
+            }
+        }
+    }
+    O_RDWR
 }
 
 /// inject_syscall specialised to the fixup resolver's
@@ -8167,13 +8257,16 @@ fn inject_openat(
     rewind: bool,
     regs: &mut Regs,
     photo: Option<&mut RidePhoto>,
+    sender_pid: i32,
+    sender_fd: i32,
 ) -> i64 {
     let nr_openat: u64 = if compat { 322 } else { 56 };
+    let flags = sender_fd_open_flags(sender_pid, sender_fd);
     inject_syscall(
         pid,
         compat,
         nr_openat,
-        [(-100i32) as i64 as u64, path_addr, 2, 0], // AT_FDCWD, path, O_RDWR, mode
+        [(-100i32) as i64 as u64, path_addr, flags, 0], // AT_FDCWD, path, flags, mode
         entry_pc,
         rewind,
         regs,
@@ -8583,7 +8676,17 @@ fn resolve_fd_fixups_core(
                 let r = match scratch_write(pid, &mut cursor, &path) {
                     Some(addr) => {
                         rode = true;
-                        inject_openat(pid, compat, addr, entry_pc, rw, &mut *regs, Some(&mut photo))
+                        inject_openat(
+                            pid,
+                            compat,
+                            addr,
+                            entry_pc,
+                            rw,
+                            &mut *regs,
+                            Some(&mut photo),
+                            fx.sender_pid,
+                            fx.sender_fd,
+                        )
                     }
                     None => -1,
                 };
