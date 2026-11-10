@@ -1166,6 +1166,30 @@ fn set_syscallno(pid: i32, value: i32) -> bool {
     ) == 0
 }
 
+/// 0.9.138: the read mirror of set_syscallno -- pt_regs.syscallno
+/// as the kernel currently holds it for this stopped tracee.
+/// Pure read; exists so the fd ride photograph (see RidePhoto)
+/// can compare what a rewrite intended against what the kernel
+/// will actually dispatch on.
+fn get_syscallno(pid: i32) -> Option<i32> {
+    let mut v: i32 = -2;
+    let mut iov = libc::iovec {
+        iov_base: &mut v as *mut i32 as *mut libc::c_void,
+        iov_len: std::mem::size_of::<i32>(),
+    };
+    if ptrace4(
+        PTRACE_GETREGSET,
+        pid,
+        NT_ARM_SYSTEM_CALL as *mut libc::c_void,
+        &mut iov as *mut libc::iovec as *mut libc::c_void,
+    ) == 0
+    {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 /// Cancel the syscall the guest is about to enter, and force x0 to
 /// `value` at the exit stop (via pend.inject).
 ///
@@ -8032,6 +8056,31 @@ fn wait_one_syscall_stop(pid: i32) -> Option<()> {
     None
 }
 
+/// 0.9.138 (s9-137-desk Q4): one obtain ride's photograph,
+/// filled by inject_syscall at its internal boundaries and
+/// printed by resolve_fd_fixups_core as a single
+/// fd-ride-photo line per ride. Every field is a pure read
+/// taken while the tracee is stopped; nothing here feeds
+/// back into the ride's timing or verdicts. pre_* are read
+/// after the rewrite (set_regs + NT_ARM_SYSTEM_CALL) but
+/// before the first continue; entry_* at a rewind ride's
+/// intermediate entry stop -- the number the kernel
+/// actually loaded for dispatch; exit_* at the harvest
+/// stop alongside the registers inject_syscall returns.
+/// Both nr sources are recorded at each point: the
+/// tracee-visible register (r7 on compat, x8 native) from
+/// NT_PRSTATUS and pt_regs.syscallno from
+/// NT_ARM_SYSTEM_CALL, the field the kernel dispatches on.
+#[derive(Default)]
+struct RidePhoto {
+    pre_r7: Option<u64>,
+    pre_sysno: Option<i32>,
+    entry_r7: Option<u64>,
+    entry_sysno: Option<i32>,
+    exit_r7: Option<u64>,
+    exit_sysno: Option<i32>,
+}
+
 /// Run one syscall inside a tracee stopped at a syscall
 /// stop and return its result (or a negative value). The
 /// first ride uses the stop we are already sitting on;
@@ -8046,6 +8095,7 @@ fn inject_syscall(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
+    mut photo: Option<&mut RidePhoto>,
 ) -> i64 {
     if rewind {
         regs.set_pc(entry_pc);
@@ -8061,6 +8111,15 @@ fn inject_syscall(
         sup!("binder: fd injection NT_ARM_SYSTEM_CALL failed pid={pid}");
         return -1;
     }
+    // 0.9.138: photograph the rewrite before releasing the
+    // tracee -- what both nr sources hold now is what the
+    // kernel was handed.
+    if let Some(ph) = photo.as_mut() {
+        if let Some(r) = get_regs(pid, compat) {
+            ph.pre_r7 = Some(r.nr());
+        }
+        ph.pre_sysno = get_syscallno(pid);
+    }
     cont_syscall(pid, 0);
     let mut stops_needed = if rewind { 2 } else { 1 };
     loop {
@@ -8070,11 +8129,25 @@ fn inject_syscall(
                 if stops_needed == 0 {
                     match get_regs(pid, compat) {
                         Some(r) => {
+                            if let Some(ph) = photo.as_mut() {
+                                ph.exit_r7 = Some(r.nr());
+                                ph.exit_sysno = get_syscallno(pid);
+                            }
                             *regs = r;
                             return r.retval();
                         }
                         None => return -1,
                     }
+                }
+                // 0.9.138: a rewind ride's intermediate
+                // entry stop. The kernel has loaded the
+                // dispatch number by now; read both
+                // sources before continuing past it.
+                if let Some(ph) = photo.as_mut() {
+                    if let Some(r) = get_regs(pid, compat) {
+                        ph.entry_r7 = Some(r.nr());
+                    }
+                    ph.entry_sysno = get_syscallno(pid);
                 }
                 cont_syscall(pid, 0);
             }
@@ -8093,6 +8166,7 @@ fn inject_openat(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
+    photo: Option<&mut RidePhoto>,
 ) -> i64 {
     let nr_openat: u64 = if compat { 322 } else { 56 };
     inject_syscall(
@@ -8103,6 +8177,7 @@ fn inject_openat(
         entry_pc,
         rewind,
         regs,
+        photo,
     )
 }
 
@@ -8129,6 +8204,7 @@ fn inject_dupfd_min(
         entry_pc,
         rewind,
         regs,
+        None,
     )
 }
 
@@ -8143,7 +8219,7 @@ fn inject_close(
     regs: &mut Regs,
 ) -> i64 {
     let nr_close: u64 = if compat { 6 } else { 57 };
-    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs)
+    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs, None)
 }
 
 /// 0.9.134 (s9-133-verify Q2, fix (b)): before a resolved
@@ -8463,7 +8539,7 @@ fn resolve_fd_fixups_core(
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
     let mut res = FdResolution::default();
-    for fx in fixups {
+    for (idx, fx) in fixups.iter().enumerate() {
         let cache_key = (arena.to_string(), fx.sender_pid, fx.sender_fd);
         let from_cache = cache.contains_key(&cache_key);
         // Obtain a candidate: the cache's number, or a
@@ -8491,13 +8567,62 @@ fn resolve_fd_fixups_core(
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
+                // 0.9.138 (s9-137-desk Q4): photograph every
+                // obtain ride at its boundaries -- the batch
+                // position of this fixup, the intent, what
+                // the rewrite left in both nr sources before
+                // release, what a rewind ride's entry stop
+                // actually loaded, the harvest-stop values,
+                // and the candidate's identity read host-side
+                // in the same moment as the sender slot's.
+                // Pure reads and prints; the ride itself is
+                // byte-for-byte the pre-.138 one.
+                let rw = res.rides > 0;
+                let mut photo = RidePhoto::default();
+                let mut rode = false;
                 let r = match scratch_write(pid, &mut cursor, &path) {
                     Some(addr) => {
-                        inject_openat(pid, compat, addr, entry_pc, res.rides > 0, &mut *regs)
+                        rode = true;
+                        inject_openat(pid, compat, addr, entry_pc, rw, &mut *regs, Some(&mut photo))
                     }
                     None => -1,
                 };
                 res.rides += 1;
+                if rode {
+                    let ou =
+                        |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string());
+                    let oi =
+                        |o: Option<i32>| o.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string());
+                    let cand_fd = if r >= 0 {
+                        r.to_string()
+                    } else {
+                        "na".to_string()
+                    };
+                    let cand_link = if r >= 0 {
+                        std::fs::read_link(format!("/proc/{pid}/fd/{r}"))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "missing".to_string())
+                    } else {
+                        "na".to_string()
+                    };
+                    let sender_link =
+                        std::fs::read_link(format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "missing".to_string());
+                    sup!(
+                        "binder: fd-ride-photo recv_pid={pid} fixup={idx}/{} attempt={attempt} sender_pid={} sender_fd={} intent_nr={} path={path} rewind={rw} pre_r7={} pre_sysno={} entry_r7={} entry_sysno={} exit_r7={} exit_sysno={} exit_r0={r} cand_fd={cand_fd} cand_link={cand_link} sender_link={sender_link}",
+                        fixups.len(),
+                        fx.sender_pid,
+                        fx.sender_fd,
+                        if compat { 322 } else { 56 },
+                        ou(photo.pre_r7),
+                        oi(photo.pre_sysno),
+                        ou(photo.entry_r7),
+                        oi(photo.entry_sysno),
+                        ou(photo.exit_r7),
+                        oi(photo.exit_sysno)
+                    );
+                }
                 if r >= 0 {
                     candidate = Some(r as i32);
                     break;
