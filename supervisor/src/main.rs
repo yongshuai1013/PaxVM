@@ -2156,6 +2156,114 @@ struct PidEvidence {
     tags: VecDeque<String>,
 }
 
+/// One parcel a serving thread was handed in a read
+/// fill (0.9.135, telemetry only): the guest VA and
+/// size of the transaction parcel exactly as the
+/// fill's BR_TRANSACTION descriptor named them, the
+/// claim sequence the frame took (None for one-way
+/// parcels and claim misses) and the fill it arrived
+/// in. Written by binder_claim_fills beside the claim
+/// push, read only by the reply-source collision
+/// check in binder_handle_txn; never consulted by
+/// any pairing, delivery or judgement decision.
+struct ClaimParcelRec {
+    seq: Option<u64>,
+    fill_id: u64,
+    va: u32,
+    size: usize,
+    code: u32,
+    sender_pid: i32,
+}
+
+/// One large transaction or reply a thread itself
+/// sent (0.9.135, telemetry only): the guest buffer
+/// it was copied from, its size, code and the first
+/// 64 bytes as copied. Written by binder_handle_txn
+/// for every transaction of 256B or more (the house
+/// big-parcel floor), replies included; read only by
+/// the reply-source collision check; never consulted
+/// by any decision.
+struct SendSrcRec {
+    daddr: u32,
+    dsize: usize,
+    code: u32,
+    is_reply: bool,
+    head: Vec<u8>,
+}
+
+/// Per-thread ring caps for the 0.9.135 collision
+/// records (see ClaimParcelRec / SendSrcRec): a
+/// serving thread's nested depth is single digits,
+/// so a handful of entries covers every buffer the
+/// aliasing hypothesis can name; the caps keep the
+/// rings at a few KB per thread worst case.
+const CLAIM_PARCEL_CAP: usize = 16;
+const SEND_SRC_CAP: usize = 8;
+
+/// 0.9.135: file one fill parcel in a reader's
+/// collision ring (see ClaimParcelRec). Pure
+/// bookkeeping; prints nothing.
+fn record_claim_parcel(st: &mut BinderState, pid: i32, rec: ClaimParcelRec) {
+    let ring = st.claim_parcels.entry(pid).or_default();
+    ring.push_back(rec);
+    while ring.len() > CLAIM_PARCEL_CAP {
+        ring.pop_front();
+    }
+}
+
+/// 0.9.135: file one of a thread's own sends in its
+/// collision ring (see SendSrcRec). Pure bookkeeping;
+/// prints nothing.
+fn record_send_src(st: &mut BinderState, pid: i32, rec: SendSrcRec) {
+    let ring = st.send_src.entry(pid).or_default();
+    ring.push_back(rec);
+    while ring.len() > SEND_SRC_CAP {
+        ring.pop_front();
+    }
+}
+
+/// 0.9.135 telemetry helper: byte verdict for two
+/// guest ranges that overlap -- "match" when every
+/// stored-head byte that falls inside the compared
+/// range agrees with the copy in hand, "differ" on
+/// the first disagreement, "na" when the stored head
+/// does not reach the overlap.
+fn overlap_verdict(head: &[u8], head_addr: u32, addr: u32, data: &[u8]) -> &'static str {
+    let h_lo = head_addr as u64;
+    let h_hi = h_lo + head.len() as u64;
+    let d_lo = addr as u64;
+    let d_hi = d_lo + data.len() as u64;
+    let lo = h_lo.max(d_lo);
+    let hi = h_hi.min(d_hi);
+    if lo >= hi {
+        return "na";
+    }
+    let hs = (lo - h_lo) as usize;
+    let ds = (lo - d_lo) as usize;
+    let n = (hi - lo) as usize;
+    if head[hs..hs + n] == data[ds..ds + n] {
+        "match"
+    } else {
+        "differ"
+    }
+}
+
+/// 0.9.135 telemetry helper: byte verdict of a copy
+/// against stored parcel bytes at a data offset --
+/// "match" / "differ" over the comparable span, or
+/// "na" when the offset starts past the stored bytes.
+fn span_verdict(stored: &[u8], off: usize, data: &[u8]) -> &'static str {
+    if off >= stored.len() {
+        return "na";
+    }
+    let n = (stored.len() - off).min(data.len());
+    if stored[off..off + n] == data[..n] {
+        "match"
+    } else {
+        "differ"
+    }
+}
+
 /// One supervisor delivery write into a guest arena,
 /// kept for the 0.9.132 write-overlap audit (telemetry
 /// only): the guest virtual-address interval and total
@@ -2296,6 +2404,28 @@ struct BinderState {
     fd_fixup_failed: u64,
     fd_fixup_dupped: u64,
     fd_fixup_verified: u64,
+    /// 0.9.135: per-thread rings for the reply-source
+    /// collision check (see ClaimParcelRec /
+    /// SendSrcRec) and its counters. Telemetry only,
+    /// like the evidence rings: a thread's rings die
+    /// with it in binder_thread_exit, and the counters
+    /// are global like shield4_drops, reported on the
+    /// arena-death free-counters line.
+    claim_parcels: HashMap<i32, VecDeque<ClaimParcelRec>>,
+    send_src: HashMap<i32, VecDeque<SendSrcRec>>,
+    reply_collide_checks: u64,
+    reply_collide_hits: u64,
+    /// 0.9.135: the write-stream batch skeleton of the
+    /// binder_process_stream call currently running
+    /// (command names and total lengths in stream
+    /// order) and the ordinal of the BC_REPLY inside
+    /// it that is being handled; read by the reply-pop
+    /// descriptor dump in binder_handle_txn.
+    /// process_stream is never re-entered, so plain
+    /// fields are safe; both sit empty/zero outside a
+    /// stream walk. Telemetry only.
+    cur_batch_skel: String,
+    cur_batch_reply_ord: usize,
     /// 0.9.128: global claim sequence counter. Every
     /// successful claim in binder_claim_fills takes the
     /// next number and stamps it on the ServingFrame it
@@ -3567,6 +3697,12 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
     // arena death in binder_on_proc_exit; running this
     // first, for every exiting thread including the
     // arena's last, keeps each wait's failure single).
+    // 0.9.135: the thread's collision-check rings die
+    // with it, like its serving stack below -- a
+    // recycled pid must never collide against a dead
+    // thread's parcels.
+    st.claim_parcels.remove(&pid);
+    st.send_src.remove(&pid);
     if let Some(stack) = st.serving.remove(&pid) {
         // 0.9.130: groups oldest-first, frames in claim
         // order -- the flat stack's iteration order, so
@@ -5377,6 +5513,52 @@ fn binder_maybe_wake_pids(st: &BinderState, arena: &str, wakes: &mut Vec<i32>) {
 /// it was read_mem_vec; since S1b it is the reverse
 /// read channel to the tracer (see binder_write_read).
 #[allow(clippy::too_many_arguments)]
+/// 0.9.135 telemetry: the command skeleton of one
+/// guest write stream -- each BC command's short name
+/// and total length in stream order, e.g.
+/// "REPLY(44) FREE_BUFFER(8)". Walks with exactly the
+/// advance rules binder_process_stream uses and stops
+/// where it would stop: an unknown command ends the
+/// skeleton (its length is unknowable) and a
+/// truncated tail is marked. Names and lengths only;
+/// reads nothing out of the guest, decides nothing.
+fn batch_skeleton(stream: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = 0usize;
+    while cur + 4 <= stream.len() {
+        let cmd = u32_at(stream, cur);
+        let (name, adv): (&str, usize) = match cmd {
+            BC_ENTER_LOOPER => ("ENTER_LOOPER", 4),
+            BC_REGISTER_LOOPER => ("REGISTER_LOOPER", 4),
+            BC_EXIT_LOOPER => ("EXIT_LOOPER", 4),
+            BC_FREE_BUFFER => ("FREE_BUFFER", 8),
+            BC_INCREFS => ("INCREFS", 8),
+            BC_ACQUIRE => ("ACQUIRE", 8),
+            BC_RELEASE => ("RELEASE", 8),
+            BC_DECREFS => ("DECREFS", 8),
+            BC_INCREFS_DONE => ("INCREFS_DONE", 12),
+            BC_ACQUIRE_DONE => ("ACQUIRE_DONE", 12),
+            BC_ATTEMPT_ACQUIRE => ("ATTEMPT_ACQUIRE", 12),
+            BC_REQUEST_DEATH_NOTIFICATION => ("REQ_DEATH", 12),
+            BC_CLEAR_DEATH_NOTIFICATION => ("CLEAR_DEATH", 12),
+            BC_DEAD_BINDER_DONE => ("DEAD_BINDER_DONE", 8),
+            BC_TRANSACTION => ("TRANSACTION", 44),
+            BC_REPLY => ("REPLY", 44),
+            other => {
+                parts.push(format!("UNKNOWN(0x{other:08x})"));
+                return parts.join(" ");
+            }
+        };
+        if cur + adv > stream.len() {
+            parts.push(format!("{name}(trunc)"));
+            return parts.join(" ");
+        }
+        parts.push(format!("{name}({adv})"));
+        cur += adv;
+    }
+    parts.join(" ")
+}
+
 fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -5387,6 +5569,15 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     actions: &mut Vec<BAction>,
     notes: &mut Vec<String>,
 ) {
+    // 0.9.135 telemetry: photograph this write batch's
+    // command skeleton for the reply-pop descriptor
+    // dump (see BinderState::cur_batch_skel). The walk
+    // below is untouched; the skeleton is cleared on
+    // the way out so no later path can quote a stale
+    // batch.
+    st.cur_batch_skel = batch_skeleton(stream);
+    st.cur_batch_reply_ord = 0;
+    let mut reply_ord = 0usize;
     let mut cur = 0usize;
     while cur + 4 <= stream.len() {
         let cmd = u32_at(stream, cur);
@@ -5539,6 +5730,13 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 }
                 let txn: Vec<u8> = stream[cur..cur + 40].to_vec();
                 cur += 40;
+                // 0.9.135 telemetry: name this reply's
+                // ordinal inside its batch for the
+                // descriptor dump (see batch_skeleton).
+                if cmd == BC_REPLY {
+                    st.cur_batch_reply_ord = reply_ord;
+                    reply_ord += 1;
+                }
                 binder_handle_txn(pid, arena, cmd == BC_REPLY, &txn, st, veuid, rd, actions, notes);
             }
             other => {
@@ -5547,6 +5745,10 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             }
         }
     }
+    // 0.9.135: the batch photograph is spent with the
+    // walk (see the note at the top of this function).
+    st.cur_batch_skel.clear();
+    st.cur_batch_reply_ord = 0;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5870,6 +6072,135 @@ fn write_audit_check(
     );
 }
 
+/// 0.9.135 reply-source collision check (telemetry
+/// only; see s9-135-desk Q2): at a claimed reply pop,
+/// collide the replier descriptor's source range
+/// [daddr, daddr+size) against every parcel record
+/// this supervisor keeps for the replier's own
+/// address space:
+///
+/// (A) the parcels fills handed THIS thread
+///     (ClaimParcelRec ring) -- a hit names the claim
+///     the buffer belongs to: rel=self (the very call
+///     being answered), rel=newer (a parcel claimed
+///     after it -- the nested call's next parcel,
+///     the aliasing hypothesis' exact prediction),
+///     rel=older (a stale buffer recycled), or an
+///     unclaimed one-way parcel;
+/// (B) the parcels THIS thread itself sent earlier
+///     (SendSrcRec ring), with a byte verdict against
+///     the head as copied then: match means the
+///     buffer still holds that send's bytes verbatim;
+/// (C) the supervisor's own delivery writes into the
+///     replier's arena (the write-audit table), with
+///     a head verdict in the audit's own style;
+/// (D) the replier arena's ignition evidence big
+///     parcels (0.9.131), their window interval
+///     derived from the arena slot under the replier
+///     thread's registered base, BR_TRANSACTION +
+///     descriptor (44B) ahead of the stored data.
+///
+/// Every hit prints one line; a miss prints nothing
+/// and only moves the settlement counters
+/// (reply_collide_checks / reply_collide_hits on the
+/// arena-death free-counters line). The check reads
+/// records and the copied bytes; it feeds no
+/// judgement, pairing or delivery decision.
+fn reply_source_collide(
+    st: &mut BinderState,
+    arena: &str,
+    pid: i32,
+    claim_seq: u64,
+    daddr: u32,
+    data: &[u8],
+) {
+    st.reply_collide_checks += 1;
+    let lo = daddr as u64;
+    let hi = lo + data.len() as u64;
+    let mut lines: Vec<String> = Vec::new();
+    // (A) parcels this thread was handed in fills.
+    if let Some(ring) = st.claim_parcels.get(&pid) {
+        for rec in ring.iter() {
+            let rlo = rec.va as u64;
+            let rhi = rlo + rec.size as u64;
+            if lo < rhi && rlo < hi {
+                let rel = match rec.seq {
+                    Some(s) if s == claim_seq => "self",
+                    Some(s) if s > claim_seq => "newer",
+                    Some(_) => "older",
+                    None => "unclaimed",
+                };
+                let seq_s = match rec.seq {
+                    Some(s) => s.to_string(),
+                    None => "-".to_string(),
+                };
+                lines.push(format!(
+                    "claim-parcel seq={seq_s} fill={} va=0x{:x} size={} code={} sender={} rel={rel}",
+                    rec.fill_id, rec.va, rec.size, rec.code, rec.sender_pid
+                ));
+            }
+        }
+    }
+    // (B) this thread's own earlier sends.
+    if let Some(ring) = st.send_src.get(&pid) {
+        for rec in ring.iter() {
+            let rlo = rec.daddr as u64;
+            let rhi = rlo + rec.dsize as u64;
+            if lo < rhi && rlo < hi {
+                let verdict = overlap_verdict(&rec.head, rec.daddr, daddr, data);
+                lines.push(format!(
+                    "own-send daddr=0x{:x} size={} code={} reply={} bytes={verdict}",
+                    rec.daddr, rec.dsize, rec.code, rec.is_reply
+                ));
+            }
+        }
+    }
+    // (C) supervisor delivery writes into this arena.
+    for rec in st.write_audit.iter().filter(|r| r.arena == arena) {
+        let rlo = rec.va;
+        let rhi = rlo + rec.len as u64;
+        if lo < rhi && rlo < hi {
+            let verdict = overlap_verdict(&rec.head, rec.va as u32, daddr, data);
+            lines.push(format!(
+                "delivery-write va=0x{:x} len={} head={verdict}",
+                rec.va, rec.len
+            ));
+        }
+    }
+    // (D) the arena's ignition evidence big parcels.
+    let base = st
+        .procs
+        .get(arena)
+        .and_then(|bp| bp.base.get(&pid))
+        .copied();
+    if let (Some(base), Some(ev)) = (base, st.evidence.get(arena)) {
+        for rec in ev.big.iter() {
+            let img_lo = base as u64 + rec.slot as u64;
+            let img_hi = img_lo + 44 + rec.full_size as u64;
+            if lo < img_hi && img_lo < hi {
+                let verdict = if lo >= img_lo + 44 {
+                    span_verdict(&rec.bytes, (lo - (img_lo + 44)) as usize, data)
+                } else {
+                    "na"
+                };
+                lines.push(format!(
+                    "evidence-big sender={} code={} size={} slot={} bytes={verdict}",
+                    rec.sender_pid, rec.code, rec.full_size, rec.slot
+                ));
+            }
+        }
+    }
+    if !lines.is_empty() {
+        st.reply_collide_hits += 1;
+        for m in lines {
+            bsup!(
+                "binder: reply source collide seq={claim_seq} replier={pid} daddr=0x{daddr:x} size={} matches={m}",
+                data.len()
+            );
+        }
+    }
+}
+
 fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -5902,6 +6233,26 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     } else {
         Vec::new()
     };
+    // 0.9.135 telemetry: file a large outgoing
+    // transaction in the sender's collision ring (see
+    // SendSrcRec) -- the buffer it was copied from is
+    // one of the addresses a later reply descriptor of
+    // the same thread can alias. Replies file
+    // themselves at their pop instead, so a pop never
+    // collides with its own record. Bookkeeping only.
+    if !is_reply && dsize >= 256 {
+        record_send_src(
+            st,
+            pid,
+            SendSrcRec {
+                daddr,
+                dsize,
+                code,
+                is_reply: false,
+                head: data[..data.len().min(64)].to_vec(),
+            },
+        );
+    }
     if !offs.is_empty() {
         bsup!(
             "binder: raw txn pid={pid} arena={arena} reply={is_reply} code={code} slots{}",
@@ -6091,6 +6442,89 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             arena,
             format!("pop seq={claim_seq} size={} first=0x{first_word:x}", data.len()),
         );
+        // 0.9.135 telemetry: the pop's full descriptor
+        // photograph -- the replier's own transaction
+        // descriptor exactly as read at the BC_REPLY
+        // stop (source and offsets ranges, plus the
+        // descriptor's own target/code/cookie words),
+        // beside the claimed wait's identity and the
+        // write batch this reply arrived in (skeleton
+        // and this reply's ordinal inside it). The
+        // .133/.134 add-reply family (s9-135-desk Q2)
+        // claims clean and delivers a foreign parcel;
+        // separating replier-side buffer aliasing from
+        // the remaining candidates starts with naming
+        // the buffer the descriptor actually pointed
+        // at and the batch it rode in on. Log only.
+        bsup!(
+            "binder: reply-pop desc claim_seq={claim_seq} fill_id={claimed_fill} replier={pid} arena={arena} waiter={} waiter_arena={} handle={} code={} txn_target={target} txn_code={code} txn_cookie=0x{cookie:x} flags=0x{flags:x} daddr=0x{daddr:x} dsize={dsize} oaddr=0x{oaddr:x} osize={osize} batch_reply={} batch=[{}]",
+            w.sender_pid,
+            w.sender_arena,
+            w.target_handle,
+            w.code,
+            st.cur_batch_reply_ord,
+            st.cur_batch_skel
+        );
+        // 0.9.135 telemetry: for the slots the foreign
+        // family haunts (handle 10, the add codes
+        // 1/3/8), widen the head photograph from the
+        // house 32B to the first 128B, hex with a
+        // printable column: the family's 49-char
+        // String16 sits past the old window, and the
+        // parcel's true owner is named by its
+        // interface token and head fields. Fires on
+        // the raw copy, before any shield judgement,
+        // for every claimed pop in the subset. Log
+        // only.
+        if w.target_handle == 10 && matches!(w.code, 1 | 3 | 8) {
+            let show = data.len().min(128);
+            bsup!(
+                "binder: reply-head128 claim_seq={claim_seq} replier={pid} waiter={} handle={} code={} size={} shown={show}",
+                w.sender_pid, w.target_handle, w.code, data.len()
+            );
+            for (ci, chunk) in data[..show].chunks(32).enumerate() {
+                let hexs: Vec<String> =
+                    chunk.iter().map(|b| format!("{b:02x}")).collect();
+                let asc: String = chunk
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                bsup!(
+                    "binder: reply-head128 +{:3} {} |{}|",
+                    ci * 32,
+                    hexs.join(" "),
+                    asc
+                );
+            }
+        }
+        // 0.9.135 telemetry: collide the descriptor's
+        // source range against this thread's own
+        // parcel records (see reply_source_collide) --
+        // then file this reply itself as one of the
+        // thread's send sources, in that order, so a
+        // pop never collides with its own record.
+        if data.len() >= 4 {
+            reply_source_collide(st, arena, pid, claim_seq, daddr, &data);
+        }
+        if dsize >= 256 {
+            record_send_src(
+                st,
+                pid,
+                SendSrcRec {
+                    daddr,
+                    dsize,
+                    code,
+                    is_reply: true,
+                    head: data[..data.len().min(64)].to_vec(),
+                },
+            );
+        }
         // 0.9.129 c1/c2 separation, first half (telemetry
         // only): for large replies, name the guest
         // address the data was copied from. The re-read
@@ -6848,6 +7282,12 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             let code = u32_at(bytes, i + 12);
             let flags = u32_at(bytes, i + 16);
             let sender_pid = u32_at(bytes, i + 20) as i32;
+            // 0.9.135 telemetry: where the fill's own
+            // descriptor says this parcel sits in the
+            // reader's address space, and how large --
+            // kept for the collision ring record below.
+            let pva = u32_at(bytes, i + 36);
+            let psz = u32_at(bytes, i + 28) as usize;
             let mut frame = ServingFrame::Other;
             // 0.9.128 telemetry: the claimed wait's key
             // scalars and its frame's claim sequence
@@ -6973,6 +7413,10 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // not be separated (s9-127-big-reply Q5).
             // Log only; the push above is the last state
             // change in this iteration either way.
+            // 0.9.135: the claim sequence this parcel
+            // took, copied before the dump below moves
+            // the key (for the collision ring record).
+            let claimed_seq = claimed_key.as_ref().map(|k| k.0);
             if let Some((seq, wsender, wsarena, kptr, kcookie, wcode, whandle)) = claimed_key {
                 bsup!(
                     "binder: claim dump claim_seq={seq} fill_id={fid} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
@@ -6993,6 +7437,25 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                     format!("serve code={wcode} seq={seq} for={wsender}"),
                 );
             }
+            // 0.9.135 telemetry: file the parcel in the
+            // reader's collision ring (see
+            // ClaimParcelRec) -- every transaction the
+            // fill carried, claimed or not, under the
+            // claim identity it took. Prints nothing;
+            // the reply-source collision check reads
+            // the ring back at this thread's reply pops.
+            record_claim_parcel(
+                st,
+                pid,
+                ClaimParcelRec {
+                    seq: claimed_seq,
+                    fill_id: fid,
+                    va: pva,
+                    size: psz,
+                    code,
+                    sender_pid,
+                },
+            );
         }
         i += adv;
     }
@@ -8129,7 +8592,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     st.write_audit.retain(|r| r.arena != arena);
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
-            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={}",
+            "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={} reply_collide_checks={} reply_collide_hits={}",
             bp.free_hit,
             bp.free_nobase,
             bp.free_stale,
@@ -8150,7 +8613,9 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.second_read_differs,
             st.fd_fixup_failed,
             st.fd_fixup_dupped,
-            st.fd_fixup_verified
+            st.fd_fixup_verified,
+            st.reply_collide_checks,
+            st.reply_collide_hits
         );
     }
     // 0.9.118 death inventory (telemetry only: reads
