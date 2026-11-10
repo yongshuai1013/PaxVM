@@ -1054,6 +1054,20 @@ struct Pending {
     /// stop names the target VMA when the host refuses the
     /// call (0.9.31 telemetry).
     mprot: Option<(u64, u64)>,
+    /// 0.9.140 (s9-140-desk-ignition M1): a futex of the
+    /// WAIT family (WAIT / WAIT_BITSET) seen at this
+    /// call's entry stop: (uaddr, op, val) exactly as the
+    /// guest passed them, op masked to the command bits.
+    /// The record lives in this call's Pending, which is
+    /// exactly the span the thread sits inside the wait,
+    /// so at wedge-snapshot time it names the wait the
+    /// thread is frozen in; the next entry stop's fresh
+    /// Pending replaces it, as with every field here.
+    last_futex: Option<(u32, u32, u32)>,
+    /// 0.9.140 (M1): the same for the WAKE family
+    /// (WAKE / WAKE_BITSET): (uaddr, nr_wake). See
+    /// last_futex.
+    last_wake: Option<(u32, u32)>,
 }
 
 struct ProcState {
@@ -1166,11 +1180,13 @@ fn set_syscallno(pid: i32, value: i32) -> bool {
     ) == 0
 }
 
-/// 0.9.138: the read mirror of set_syscallno -- pt_regs.syscallno
-/// as the kernel currently holds it for this stopped tracee.
-/// Pure read; exists so the fd ride photograph (see RidePhoto)
-/// can compare what a rewrite intended against what the kernel
-/// will actually dispatch on.
+/// The read mirror of set_syscallno -- pt_regs.syscallno
+/// as the kernel currently holds it for this stopped
+/// tracee. Pure read; the 0.9.139 ride-entry guardrail
+/// compares it against the number a rewind ride
+/// injected. (It was the 0.9.138 ride photograph's
+/// second source before that telemetry retired in
+/// 0.9.140, the fd line having closed in .139.)
 fn get_syscallno(pid: i32) -> Option<i32> {
     let mut v: i32 = -2;
     let mut iov = libc::iovec {
@@ -2434,6 +2450,13 @@ struct BinderState {
     /// arrival path as the three counters above.
     fd_fixup_retried: u64,
     fd_fixup_retry_saved: u64,
+    /// 0.9.140: cumulative code-2 transactions whose
+    /// interface token the trigger-A heuristic could
+    /// not extract at all (see binder_send_txn) --
+    /// the trigger's blind-spot account. Global like
+    /// shield_drops; reported at arena death beside
+    /// the free counters.
+    crash_token_miss: u64,
     /// 0.9.135: per-thread rings for the reply-source
     /// collision check (see ClaimParcelRec /
     /// SendSrcRec) and its counters. Telemetry only,
@@ -2680,6 +2703,14 @@ const MSG_REQ_VCRED: u8 = 8;
 // shield-cookie suspect line is the field proof),
 // while a reply carries its logs in order.
 const MSG_REQ_IGNITION_DUMP: u8 = 9;
+// 0.9.140: the tracer asks the coordinator for the
+// wedge chain dump of one system_server arena (see
+// binder_wedge_chain): serving stacks, outstanding
+// waits, park kinds and the provisional verdict. A
+// request/reply for the same reason as 9 -- the dump
+// rides the snapshot instant and the oneway log
+// channel provably loses lines there.
+const MSG_REQ_WEDGE_CHAIN: u8 = 10;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -2715,6 +2746,7 @@ const MSG_PUSH_ADOPT_ACK: u8 = 42;
 const MSG_PUSH_DUMP_STACKS: u8 = 43;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
+const MSG_RESP_WEDGE_CHAIN: u8 = 110;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -3394,6 +3426,30 @@ impl CoordClient {
         let p = self.rpc(MSG_REQ_IGNITION_DUMP, &e.0, MSG_RESP_IGNITION_DUMP);
         let mut d = Dec::new(&p);
         d.logs()
+    }
+
+    /// 0.9.140 wedge forensics (M3 plumbing): ask the
+    /// coordinator for one system_server tenure's
+    /// chain dump (the coordinator owns the binder
+    /// state) and hand the captured lines back for
+    /// in-order replay beside the wedge snapshot,
+    /// exactly like ignition_dump. The solo futex
+    /// waiter the snapshot named (0 when none) rides
+    /// along for the verdict; the reply carries the
+    /// holder the verdict named, for the traces
+    /// harvest (M5). Guest-memory reads the
+    /// coordinator needs on the way (frozen ioctl
+    /// write streams) ride the rpc's reverse channel,
+    /// as with every other decision.
+    fn wedge_chain(&mut self, leader: i32, solo: i32) -> (Vec<(String, String)>, i32) {
+        let mut e = Enc::new();
+        e.i32(leader);
+        e.i32(solo);
+        let p = self.rpc(MSG_REQ_WEDGE_CHAIN, &e.0, MSG_RESP_WEDGE_CHAIN);
+        let mut d = Dec::new(&p);
+        let logs = d.logs();
+        let holder = d.i32();
+        (logs, holder)
     }
 
     fn set_context_mgr(
@@ -4506,6 +4562,84 @@ impl CoordServer {
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 self.send_to(ci, MSG_RESP_IGNITION_DUMP, &e.0);
+            }
+            MSG_REQ_WEDGE_CHAIN => {
+                let leader = d.i32();
+                let solo = d.i32();
+                cap_clear();
+                // Disjoint field borrows, as in the
+                // WRITE_READ arm: the state goes to the
+                // dump, the one connection serves its
+                // reverse reads (the frozen write
+                // streams of the arena's parked threads).
+                let holder = {
+                    let st = &mut self.st;
+                    let conn = &mut self.conns[ci];
+                    use std::os::unix::io::AsRawFd;
+                    let cfd = conn.s.as_raw_fd();
+                    let mut rd = |rpid: i32, addr: u64, len: usize| -> Option<Vec<u8>> {
+                        let mut re = Enc::new();
+                        re.i32(rpid);
+                        re.u64(addr);
+                        re.usize(len);
+                        if !write_msg(&mut conn.s, MSG_REV_READ, &re.0) {
+                            return None;
+                        }
+                        loop {
+                            if let Some((k, p)) = conn.queue.pop_front() {
+                                if k == MSG_REV_READ_RESP {
+                                    return Dec::new(&p).opt_bytes();
+                                }
+                                return None;
+                            }
+                            if conn.dead {
+                                return None;
+                            }
+                            let mut pfd = libc::pollfd {
+                                fd: cfd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let n = unsafe { libc::poll(&mut pfd, 1, -1) };
+                            if n < 0 {
+                                if errno() == libc::EINTR {
+                                    continue;
+                                }
+                                return None;
+                            }
+                            if n == 0 || pfd.revents == 0 {
+                                continue;
+                            }
+                            use std::io::Read;
+                            let mut buf = [0u8; 65536];
+                            match conn.s.read(&mut buf) {
+                                Ok(0) => {
+                                    conn.dead = true;
+                                    return None;
+                                }
+                                Ok(m) => {
+                                    conn.inbuf.extend_from_slice(&buf[..m]);
+                                    extract_frames(
+                                        &mut conn.inbuf,
+                                        &mut conn.queue,
+                                        &mut conn.dead,
+                                    );
+                                }
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => {
+                                    conn.dead = true;
+                                    return None;
+                                }
+                            }
+                        }
+                    };
+                    binder_wedge_chain(st, leader, solo, &mut rd)
+                };
+                let mut e = Enc::new();
+                e.logs(&cap_take());
+                e.i32(holder);
+                self.send_to(ci, MSG_RESP_WEDGE_CHAIN, &e.0);
             }
             MSG_ONEWAY_PARK => {
                 let pid = d.i32();
@@ -6013,6 +6147,329 @@ fn binder_ignition_dump(st: &BinderState, pid: i32, trigger: &str) {
     bsup!("binder: ignition dump end pid={pid}");
 }
 
+/// 0.9.140 (M2): the first outstanding wait one
+/// thread owns as sender, wherever it currently
+/// lives -- the shared per-target queues, or claimed
+/// on a serving thread's stack. Returns (target
+/// arena, code). This is the ground truth a parked
+/// thread's park kind is judged from: a parked
+/// thread with a wait outstanding is waiting for
+/// that wait's reply, not for work.
+fn find_wait_for_sender(st: &BinderState, pid: i32) -> Option<(String, u32)> {
+    for (t_arena, q) in &st.waiters {
+        for w in q {
+            if w.sender_pid == pid {
+                return Some((t_arena.clone(), w.code));
+            }
+        }
+    }
+    for stack in st.serving.values() {
+        for g in &stack.groups {
+            for fr in &g.frames {
+                if let ServingFrame::Reply(w, _) = fr {
+                    if w.sender_pid == pid {
+                        return Some((stack.arena.clone(), w.code));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 0.9.140 (M2): name the first two BC commands of
+/// the write stream a parked thread's frozen ioctl
+/// carried. A transaction that never completes
+/// otherwise leaves no trace in any log -- its write
+/// buffer was consumed at its entry stop and the
+/// completion line never prints -- so the frozen
+/// call's identity (target handle, code) is read
+/// back out of the guest's own buffer while the
+/// thread sits parked. Bounded: the bwr struct plus
+/// at most the first two commands' span. Decode
+/// advances exactly as batch_skeleton's walk does;
+/// an unknown command ends the decode.
+fn frozen_write_desc<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
+    rd: &mut R,
+    pid: i32,
+    park: &ParkedIoctl,
+) -> String {
+    if park.write_consumed == 0 {
+        return String::new();
+    }
+    let Some(bwr) = rd(pid, park.bwr as u64, 24) else {
+        return "unreadable".to_string();
+    };
+    let ws = u32_at(&bwr, 0) as usize;
+    let wb = u32_at(&bwr, 8);
+    if ws == 0 {
+        return String::new();
+    }
+    let want = ws.min(4 + 44 * 2 + 64);
+    let Some(stream) = rd(pid, wb as u64, want) else {
+        return "unreadable".to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = 0usize;
+    while parts.len() < 2 && cur + 4 <= stream.len() {
+        let cmd = u32_at(&stream, cur);
+        let (name, adv): (&str, usize) = match cmd {
+            BC_ENTER_LOOPER => ("ENTER_LOOPER", 4),
+            BC_REGISTER_LOOPER => ("REGISTER_LOOPER", 4),
+            BC_EXIT_LOOPER => ("EXIT_LOOPER", 4),
+            BC_FREE_BUFFER => ("FREE_BUFFER", 8),
+            BC_INCREFS => ("INCREFS", 8),
+            BC_ACQUIRE => ("ACQUIRE", 8),
+            BC_RELEASE => ("RELEASE", 8),
+            BC_DECREFS => ("DECREFS", 8),
+            BC_INCREFS_DONE => ("INCREFS_DONE", 12),
+            BC_ACQUIRE_DONE => ("ACQUIRE_DONE", 12),
+            BC_ATTEMPT_ACQUIRE => ("ATTEMPT_ACQUIRE", 12),
+            BC_REQUEST_DEATH_NOTIFICATION => ("REQ_DEATH", 12),
+            BC_CLEAR_DEATH_NOTIFICATION => ("CLEAR_DEATH", 12),
+            BC_DEAD_BINDER_DONE => ("DEAD_BINDER_DONE", 8),
+            BC_TRANSACTION => ("TRANSACTION", 44),
+            BC_REPLY => ("REPLY", 44),
+            other => {
+                parts.push(format!("UNKNOWN(0x{other:08x})"));
+                return parts.join(" ");
+            }
+        };
+        if cur + adv > stream.len() {
+            parts.push(format!("{name}(trunc)"));
+            break;
+        }
+        if cmd == BC_TRANSACTION || cmd == BC_REPLY {
+            let target = u32_at(&stream, cur + 4);
+            let code = u32_at(&stream, cur + 12);
+            let flags = u32_at(&stream, cur + 16);
+            parts.push(format!(
+                "{name} code={code} target={target} flags=0x{flags:x}"
+            ));
+        } else {
+            parts.push(name.to_string());
+        }
+        cur += adv;
+    }
+    parts.join(" ")
+}
+
+/// 0.9.140 (s9-140-desk-ignition M2/M3/M6): the
+/// wedge chain dump for one system_server arena,
+/// assembled coordinator-side at the tracer's
+/// request (see MSG_REQ_WEDGE_CHAIN) in the wedge
+/// snapshot's instant, and carried back over the
+/// reply for in-order replay. Everything printed is
+/// a read of existing BinderState tables -- serving
+/// stacks, the waiters queues, the parked table --
+/// plus, per parked thread of the arena, the frozen
+/// write decode above. Nothing here feeds any
+/// pairing, delivery, shield or settlement decision.
+/// Returns the holder the provisional verdict (M6)
+/// named, 0 when it named none; the tracer keeps it
+/// for the traces harvest (M5).
+fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
+    st: &BinderState,
+    leader: i32,
+    solo: i32,
+    rd: &mut R,
+) -> i32 {
+    let Some(arena) = st.thread_arena.get(&leader).cloned() else {
+        bsup!(
+            "binder: wedge-chain leader={leader} arena=- (leader holds no binder arena)"
+        );
+        bsup!(
+            "binder: wedge-verdict arena=- class=unknown holder=- basis=none (provisional)"
+        );
+        return 0;
+    };
+    // (a) Serving stacks of this arena: every frame
+    // the arena's threads are serving, in stack
+    // order. A code-2 frame sitting unreplied on a
+    // stack names the crash report's holder.
+    let mut stack_pids: Vec<i32> = st
+        .serving
+        .iter()
+        .filter(|(_, s)| s.arena == arena)
+        .map(|(p, _)| *p)
+        .collect();
+    stack_pids.sort_unstable();
+    let mut crash_frame_holder: Option<i32> = None;
+    for tpid in &stack_pids {
+        let stack = &st.serving[tpid];
+        let mut parts: Vec<String> = Vec::new();
+        for g in &stack.groups {
+            for fr in &g.frames {
+                match fr {
+                    ServingFrame::Reply(w, _) => {
+                        parts.push(format!("({},{})", w.sender_pid, w.code));
+                        if w.code == 2 {
+                            crash_frame_holder = Some(*tpid);
+                        }
+                    }
+                    ServingFrame::Other => parts.push("(-,oneway)".to_string()),
+                }
+            }
+        }
+        bsup!(
+            "binder: wedge-serving arena={arena} pid={tpid} depth={} stack=[{}]",
+            stack.depth(),
+            parts.join(",")
+        );
+    }
+    // (b) Outstanding waits, both directions. A wait
+    // lives in exactly one of two places: the shared
+    // queue of its target arena (delivered, not yet
+    // claimed by a serving thread) or, once claimed,
+    // as a Reply frame on the serving thread's stack.
+    // Out-waits are this arena's threads as senders;
+    // in-waits are the waits addressed to this arena
+    // (who is queued behind the wedge). For an
+    // unclaimed out-wait the peer cell is read off
+    // the target arena's parcel table: the parcel is
+    // either there (received, unclaimed) or not
+    // (never landed).
+    let mut out_waits: Vec<(i32, String, u32, String, String)> = Vec::new();
+    let mut in_waits: Vec<(i32, String, u32, String)> = Vec::new();
+    for (t_arena, q) in &st.waiters {
+        for w in q {
+            if w.sender_arena == arena {
+                let peer = match st.procs.get(t_arena) {
+                    Some(bp) if bp
+                        .parcels
+                        .values()
+                        .any(|pp| pp.from_pid == w.sender_pid && pp.code == w.code) =>
+                    {
+                        "received-unclaimed"
+                    }
+                    _ => "not-received",
+                };
+                out_waits.push((
+                    w.sender_pid,
+                    t_arena.clone(),
+                    w.code,
+                    "queued".to_string(),
+                    peer.to_string(),
+                ));
+            }
+            if *t_arena == arena {
+                in_waits.push((
+                    w.sender_pid,
+                    w.sender_arena.clone(),
+                    w.code,
+                    "queued".to_string(),
+                ));
+            }
+        }
+    }
+    for (tpid, stack) in &st.serving {
+        for g in &stack.groups {
+            for fr in &g.frames {
+                let ServingFrame::Reply(w, seq) = fr else {
+                    continue;
+                };
+                if w.sender_arena == arena {
+                    out_waits.push((
+                        w.sender_pid,
+                        stack.arena.clone(),
+                        w.code,
+                        format!("claimed serving_pid={tpid} claim_seq={seq}"),
+                        "serving".to_string(),
+                    ));
+                }
+                if stack.arena == arena {
+                    in_waits.push((
+                        w.sender_pid,
+                        w.sender_arena.clone(),
+                        w.code,
+                        format!("claimed serving_pid={tpid} claim_seq={seq}"),
+                    ));
+                }
+            }
+        }
+    }
+    out_waits.sort();
+    in_waits.sort();
+    for (from, t_arena, code, state, peer) in &out_waits {
+        bsup!(
+            "binder: wedge-waits arena={arena} dir=out from={from} target_arena={t_arena} code={code} state={state} peer={peer}"
+        );
+    }
+    for (from, s_arena, code, state) in &in_waits {
+        bsup!(
+            "binder: wedge-waits arena={arena} dir=in from={from} sender_arena={s_arena} code={code} state={state}"
+        );
+    }
+    // (M2) Park kinds for this arena's parked
+    // threads: idle awaiting-work versus frozen
+    // mid-call, judged from the wait tables above,
+    // with the frozen call named from its own write
+    // stream.
+    let mut park_pids: Vec<i32> = st
+        .parked
+        .keys()
+        .copied()
+        .filter(|p| st.thread_arena.get(p) == Some(&arena))
+        .collect();
+    park_pids.sort_unstable();
+    for ppid in &park_pids {
+        let park = &st.parked[ppid];
+        let (kind, t_arena_s, code_s) = match find_wait_for_sender(st, *ppid) {
+            Some((t, c)) => ("wait-reply", t, c.to_string()),
+            None => ("idle", "-".to_string(), "-".to_string()),
+        };
+        let frozen = frozen_write_desc(rd, *ppid, park);
+        bsup!(
+            "binder: wedge-park arena={arena} pid={ppid} park_kind={kind} target_arena={t_arena_s} code={code_s} frozen_write=[{frozen}]"
+        );
+    }
+    // (M6) The provisional verdict. Field forensics
+    // re-judge every tenure against the decision
+    // rules in s9-140-desk-ignition section 5.1;
+    // this line is a grep entry point, not a ruling.
+    // The B family splits by the waiting thread (the
+    // leader itself, or a binder thread) -- B versus
+    // B' (a wait on an app arena) is read off the
+    // target_arena the waits lines above print, not
+    // guessed here.
+    let (class, holder, basis): (&str, i32, &str) =
+        if let Some(h) = crash_frame_holder {
+            (if h == leader { "A1" } else { "A2" }, h, "report+stack")
+        } else if in_waits.iter().any(|w| w.2 == 2) {
+            // A crash report delivered but never
+            // claimed: the report exists (the waits
+            // lines prove it) but no stack frame names
+            // its holder; the solo futex waiter is the
+            // only holder candidate in evidence.
+            if solo > 0 {
+                (
+                    if solo == leader { "A1" } else { "A2" },
+                    solo,
+                    "futex-solo",
+                )
+            } else {
+                ("unknown", 0, "none")
+            }
+        } else if let Some(w) =
+            out_waits.iter().find(|w| w.0 == leader).or(out_waits.first())
+        {
+            (if w.0 == leader { "B" } else { "B2" }, w.0, "wait-target")
+        } else if solo > 0 {
+            ("C", solo, "futex-solo")
+        } else {
+            ("unknown", 0, "none")
+        };
+    bsup!(
+        "binder: wedge-verdict arena={arena} class={class} holder={} basis={basis} (provisional)",
+        if holder > 0 {
+            holder.to_string()
+        } else {
+            "-".to_string()
+        }
+    );
+    holder
+}
+
 /// Cap on the write-overlap audit table (0.9.132):
 /// the most recent delivery writes kept, across all
 /// arenas. Each record costs at most 64 bytes of head
@@ -7066,7 +7523,36 @@ fn binder_send_txn(
         // carry no name registry in this driver, and
         // the token is what the caller itself declared.
         if code == 2 && tok == "android.app.IActivityManager" {
-            binder_ignition_dump(st, pid, "crash-report");
+            // 0.9.140 (M4): the token is demoted to an
+            // annotation on the trigger -- it is the
+            // caller's own declaration, quoted, not the
+            // identity the dump stands on.
+            binder_ignition_dump(st, pid, &format!("crash-report token={tok}"));
+        } else if code == 2 && tok.is_empty() {
+            // 0.9.140 (M4): a code-2 transaction whose
+            // interface token the heuristic above could
+            // not extract at all. If this parcel is a
+            // crash report whose shape defeated the
+            // parse, trigger A missed it, and "no dump"
+            // stops being proof of "no report" -- the
+            // A' blind spot (s9-140-desk-ignition
+            // section 3). Every such transaction is
+            // named and counted into the arena-death
+            // settlement, so a field run can convict or
+            // clear the blind spot from the count. The
+            // trigger widening the spec pairs with this
+            // (code==2 addressed to a system_server
+            // arena firing regardless of token) needs
+            // an SS-arena identity the coordinator does
+            // not hold -- no registry of it exists in
+            // BinderState, and the tracer's candidate
+            // knowledge never crosses -- so it is NOT
+            // implemented in this build; see the 0.9.140
+            // delivery notes.
+            st.crash_token_miss += 1;
+            bsup!(
+                "binder: crash-report-token-miss from pid={pid} code=2 target_arena={owner} (token unparseable; trigger A blind spot)"
+            );
         }
     }
     let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
@@ -8056,31 +8542,6 @@ fn wait_one_syscall_stop(pid: i32) -> Option<()> {
     None
 }
 
-/// 0.9.138 (s9-137-desk Q4): one obtain ride's photograph,
-/// filled by inject_syscall at its internal boundaries and
-/// printed by resolve_fd_fixups_core as a single
-/// fd-ride-photo line per ride. Every field is a pure read
-/// taken while the tracee is stopped; nothing here feeds
-/// back into the ride's timing or verdicts. pre_* are read
-/// after the rewrite (set_regs + NT_ARM_SYSTEM_CALL) but
-/// before the first continue; entry_* at a rewind ride's
-/// intermediate entry stop -- the number the kernel
-/// actually loaded for dispatch; exit_* at the harvest
-/// stop alongside the registers inject_syscall returns.
-/// Both nr sources are recorded at each point: the
-/// tracee-visible register (r7 on compat, x8 native) from
-/// NT_PRSTATUS and pt_regs.syscallno from
-/// NT_ARM_SYSTEM_CALL, the field the kernel dispatches on.
-#[derive(Default)]
-struct RidePhoto {
-    pre_r7: Option<u64>,
-    pre_sysno: Option<i32>,
-    entry_r7: Option<u64>,
-    entry_sysno: Option<i32>,
-    exit_r7: Option<u64>,
-    exit_sysno: Option<i32>,
-}
-
 /// 0.9.139 (s9-138-verify Q2/Q5): is the 4-byte word at
 /// `addr` in the tracee an svc instruction? The rewind
 /// landing is only released once this proves the tracee
@@ -8114,7 +8575,6 @@ fn inject_syscall(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
-    mut photo: Option<&mut RidePhoto>,
 ) -> i64 {
     if rewind {
         // 0.9.139 (s9-138-verify Q2/Q5): entry_pc comes
@@ -8151,15 +8611,6 @@ fn inject_syscall(
         sup!("binder: fd injection NT_ARM_SYSTEM_CALL failed pid={pid}");
         return -1;
     }
-    // 0.9.138: photograph the rewrite before releasing the
-    // tracee -- what both nr sources hold now is what the
-    // kernel was handed.
-    if let Some(ph) = photo.as_mut() {
-        if let Some(r) = get_regs(pid, compat) {
-            ph.pre_r7 = Some(r.nr());
-        }
-        ph.pre_sysno = get_syscallno(pid);
-    }
     cont_syscall(pid, 0);
     let mut stops_needed = if rewind { 2 } else { 1 };
     loop {
@@ -8169,27 +8620,18 @@ fn inject_syscall(
                 if stops_needed == 0 {
                     match get_regs(pid, compat) {
                         Some(r) => {
-                            if let Some(ph) = photo.as_mut() {
-                                ph.exit_r7 = Some(r.nr());
-                                ph.exit_sysno = get_syscallno(pid);
-                            }
                             *regs = r;
                             return r.retval();
                         }
                         None => return -1,
                     }
                 }
-                // 0.9.138: a rewind ride's intermediate
-                // entry stop. The kernel has loaded the
-                // dispatch number by now; read both
-                // sources before continuing past it.
+                // A rewind ride's intermediate entry
+                // stop: the kernel has loaded the
+                // dispatch number by now, and the
+                // guardrail below reads it before
+                // continuing past the stop.
                 let entry_sysno = get_syscallno(pid);
-                if let Some(ph) = photo.as_mut() {
-                    if let Some(r) = get_regs(pid, compat) {
-                        ph.entry_r7 = Some(r.nr());
-                    }
-                    ph.entry_sysno = entry_sysno;
-                }
                 // 0.9.139 guardrail (s9-138-verify Q5):
                 // if the number loaded at this entry stop
                 // provably is not the one this ride
@@ -8256,7 +8698,6 @@ fn inject_openat(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
-    photo: Option<&mut RidePhoto>,
     sender_pid: i32,
     sender_fd: i32,
 ) -> i64 {
@@ -8270,7 +8711,6 @@ fn inject_openat(
         entry_pc,
         rewind,
         regs,
-        photo,
     )
 }
 
@@ -8297,7 +8737,6 @@ fn inject_dupfd_min(
         entry_pc,
         rewind,
         regs,
-        None,
     )
 }
 
@@ -8312,7 +8751,7 @@ fn inject_close(
     regs: &mut Regs,
 ) -> i64 {
     let nr_close: u64 = if compat { 6 } else { 57 };
-    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs, None)
+    inject_syscall(pid, compat, nr_close, [fd as u64, 0, 0, 0], entry_pc, rewind, regs)
 }
 
 /// 0.9.134 (s9-133-verify Q2, fix (b)): before a resolved
@@ -8632,7 +9071,7 @@ fn resolve_fd_fixups_core(
     let entry_pc = regs.pc();
     let mut cursor = regs.sp().saturating_sub(256);
     let mut res = FdResolution::default();
-    for (idx, fx) in fixups.iter().enumerate() {
+    for fx in fixups.iter() {
         let cache_key = (arena.to_string(), fx.sender_pid, fx.sender_fd);
         let from_cache = cache.contains_key(&cache_key);
         // Obtain a candidate: the cache's number, or a
@@ -8660,72 +9099,31 @@ fn resolve_fd_fixups_core(
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                // 0.9.138 (s9-137-desk Q4): photograph every
-                // obtain ride at its boundaries -- the batch
-                // position of this fixup, the intent, what
-                // the rewrite left in both nr sources before
-                // release, what a rewind ride's entry stop
-                // actually loaded, the harvest-stop values,
-                // and the candidate's identity read host-side
-                // in the same moment as the sender slot's.
-                // Pure reads and prints; the ride itself is
-                // byte-for-byte the pre-.138 one.
+                // 0.9.140: the 0.9.138 ride photograph
+                // (fd-ride-photo) retires here -- the fd
+                // line closed in .139 on its evidence
+                // (rewind rides landing on the svc, trio
+                // members writing back, failed=0), and
+                // the settlement counters, the settled
+                // lines and the two guardrail lines
+                // (rewind-anchor-bad, ride-entry-mismatch)
+                // stay on watch. The rides themselves are
+                // byte-for-byte the .139 ones.
                 let rw = res.rides > 0;
-                let mut photo = RidePhoto::default();
-                let mut rode = false;
                 let r = match scratch_write(pid, &mut cursor, &path) {
-                    Some(addr) => {
-                        rode = true;
-                        inject_openat(
-                            pid,
-                            compat,
-                            addr,
-                            entry_pc,
-                            rw,
-                            &mut *regs,
-                            Some(&mut photo),
-                            fx.sender_pid,
-                            fx.sender_fd,
-                        )
-                    }
+                    Some(addr) => inject_openat(
+                        pid,
+                        compat,
+                        addr,
+                        entry_pc,
+                        rw,
+                        &mut *regs,
+                        fx.sender_pid,
+                        fx.sender_fd,
+                    ),
                     None => -1,
                 };
                 res.rides += 1;
-                if rode {
-                    let ou =
-                        |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string());
-                    let oi =
-                        |o: Option<i32>| o.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string());
-                    let cand_fd = if r >= 0 {
-                        r.to_string()
-                    } else {
-                        "na".to_string()
-                    };
-                    let cand_link = if r >= 0 {
-                        std::fs::read_link(format!("/proc/{pid}/fd/{r}"))
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| "missing".to_string())
-                    } else {
-                        "na".to_string()
-                    };
-                    let sender_link =
-                        std::fs::read_link(format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd))
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| "missing".to_string());
-                    sup!(
-                        "binder: fd-ride-photo recv_pid={pid} fixup={idx}/{} attempt={attempt} sender_pid={} sender_fd={} intent_nr={} path={path} rewind={rw} pre_r7={} pre_sysno={} entry_r7={} entry_sysno={} exit_r7={} exit_sysno={} exit_r0={r} cand_fd={cand_fd} cand_link={cand_link} sender_link={sender_link}",
-                        fixups.len(),
-                        fx.sender_pid,
-                        fx.sender_fd,
-                        if compat { 322 } else { 56 },
-                        ou(photo.pre_r7),
-                        oi(photo.pre_sysno),
-                        ou(photo.entry_r7),
-                        oi(photo.entry_sysno),
-                        ou(photo.exit_r7),
-                        oi(photo.exit_sysno)
-                    );
-                }
                 if r >= 0 {
                     candidate = Some(r as i32);
                     break;
@@ -9026,6 +9424,15 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             st.reply_collide_hits
         );
     }
+    // 0.9.140: the trigger-A blind-spot account (see
+    // BinderState::crash_token_miss), reported at the
+    // same settlement on its own line -- the
+    // free-counters format above is byte-stable field
+    // tooling and does not grow new fields.
+    bsup!(
+        "binder: arena {arena} crash-report account: token_miss={}",
+        st.crash_token_miss
+    );
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
     // an arena dies holding a backlog of unfreed parcels,
@@ -10901,6 +11308,7 @@ fn wedge_snapshot(
     trig: i32,
     procs: &HashMap<i32, ProcState>,
     leader: i32,
+    solo_out: &mut Option<i32>,
 ) -> bool {
     // Family membership: the tracer-side parent chain
     // (ProcState.parent, recorded at each birth event)
@@ -10961,6 +11369,10 @@ fn wedge_snapshot(
         "binder: wedge-snapshot arena={leader} threads={}",
         family.len()
     );
+    // 0.9.140 (M1): futex waiter groups by address,
+    // accumulated inside the per-thread loop below
+    // (the loop consumes the family vector).
+    let mut futex_groups: Vec<(u32, Vec<i32>)> = Vec::new();
     for pid in family {
         let p = &procs[&pid];
         // State vocabulary, all from the thread's
@@ -10990,11 +11402,212 @@ fn wedge_snapshot(
             ),
             _ => ("-".to_string(), "running"),
         };
+        // 0.9.140 (M1): the thread's futex face, from
+        // the entry capture in its in-flight Pending
+        // (see Pending::last_futex). Threads not inside
+        // a futex keep the pre-.140 line byte for byte.
+        // A thread inside a WAIT-family futex is also
+        // counted into the snapshot's address groups
+        // below.
+        let mut futex_face = String::new();
+        if let Some(pend) = &p.pending {
+            if let Some((u, op, v)) = pend.last_futex {
+                futex_face.push_str(&format!(
+                    " futex_uaddr=0x{u:x} op={} val={v}",
+                    match op {
+                        0 => "WAIT".to_string(),
+                        9 => "WAIT_BITSET".to_string(),
+                        n => n.to_string(),
+                    }
+                ));
+                match futex_groups.iter_mut().find(|(a, _)| *a == u) {
+                    Some((_, ws)) => ws.push(pid),
+                    None => futex_groups.push((u, vec![pid])),
+                }
+            }
+            if let Some((u, v)) = pend.last_wake {
+                futex_face
+                    .push_str(&format!(" last_wake_uaddr=0x{u:x} last_wake_val={v}"));
+            }
+        }
         sup!(
-            "binder: wedge-thread pid={pid} last_syscall={last_syscall} park={park} last_read_lines_ago=-"
+            "binder: wedge-thread pid={pid} last_syscall={last_syscall} park={park} last_read_lines_ago=-{futex_face}"
         );
     }
+    // 0.9.140 (M1): group the family's in-flight futex
+    // waiters by the address they wait on. A group with
+    // several waiters is the AMS monitor's futex word
+    // (the queue); a solo group's waiter waits on an
+    // object of its own -- in the wedge taxonomy it is
+    // the monitor holder, and naming it here is what
+    // lets the chain dump (M3) and the traces harvest
+    // (M5) point at the same thread. The holder is
+    // only named when exactly one solo group exists:
+    // two private waits would leave it ambiguous.
+    {
+        futex_groups.sort_unstable();
+        let mut solo_groups = 0usize;
+        let mut solo_pid = 0i32;
+        for (u, ws) in &futex_groups {
+            sup!(
+                "binder: wedge-futex arena={leader} uaddr=0x{u:x} waiters=[{}]{}",
+                ws.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                if ws.len() == 1 { " solo" } else { "" }
+            );
+            if ws.len() == 1 {
+                solo_groups += 1;
+                solo_pid = ws[0];
+            }
+        }
+        if solo_groups == 1 {
+            *solo_out = Some(solo_pid);
+        }
+    }
     true
+}
+
+/// 0.9.140 (s9-140-desk-ignition M3): the chain dump
+/// rides the wedge snapshot's one-shot. The snapshot
+/// itself is tracer-side state, but the serving
+/// stacks, the outstanding waits and the park kinds
+/// live in the coordinator's BinderState, so they are
+/// requested over the request/reply channel (the
+/// oneway log channel provably loses lines under
+/// cap_clear at exactly this pressure) and replayed
+/// here, in order, straight after the snapshot lines.
+/// The holder the coordinator's provisional verdict
+/// names is kept for the traces harvest (M5).
+fn fire_wedge_chain(
+    coord: &mut CoordClient,
+    leader: i32,
+    solo: Option<i32>,
+    wedge_leader: &mut Option<i32>,
+    wedge_holder: &mut Option<i32>,
+) {
+    let (logs, holder) = coord.wedge_chain(leader, solo.unwrap_or(0));
+    replay_logs(logs);
+    *wedge_leader = Some(leader);
+    *wedge_holder = if holder > 0 { Some(holder) } else { None };
+}
+
+/// 0.9.140 (s9-140-desk-ignition M5): per-tenure
+/// traces preservation. The guest's /data/anr/
+/// traces.txt only ever holds the LAST tenure's
+/// Watchdog dumps -- the next tenure's first dump
+/// overwrites it -- so a wedged tenure's Java stacks
+/// have to be lifted out of the file between its
+/// death and its successor's birth; that is what
+/// made per-tenure classification a lottery in every
+/// field before this one. Runs tracer-side at the
+/// dead leader's reap: a direct host read of the
+/// rootfs file (no guest cooperation, no binder
+/// channel), printed on the session log's own
+/// immediate-write channel. Only the dead leader's
+/// own (last) section is read; from it, the main
+/// thread's block, the chain dump's named holder's
+/// block, and any block whose text names a wedge
+/// keyword are kept, capped at roughly 200 printed
+/// lines. A file that no longer holds this leader's
+/// section is a miss, printed as one, never papered
+/// over.
+fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
+    let path = format!("{rootfs}/data/anr/traces.txt");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            sup!("binder: wedge-traces-miss arena={leader} why=unreadable ({e})");
+            return;
+        }
+    };
+    // Sections begin "----- pid <pid> at ... -----";
+    // collect their start offsets, then take the LAST
+    // section naming this leader.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut from = 0usize;
+    while let Some(i) = text[from..].find("----- pid ") {
+        starts.push(from + i);
+        from += i + 10;
+    }
+    starts.push(text.len());
+    let mut section: Option<&str> = None;
+    for w in starts.windows(2) {
+        let seg = &text[w[0]..w[1]];
+        let num: String = seg[10..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if num.parse::<i32>() == Ok(leader) {
+            section = Some(seg);
+        }
+    }
+    let Some(section) = section else {
+        sup!(
+            "binder: wedge-traces-miss arena={leader} why=no-section (file holds a later tenure, or the dump never landed)"
+        );
+        return;
+    };
+    // Thread blocks begin at lines starting with '"'
+    // and run to the next block; a block's header
+    // carries its guest tid as tid=<n>. The section's
+    // preamble (header, Cmd line) belongs to no block
+    // and is skipped.
+    let mut blocks: Vec<(i32, String, Vec<&str>)> = Vec::new();
+    for ln in section.lines() {
+        if ln.starts_with('"') {
+            let name = ln[1..].split('"').next().unwrap_or("").to_string();
+            let tid = ln
+                .split("tid=")
+                .nth(1)
+                .map(|s| {
+                    s.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                })
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            blocks.push((tid, name, Vec::new()));
+        }
+        if let Some(b) = blocks.last_mut() {
+            b.2.push(ln);
+        }
+    }
+    let mut printed = 0usize;
+    let mut kept = 0usize;
+    for (tid, name, blines) in &blocks {
+        let body = blines.join("\n");
+        let keep = *tid == leader
+            || (holder > 0 && *tid == holder)
+            || body.contains("AppErrorResult")
+            || body.contains("Surface")
+            || body.contains("createSurfaceLocked");
+        if !keep {
+            continue;
+        }
+        kept += 1;
+        sup!(
+            "binder: wedge-traces arena={leader} pid={tid} name={name} lines={}",
+            blines.len()
+        );
+        for ln in blines {
+            if printed >= 200 {
+                break;
+            }
+            sup!("binder: wedge-traces arena={leader} pid={tid} | {ln}");
+            printed += 1;
+        }
+        if printed >= 200 {
+            sup!("binder: wedge-traces arena={leader} truncated at 200 lines");
+            break;
+        }
+    }
+    if kept == 0 {
+        sup!(
+            "binder: wedge-traces arena={leader} (section found; no main, holder or keyword block in it)"
+        );
+    }
 }
 
 fn tracer_loop(ctx: TracerCtx) {
@@ -11028,6 +11641,12 @@ fn tracer_loop(ctx: TracerCtx) {
     // wedge_snapshot); reset whenever the candidate
     // slot changes hands.
     let mut wedge_snapped = false;
+    // 0.9.140 (M5): the tenure the wedge snapshot last
+    // fired for, and the holder its chain dump (M3)
+    // named; consumed by the traces harvest when that
+    // tenure's leader dies (see wedge_traces_harvest).
+    let mut wedge_leader: Option<i32> = None;
+    let mut wedge_holder: Option<i32> = None;
 
     // ---- main tracing loop over the whole guest tree ----
     // (S2: one loop body for every tracer process. The
@@ -11076,6 +11695,22 @@ fn tracer_loop(ctx: TracerCtx) {
             // zygote tenure's system_server re-earns it
             // at its own birth.
             if dump_candidate == Some(pid) {
+                // 0.9.140 (M5): lift this tenure's Java
+                // stacks out of traces.txt before the
+                // slot changes hands -- the file is only
+                // overwritten by the NEXT tenure's first
+                // ANR dump, so the dead leader's reap is
+                // inside the preservation window by
+                // construction.
+                if wedge_snapped && wedge_leader == Some(pid) {
+                    wedge_traces_harvest(
+                        &rootfs,
+                        pid,
+                        wedge_holder.unwrap_or(0),
+                    );
+                }
+                wedge_leader = None;
+                wedge_holder = None;
                 dump_candidate = None;
                 wedge_snapped = false;
             }
@@ -11191,9 +11826,40 @@ fn tracer_loop(ctx: TracerCtx) {
                     binder_parked: false,
                     mmap_binder: None,
                     mprot: None,
+                    last_futex: None,
+                    last_wake: None,
                 };
                 if proc.compat && nr == 125 {
                     pend.mprot = Some((regs.arg(0), regs.arg(2)));
+                }
+                // 0.9.140 (M1): futex entry capture, at
+                // the same seat the peercred / killfam
+                // argument captures read -- the entry
+                // stop's registers, pure reads, nothing
+                // rewritten (futex passes through this
+                // engine untouched). The WAIT family
+                // keeps (uaddr, op, val), the WAKE family
+                // (uaddr, nr_wake), the op masked with
+                // the futex command mask (0x7f): the
+                // private / clock bits ride above it and
+                // are not part of the command the wedge
+                // snapshot names.
+                if (proc.compat && nr == 240) || (!proc.compat && nr == 98) {
+                    let op = regs.arg(1) as u32 & 0x7f;
+                    match op {
+                        0 | 9 => {
+                            pend.last_futex = Some((
+                                regs.arg(0) as u32,
+                                op,
+                                regs.arg(2) as u32,
+                            ));
+                        }
+                        1 | 10 => {
+                            pend.last_wake =
+                                Some((regs.arg(0) as u32, regs.arg(2) as u32));
+                        }
+                        _ => {}
+                    }
                 }
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -12113,8 +12779,16 @@ fn tracer_loop(ctx: TracerCtx) {
             if let Some(tp) = wedge_kill_target.take() {
                 if !wedge_snapped {
                     if let Some(leader) = dump_candidate {
-                        if wedge_snapshot(tp, &procs, leader) {
+                        let mut solo: Option<i32> = None;
+                        if wedge_snapshot(tp, &procs, leader, &mut solo) {
                             wedge_snapped = true;
+                            fire_wedge_chain(
+                                &mut coord,
+                                leader,
+                                solo,
+                                &mut wedge_leader,
+                                &mut wedge_holder,
+                            );
                         }
                     }
                 }
@@ -12216,6 +12890,10 @@ fn tracer_loop(ctx: TracerCtx) {
                     // A new tenure earns a fresh wedge
                     // snapshot (0.9.122).
                     wedge_snapped = false;
+                    // 0.9.140 (M5): and no chain-dump
+                    // bookkeeping from any earlier one.
+                    wedge_leader = None;
+                    wedge_holder = None;
                 }
             }
             cont_syscall(pid, 0);
@@ -12256,8 +12934,16 @@ fn tracer_loop(ctx: TracerCtx) {
             // before.
             if sig == 3 && !wedge_snapped {
                 if let Some(leader) = dump_candidate {
-                    if wedge_snapshot(pid, &procs, leader) {
+                    let mut solo: Option<i32> = None;
+                    if wedge_snapshot(pid, &procs, leader, &mut solo) {
                         wedge_snapped = true;
+                        fire_wedge_chain(
+                            &mut coord,
+                            leader,
+                            solo,
+                            &mut wedge_leader,
+                            &mut wedge_holder,
+                        );
                     }
                 }
             }
