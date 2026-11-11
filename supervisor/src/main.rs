@@ -3128,6 +3128,64 @@ struct FatalProfRec {
     size: u32,
 }
 
+/// 0.9.150 (s10-arrival-desk section 4.1): one
+/// thread's unconsumed completion-token account --
+/// how many BR_TRANSACTION_COMPLETE tokens have
+/// been queued to the thread (at the send tail in
+/// binder_send_txn, or by binder_reply_complete)
+/// that no fill has carried to it yet, and the
+/// code of its most recent send. While count > 0
+/// the thread sits inside a waitForResponse
+/// window: the one-way completion wait (W1') or
+/// the sendReply wait (W2) -- the two windows the
+/// delivery discipline's three registries never
+/// recorded (.149 field: the crash report claimed
+/// nested inside a one-way send's ride-along fill).
+#[derive(Default, Clone, Copy)]
+struct TcOut {
+    count: u64,
+    last_code: u32,
+}
+
+/// 0.9.150 (s10-arrival-desk section 3.2): the M3
+/// park-registry account, per arena -- every seat
+/// that writes or removes a st.parked registration,
+/// counted by outcome, so a registration that
+/// vanishes names the seat it vanished at. The
+/// desk's rm_reinsert column is the same event as
+/// reins (an empty-fill decision's remove+reinsert
+/// pair), counted once here as reins; the pair is
+/// conservation-neutral. Counts only: nothing
+/// reads this back into the predicate, delivery
+/// or wakes.
+#[derive(Default, Clone, Copy)]
+struct ParkAcct {
+    ins: u64,
+    reins: u64,
+    rm_complete: u64,
+    lost_no_arena: u64,
+    lost_no_bp: u64,
+    rm_msg: u64,
+    rm_exit_ioctl: u64,
+}
+
+/// 0.9.150 (s10-arrival-desk section 3.4):
+/// M4-lite, the per-arena thread life ledger:
+/// looper registrations and unregistrations as
+/// the guest streams them, the two coordinator
+/// reap messages, and the set of thread pids ever
+/// seen registering as loopers (its size is the
+/// settlement line's cumulative `seen`). Counts
+/// only, like ParkAcct.
+#[derive(Default)]
+struct ThreadAcct {
+    seen: HashSet<i32>,
+    reg: u64,
+    unreg: u64,
+    exit_ioctl: u64,
+    reaped: u64,
+}
+
 #[derive(Default)]
 struct BinderState {
     procs: HashMap<String, BinderProc>,
@@ -3485,6 +3543,42 @@ struct BinderState {
     /// carries its leader pid, so one string is one
     /// tenure). Telemetry only.
     ds_noted: HashSet<String>,
+    /// 0.9.150 (s10-arrival-desk section 4.1): the
+    /// predicate's fourth seat, per thread (see
+    /// TcOut). Charged at the two seats that queue
+    /// a completion token to a thread, discharged
+    /// at the two fill seats beside
+    /// settle_fill_answers, cleared at thread exit
+    /// and swept at arena death. Unlike every
+    /// account around it this registry FEEDS the
+    /// predicate (binder_thread_waiting) -- that is
+    /// the fix itself; the counts-only red line
+    /// applies to tc_gated and the M3 accounts
+    /// below, not to this one.
+    tc_out: HashMap<i32, TcOut>,
+    /// 0.9.150 (s10-arrival-desk section 4.1): the
+    /// tc_gated column of the delivery-discipline
+    /// account, per arena: transaction units a gate
+    /// held (the two drain seats) or a landing
+    /// denied and pooled (the land seat) where the
+    /// reader was waiting ONLY by the fourth seat.
+    /// The attribution is decided at the gate
+    /// (ds_drain_counter / ds_land_counter): a unit
+    /// counted here is never also counted in
+    /// ds_suppressed / ds_land_denied. Counts only,
+    /// like the rest of the discipline ledger.
+    tc_gated: HashMap<String, u64>,
+    /// 0.9.150 (s10-arrival-desk section 3): the M3
+    /// park-registry account, per arena (see
+    /// ParkAcct), and the first-occurrence keys of
+    /// its loss lines (arena|seat, section 3.3:
+    /// once per arena per class). Counts only.
+    park_acct: HashMap<String, ParkAcct>,
+    park_lost_noted: HashSet<String>,
+    /// 0.9.150 (s10-arrival-desk section 3.4):
+    /// M4-lite, the per-arena thread life ledger
+    /// (see ThreadAcct). Counts only.
+    thread_acct: HashMap<String, ThreadAcct>,
 }
 
 /// One transaction held for the context manager (see
@@ -3732,6 +3826,57 @@ impl BinderState {
                 }
             }
         }
+    }
+
+    /// 0.9.150 (s10-arrival-desk section 4.1):
+    /// charge one completion token queued to
+    /// thread `pid` -- the predicate's fourth seat
+    /// opens (or deepens) its waitForResponse
+    /// window. Called at exactly the two seats
+    /// that push BR_TRANSACTION_COMPLETE into a
+    /// personal queue: binder_send_txn's tail (any
+    /// send, sync or one-way -- `code` is the sent
+    /// transaction's) and binder_reply_complete
+    /// (code None: a reply opens the replier's W2
+    /// window, and the wait descriptor keeps
+    /// naming its most recent send).
+    fn tc_charge(&mut self, pid: i32, code: Option<u32>) {
+        let e = self.tc_out.entry(pid).or_default();
+        e.count += 1;
+        if let Some(c) = code {
+            e.last_code = c;
+        }
+    }
+    /// 0.9.150 (s10-arrival-desk section 4.1): the
+    /// discharge hinge, twin of settle_fill_
+    /// answers at the same two fill seats: every
+    /// BR_TRANSACTION_COMPLETE a fill carries to
+    /// its reader closes one of the reader's
+    /// windows. Runs after that fill's predicate
+    /// evaluation by construction (the seats call
+    /// it with the assembled fill), so a ride-along
+    /// fill is gated by the very token it carries
+    /// before the token discharges. Saturates at
+    /// zero; an entry that reaches zero is removed.
+    fn tc_settle_fill(&mut self, pid: i32, bytes: &[u8]) {
+        let n = count_br_completes(bytes);
+        if n == 0 {
+            return;
+        }
+        let mut drain = false;
+        if let Some(e) = self.tc_out.get_mut(&pid) {
+            e.count = e.count.saturating_sub(n as u64);
+            drain = e.count == 0;
+        }
+        if drain {
+            self.tc_out.remove(&pid);
+        }
+    }
+    /// The fourth seat's predicate face: thread
+    /// `pid` holds at least one unconsumed
+    /// completion token.
+    fn tc_open(&self, pid: i32) -> bool {
+        self.tc_out.get(&pid).map_or(false, |e| e.count > 0)
     }
 
     /// 0.9.144 (s9-144-desk section 3.1): the
@@ -4673,7 +4818,13 @@ impl CoordClient {
         &mut self,
         leader: i32,
         solo: i32,
-    ) -> (Vec<(String, String)>, i32, Vec<(String, i32)>) {
+    ) -> (
+        Vec<(String, String)>,
+        i32,
+        Vec<(String, i32)>,
+        String,
+        Vec<i32>,
+    ) {
         let mut e = Enc::new();
         e.i32(leader);
         e.i32(solo);
@@ -4692,7 +4843,18 @@ impl CoordClient {
             let p = d.i32();
             servicers.push((a, p));
         }
-        (logs, holder, servicers)
+        // 0.9.150 (s10-arrival-desk section 3.3): the
+        // snapshot arena's name and the coordinator's
+        // parked set for it, appended behind the
+        // servicers -- fire_wedge_chain diffs the set
+        // against this worker's own pend book.
+        let snap_arena = d.string();
+        let m = d.u32();
+        let mut coord_parked = Vec::new();
+        for _ in 0..m {
+            coord_parked.push(d.i32());
+        }
+        (logs, holder, servicers, snap_arena, coord_parked)
     }
 
     /// 0.9.142 (s9-142-desk section 3.2): ask the
@@ -5064,6 +5226,11 @@ fn spawn_coordinator(sock_path: &str) {
 /// the exact order the main loop used to run them in.
 fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
     let a = st.thread_arena.remove(&pid)?;
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // exiting thread's completion-token account
+    // dies with it -- a residue would gate a
+    // recycled pid on a dead life's windows.
+    st.tc_out.remove(&pid);
     if let Some(bp) = st.procs.get_mut(&a) {
         bp.loopers.remove(&pid);
     }
@@ -5410,6 +5577,23 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         return ParkedOutcome::Nothing;
     };
     let Some(arena) = st.thread_arena.get(&pid).cloned() else {
+        // 0.9.150 (s10-arrival-desk section 3.1):
+        // the removed registration is discarded
+        // here -- its owner is gone from
+        // thread_arena, so the M3 account
+        // attributes it by the surviving records
+        // (arena_of_pid_loose); a pid no record
+        // names at all leaves the loss uncounted,
+        // there being no arena to charge it to.
+        if let Some(a) = arena_of_pid_loose(st, pid) {
+            park_lost(
+                st,
+                &a,
+                "complete-no-arena",
+                ParkCounter::LostNoArena,
+                pid,
+            );
+        }
         return ParkedOutcome::Nothing;
     };
     // 0.9.147 (s9-147-desk section 2 R1, parked
@@ -5427,13 +5611,37 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let waiting = binder_thread_waiting(st, pid);
     let (bytes, from_inbound) = if waiting {
         let Some(bp) = st.procs.get_mut(&arena) else {
+            // 0.9.150 (M3): the removed registration
+            // is discarded here too -- the arena is
+            // named but its proc record is gone.
+            park_lost(
+                st,
+                &arena,
+                "complete-no-bp",
+                ParkCounter::LostNoBp,
+                pid,
+            );
             return ParkedOutcome::Nothing;
         };
         let (b, suppressed) = bp.drain_gated_for(pid, park.read_size as usize);
-        ds_count(st, &arena, "drain-parked", pid, DsCounter::Suppressed, suppressed);
+        ds_count(
+            st,
+            &arena,
+            "drain-parked",
+            pid,
+            ds_drain_counter(st, pid),
+            suppressed,
+        );
         (b, 0)
     } else {
         let Some(bp) = st.procs.get_mut(&arena) else {
+            park_lost(
+                st,
+                &arena,
+                "complete-no-bp",
+                ParkCounter::LostNoBp,
+                pid,
+            );
             return ParkedOutcome::Nothing;
         };
         // Command-boundary cut, same rule as the inline
@@ -5453,6 +5661,12 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     // 0.9.144 (s9-144-desk section 3.1): this seat's
     // unmatched lines carry site=parked.
     st.settle_fill_answers(pid, &bytes, "parked");
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // discharge hinge twin -- the completion
+    // tokens this fill carries close the reader's
+    // waitForResponse windows (tc_out). After the
+    // predicate evaluation above by construction.
+    st.tc_settle_fill(pid, &bytes);
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -5509,8 +5723,14 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     }
     if bytes.is_empty() {
         st.parked.insert(pid, park);
+        // 0.9.150 (M3): the empty fill restored the
+        // registration this decision removed.
+        park_count(st, &arena, ParkCounter::Reins);
         return ParkedOutcome::Nothing;
     }
+    // 0.9.150 (M3): the removal completed -- a
+    // non-empty fill went back to the reader.
+    park_count(st, &arena, ParkCounter::RmComplete);
     // 0.9.136: only the fixups whose deliveries this
     // completion's own bytes carry (see take_fixups_for);
     // the rest stay queued for their own completions.
@@ -6232,6 +6452,44 @@ impl CoordServer {
                     e.string(sa);
                     e.i32(*sp);
                 }
+                // 0.9.150 (s10-arrival-desk section
+                // 3.3): the coordinator's parked set
+                // for the snapshot arena rides the
+                // same reply; the tracer diffs it
+                // against its own pend set and prints
+                // the difference only when it is
+                // non-empty (the park-registry diff
+                // line), so the two books' divergence
+                // is evidence at the snapshot instant
+                // instead of a post-field inference
+                // from pooled deliveries.
+                {
+                    let snap_arena = self
+                        .st
+                        .thread_arena
+                        .get(&leader)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut snap_parked: Vec<i32> = if snap_arena.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.st
+                            .parked
+                            .keys()
+                            .filter(|p| {
+                                self.st.thread_arena.get(*p)
+                                    == Some(&snap_arena)
+                            })
+                            .copied()
+                            .collect()
+                    };
+                    snap_parked.sort_unstable();
+                    e.string(&snap_arena);
+                    e.u32(snap_parked.len() as u32);
+                    for p in &snap_parked {
+                        e.i32(*p);
+                    }
+                }
                 self.send_to(ci, MSG_RESP_WEDGE_CHAIN, &e.0);
                 // 0.9.141 (S6): the servicer faces ride
                 // a broadcast so each servicer's owner
@@ -6263,6 +6521,14 @@ impl CoordServer {
                 let pid = d.i32();
                 let park = d.park();
                 self.st.parked.insert(pid, park);
+                // 0.9.150 (M3): the registration
+                // landed; charge the arena it
+                // belongs to (the loose attribution
+                // covers a park that arrives ahead
+                // of its THREAD_ARENA registration).
+                if let Some(a) = arena_of_pid_loose(&self.st, pid) {
+                    park_count(&mut self.st, &a, ParkCounter::Ins);
+                }
                 // A delivery that finds nobody parked
                 // pools its bytes in the arena's inbound
                 // stream (binder_deliver), and the matching
@@ -6422,7 +6688,20 @@ impl CoordServer {
             }
             MSG_ONEWAY_PARK_REMOVE => {
                 let pid = d.i32();
-                self.st.parked.remove(&pid);
+                let removed = self.st.parked.remove(&pid).is_some();
+                // 0.9.150 (M3 / M4-lite): a removed
+                // registration charges rm_msg; the
+                // reap itself charges the thread
+                // ledger either way. Attribution is
+                // loose -- the thread's own
+                // registration may already be gone,
+                // which is the normal order here.
+                if let Some(a) = arena_of_pid_loose(&self.st, pid) {
+                    if removed {
+                        park_count(&mut self.st, &a, ParkCounter::RmMsg);
+                    }
+                    thread_acct_mut(&mut self.st, &a).reaped += 1;
+                }
             }
             MSG_ONEWAY_THREAD_ARENA => {
                 let pid = d.i32();
@@ -6445,7 +6724,18 @@ impl CoordServer {
                 if let Some(bp) = self.st.procs.get_mut(&arena) {
                     bp.loopers.remove(&pid);
                 }
-                self.st.parked.remove(&pid);
+                // 0.9.150 (M3 / M4-lite): a removed
+                // registration charges rm_exit_ioctl;
+                // the exit itself charges the thread
+                // ledger.
+                if self.st.parked.remove(&pid).is_some() {
+                    park_count(&mut self.st, &arena, ParkCounter::RmExitIoctl);
+                }
+                thread_acct_mut(&mut self.st, &arena).exit_ioctl += 1;
+                // 0.9.150: the exiting thread's
+                // completion-token account dies with
+                // it, as at binder_thread_exit.
+                self.st.tc_out.remove(&pid);
             }
             MSG_ONEWAY_ASHMEM_SET_NAME => {
                 let key = d.string();
@@ -7465,7 +7755,11 @@ fn binder_deliver(
     }
     if ds_pooled_denied {
         if let Some(dp) = ds_denied {
-            ds_count(st, target, "land", dp, DsCounter::LandDenied, 1);
+            // 0.9.150: the denial's attribution is
+            // decided here, like the drains' -- a
+            // candidate only the fourth seat held
+            // counts tc_gated, not land_denied.
+            ds_count(st, target, "land", dp, ds_land_counter(st, dp), 1);
         }
     }
     // 0.9.132: file this delivery in the write-overlap
@@ -7484,24 +7778,32 @@ fn binder_deliver(
 /// delivery-discipline predicate -- thread `pid` has
 /// an unanswered synchronous call outstanding. The
 /// union of the three seats where such a wait is
-/// registered, and no fourth: the shared waiters
-/// queues (sent, not yet claimed), the Reply frames
-/// of the serving stacks (claimed, not yet popped),
-/// and mgr_pending (sent to handle 0 before the
-/// context manager registered, its sender already
-/// parked in its transact wait with no waiters entry
-/// yet). Read-only over coordinator state -- the
-/// predicate opens no registry of its own, and the
-/// tracer channel does not change. The sendReply
+/// registered: the shared waiters queues (sent, not
+/// yet claimed), the Reply frames of the serving
+/// stacks (claimed, not yet popped), and mgr_pending
+/// (sent to handle 0 before the context manager
+/// registered, its sender already parked in its
+/// transact wait with no waiters entry yet).
+/// Read-only over coordinator state.
+/// 0.9.150 (s10-arrival-desk sections 1 / 4.1):
+/// this is now only the predicate's registered
+/// half. The .147 text here held that the sendReply
 /// wait (W2) and the one-way completion wait (W1')
-/// are deliberately not seats here: their token is
-/// queued into the waiting thread's own queue inside
-/// the same call that opens the wait (binder_reply_
-/// complete / binder_send_txn), so it is always in
-/// place before any later fill is assembled; their
-/// residual exposure is flush ordering, which R2
-/// covers unconditionally.
-fn binder_thread_waiting(st: &BinderState, pid: i32) -> bool {
+/// needed no seat because their token is queued
+/// inside the call that opens the wait -- true of
+/// the token, false of the window: the .149 field's
+/// holders were claimed nested inside exactly
+/// those windows, on ride-along fills and landings
+/// the three registries scored as a free station.
+/// The predicate proper (binder_thread_waiting)
+/// adds the fourth seat that records the windows
+/// themselves. This registered half stays separate
+/// because the discipline ledger's attribution is
+/// defined against it (ds_drain_counter /
+/// ds_land_counter): a gate that fires on the
+/// fourth seat alone counts tc_gated, never
+/// suppressed / land_denied.
+fn binder_thread_waiting_registered(st: &BinderState, pid: i32) -> bool {
     if st
         .waiters
         .values()
@@ -7519,6 +7821,21 @@ fn binder_thread_waiting(st: &BinderState, pid: i32) -> bool {
         return true;
     }
     st.mgr_pending.iter().any(|q| q.sender_pid == pid)
+}
+
+/// The delivery-discipline predicate, all four
+/// seats: the three .147 registries plus the
+/// unconsumed completion-token account (tc_out) --
+/// a thread holding an unconsumed token is inside
+/// a waitForResponse window (W1' one-way, W2
+/// sendReply, or the front of W1 itself) whatever
+/// the registries say. Every gate seat (both
+/// drains, the landing search, the wake candidacy)
+/// reads the predicate through this function, so
+/// the fourth seat takes effect at all of them
+/// with no seat of its own.
+fn binder_thread_waiting(st: &BinderState, pid: i32) -> bool {
+    binder_thread_waiting_registered(st, pid) || st.tc_open(pid)
 }
 
 /// The outstanding wait a first-occurrence line names
@@ -7556,16 +7873,61 @@ fn binder_wait_desc(st: &BinderState, pid: i32) -> Option<(String, u32)> {
     if let Some(q) = st.mgr_pending.iter().find(|q| q.sender_pid == pid) {
         return Some(("handle0".to_string(), q.code));
     }
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // fourth seat names itself -- a thread gated
+    // only by an unconsumed completion token is in
+    // a waitForResponse window, and the code is
+    // its most recent send's. (This also closes
+    // the (?, code=0) gap on this seat; the older
+    // seats' gaps are out of this build's scope.)
+    if let Some(e) = st.tc_out.get(&pid) {
+        if e.count > 0 {
+            return Some(("waitForResponse".to_string(), e.last_code));
+        }
+    }
     None
 }
 
 /// Which delivery-discipline counter a seat counts
-/// into (s9-147-desk section 4).
+/// into (s9-147-desk section 4). TcGated is
+/// 0.9.150's column (s10-arrival-desk section 4.1):
+/// the events a gate produced where the reader was
+/// waiting only by the predicate's fourth seat.
 #[derive(Clone, Copy)]
 enum DsCounter {
     Suppressed,
     FlushHeld,
     LandDenied,
+    TcGated,
+}
+
+/// 0.9.150 (s10-arrival-desk section 4.1): the
+/// drain seats' counting attribution. A gated
+/// drain's held units belong to the registered
+/// predicate when any of its three seats holds
+/// the reader (the .147 world, counted as
+/// suppressed exactly as before), and to the
+/// fourth seat alone when only the unconsumed-
+/// token account does (counted tc_gated) -- the
+/// two never both take the same unit.
+fn ds_drain_counter(st: &BinderState, pid: i32) -> DsCounter {
+    if binder_thread_waiting_registered(st, pid) {
+        DsCounter::Suppressed
+    } else {
+        DsCounter::TcGated
+    }
+}
+
+/// The landing seat's attribution, same rule:
+/// a denial the registered predicate caused
+/// counts land_denied; one only the fourth seat
+/// caused counts tc_gated.
+fn ds_land_counter(st: &BinderState, pid: i32) -> DsCounter {
+    if binder_thread_waiting_registered(st, pid) {
+        DsCounter::LandDenied
+    } else {
+        DsCounter::TcGated
+    }
 }
 
 /// Count one delivery-discipline event against its
@@ -7597,6 +7959,9 @@ fn ds_count(
         DsCounter::LandDenied => {
             *st.ds_land_denied.entry(arena.to_string()).or_default() += n
         }
+        DsCounter::TcGated => {
+            *st.tc_gated.entry(arena.to_string()).or_default() += n
+        }
     }
     if st.ds_noted.insert(arena.to_string()) {
         let (tgt, code) = binder_wait_desc(st, reader)
@@ -7605,6 +7970,131 @@ fn ds_count(
             "binder: delivery-discipline first hit arena={arena} site={site} reader={reader} wait=({tgt}, code={code})"
         );
     }
+}
+
+/// 0.9.150 (s10-arrival-desk section 3): attribute
+/// a thread to its arena for the M3 accounts when
+/// thread_arena itself has no entry -- the serving
+/// stack's arena, else any proc record still
+/// holding the pid (base / looper / queue). The
+/// seats that need this are exactly the loss and
+/// reap paths, where the primary registry may
+/// already be gone; attribution is telemetry
+/// only and decides nothing.
+fn arena_of_pid_loose(st: &BinderState, pid: i32) -> Option<String> {
+    if let Some(a) = st.thread_arena.get(&pid) {
+        return Some(a.clone());
+    }
+    if let Some(s) = st.serving.get(&pid) {
+        return Some(s.arena.clone());
+    }
+    for (a, bp) in &st.procs {
+        if bp.base.contains_key(&pid)
+            || bp.loopers.contains(&pid)
+            || bp.queues.contains_key(&pid)
+        {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
+/// Which park-registry counter a seat counts into
+/// (s10-arrival-desk section 3.2).
+#[derive(Clone, Copy)]
+enum ParkCounter {
+    Ins,
+    Reins,
+    RmComplete,
+    LostNoArena,
+    LostNoBp,
+    RmMsg,
+    RmExitIoctl,
+}
+
+/// Count one park-registry event against its
+/// arena. Counts only -- the M3 red line, same as
+/// the discipline ledger's: nothing reads the
+/// account back into the predicate, delivery or
+/// wakes.
+fn park_count(st: &mut BinderState, arena: &str, counter: ParkCounter) {
+    let a = st.park_acct.entry(arena.to_string()).or_default();
+    match counter {
+        ParkCounter::Ins => a.ins += 1,
+        ParkCounter::Reins => a.reins += 1,
+        ParkCounter::RmComplete => a.rm_complete += 1,
+        ParkCounter::LostNoArena => a.lost_no_arena += 1,
+        ParkCounter::LostNoBp => a.lost_no_bp += 1,
+        ParkCounter::RmMsg => a.rm_msg += 1,
+        ParkCounter::RmExitIoctl => a.rm_exit_ioctl += 1,
+    }
+}
+
+/// Count a park registration lost at a
+/// complete_decision early exit, and print the
+/// loss's first-occurrence line (section 3.3: once
+/// per arena per class). `seat` is the line's
+/// literal: complete-no-arena / complete-no-bp.
+fn park_lost(
+    st: &mut BinderState,
+    arena: &str,
+    seat: &'static str,
+    counter: ParkCounter,
+    pid: i32,
+) {
+    park_count(st, arena, counter);
+    if st.park_lost_noted.insert(format!("{arena}|{seat}")) {
+        bsup!("binder: park-registry lost arena={arena} seat={seat} pid={pid}");
+    }
+}
+
+/// The mutable M4-lite ledger of one arena.
+fn thread_acct_mut<'x>(st: &'x mut BinderState, arena: &str) -> &'x mut ThreadAcct {
+    st.thread_acct.entry(arena.to_string()).or_default()
+}
+
+/// The M3 settlement line for one arena, in the
+/// shape the snapshot and the arena-death seats
+/// both print. `cur` is the caller's count of the
+/// arena's pids currently in st.parked (the two
+/// seats compute membership differently: the
+/// snapshot by thread_arena, the death settlement
+/// by the arena's surviving pid records).
+fn park_registry_account(st: &BinderState, arena: &str, cur: usize) -> String {
+    let z = ParkAcct::default();
+    let a = st.park_acct.get(arena).unwrap_or(&z);
+    format!(
+        "binder: arena {arena} park-registry account: ins={} reins={} rm_complete={} lost_no_arena={} lost_no_bp={} rm_msg={} rm_exit_ioctl={} cur={cur} t={}",
+        a.ins,
+        a.reins,
+        a.rm_complete,
+        a.lost_no_arena,
+        a.lost_no_bp,
+        a.rm_msg,
+        a.rm_exit_ioctl,
+        field_t_ms()
+    )
+}
+
+/// The M4-lite settlement line for one arena:
+/// current loopers off the proc record, the rest
+/// off the thread life ledger.
+fn thread_registry_account(st: &BinderState, arena: &str) -> String {
+    let loopers = st.procs.get(arena).map_or(0, |bp| bp.loopers.len());
+    let (seen, reg, unreg, exit_ioctl, reaped) = match st.thread_acct.get(arena) {
+        Some(t) => (
+            t.seen.len() as u64,
+            t.reg,
+            t.unreg,
+            t.exit_ioctl,
+            t.reaped,
+        ),
+        None => (0, 0, 0, 0, 0),
+    };
+    format!(
+        "binder: arena {arena} thread-registry account: loopers={loopers} seen={seen} reg={reg} unreg={unreg} exit_ioctl={exit_ioctl} reaped={reaped} t={}",
+        field_t_ms()
+    )
 }
 
 /// Which parked threads of `arena` have work they may
@@ -7754,12 +8244,19 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 if let Some(bp) = st.procs.get_mut(arena) {
                     bp.loopers.insert(pid);
                 }
+                // 0.9.150 (M4-lite): the thread life
+                // ledger charges the registration and
+                // remembers the pid as seen.
+                let ta = thread_acct_mut(st, arena);
+                ta.reg += 1;
+                ta.seen.insert(pid);
                 notes.push("looper in".to_string());
             }
             BC_EXIT_LOOPER => {
                 if let Some(bp) = st.procs.get_mut(arena) {
                     bp.loopers.remove(&pid);
                 }
+                thread_acct_mut(st, arena).unreg += 1;
                 notes.push("looper out".to_string());
             }
             BC_FREE_BUFFER => {
@@ -9116,17 +9613,39 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     // the same shape, for every live arena (the
     // proc-exit settlement in binder_on_proc_exit
     // prints the same line again at arena death).
+    // 0.9.150: with the tc_gated column, as there.
     {
         let mut acct_arenas: Vec<&String> = st.procs.keys().collect();
         acct_arenas.sort();
         for a in acct_arenas {
             bsup!(
-                "binder: arena {a} delivery-discipline account: suppressed={} flush_held={} land_denied={} t={}",
+                "binder: arena {a} delivery-discipline account: suppressed={} flush_held={} land_denied={} tc_gated={} t={}",
                 st.ds_suppressed.get(a).copied().unwrap_or(0),
                 st.ds_flush_held.get(a).copied().unwrap_or(0),
                 st.ds_land_denied.get(a).copied().unwrap_or(0),
+                st.tc_gated.get(a).copied().unwrap_or(0),
                 field_t_ms()
             );
+        }
+    }
+    // 0.9.150 (s10-arrival-desk section 3): the M3
+    // park-registry and M4-lite thread-registry
+    // accounts settle at the same seat, for every
+    // live arena. cur counts the arena's pids in
+    // st.parked by thread_arena -- the same
+    // membership the snapshot's park census above
+    // uses.
+    {
+        let mut acct_arenas: Vec<&String> = st.procs.keys().collect();
+        acct_arenas.sort();
+        for a in acct_arenas {
+            let cur = st
+                .parked
+                .keys()
+                .filter(|p| st.thread_arena.get(*p) == Some(a))
+                .count();
+            bsup!("{}", park_registry_account(st, a, cur));
+            bsup!("{}", thread_registry_account(st, a));
         }
     }
     // 0.9.142 (section 2.4): servicers the v2
@@ -9535,6 +10054,16 @@ fn binder_reply_complete(
     }
     if queued {
         *st.reply_completes.entry(arena.to_string()).or_default() += 1;
+        // 0.9.150 (s10-arrival-desk section 4.1):
+        // the token just queued opens the replier's
+        // sendReply wait (W2) in the predicate's
+        // fourth seat, under the same queued-only
+        // discipline as the completes count beside
+        // it -- an unqueued token (arena gone)
+        // opens nothing. This one seat covers all
+        // four BC_REPLY exits: every one of them
+        // closes through this function.
+        st.tc_charge(pid, None);
     }
     ds_count(st, arena, "flush-complete", pid, DsCounter::FlushHeld, ds_flush_held);
     binder_maybe_wake(st, arena, actions);
@@ -10557,7 +11086,11 @@ fn binder_send_txn(
     // holds back, counted after the block (the
     // counters live on the state the proc borrow
     // blocks access to).
+    // 0.9.150: whether the completion token below
+    // was actually queued, for the same after-block
+    // reason.
     let mut ds_flush_held = 0u64;
+    let mut tc_queued = false;
     if let Some(bp) = st.procs.get_mut(arena) {
         // Kernel ordering: 81e7dc2 flushed the shared
         // inbound stream ahead of BR_REPLY (and ahead of
@@ -10589,6 +11122,20 @@ fn binder_send_txn(
             bsup!("binder: flushed pending inbound ahead of transaction-complete to pid={pid}");
         }
         bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
+        tc_queued = true;
+    }
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // token just queued opens the sender's
+    // waitForResponse window in the predicate's
+    // fourth seat -- sync and one-way sends alike
+    // (the sync window is also in waiters; the
+    // overlap is harmless and keeps the discharge
+    // rule single). The delivery-failure return
+    // above never reaches this seat: it answered
+    // DEAD_REPLY and queued no token, exactly as
+    // it records no wait.
+    if tc_queued {
+        st.tc_charge(pid, Some(code));
     }
     ds_count(st, arena, "flush-send", pid, DsCounter::FlushHeld, ds_flush_held);
     binder_maybe_wake(st, &owner, actions);
@@ -10670,7 +11217,14 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             .get_mut(&arena)
             .map(|bp| bp.drain_gated_for(pid, rs as usize))
             .unwrap_or_default();
-        ds_count(st, &arena, "drain-inline", pid, DsCounter::Suppressed, suppressed);
+        ds_count(
+            st,
+            &arena,
+            "drain-inline",
+            pid,
+            ds_drain_counter(st, pid),
+            suppressed,
+        );
         Some(b)
     } else {
         None
@@ -10715,6 +11269,13 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // 0.9.144 (s9-144-desk section 3.1): this
         // seat's unmatched lines carry site=inline.
         st.settle_fill_answers(pid, &bytes, "inline");
+        // 0.9.150 (s10-arrival-desk section 4.1):
+        // the discharge hinge twin, as at the
+        // parked seat -- the tokens this fill
+        // carries close the reader's windows, after
+        // the predicate evaluation above gated (or
+        // did not gate) this very fill by them.
+        st.tc_settle_fill(pid, &bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
         // 0.9.136: this fill's delivery VAs, taken before
         // the bytes move into the action list; the fd
@@ -10854,6 +11415,25 @@ fn br_prefix_len(bytes: &[u8], cap: usize) -> usize {
         off += len;
     }
     off
+}
+
+/// 0.9.150 (s10-arrival-desk section 4.1): count
+/// the BR_TRANSACTION_COMPLETE words in a fill --
+/// the discharge walk of the tc_out ledger (see
+/// BinderState::tc_settle_fill). Same stepping
+/// and same trust in supervisor-assembled bytes
+/// as count_br_transactions below.
+fn count_br_completes(bytes: &[u8]) -> u32 {
+    let mut n = 0u32;
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        if cmd == BR_TRANSACTION_COMPLETE {
+            n += 1;
+        }
+        off += br_one_len(cmd);
+    }
+    n
 }
 
 /// 0.9.141 (P3): count the BR_TRANSACTION commands
@@ -12711,6 +13291,30 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     if st.thread_arena.values().any(|a| a == arena) {
         return; // sibling threads still hold this arena
     }
+    // 0.9.150: this arena's thread pids by the
+    // records that survive to this seat (mmap
+    // bases, queues, loopers, serving stacks --
+    // thread_arena itself is already empty for
+    // this arena, that being the guard above).
+    // Captured before the sweeps: the M3 death
+    // settlement's cur and the tc_out sweep both
+    // read membership off it.
+    let arena_pids: Vec<i32> = {
+        let mut v: Vec<i32> = Vec::new();
+        if let Some(bp) = st.procs.get(arena) {
+            v.extend(bp.base.keys().copied());
+            v.extend(bp.queues.keys().copied());
+            v.extend(bp.loopers.iter().copied());
+        }
+        for (p, s) in &st.serving {
+            if s.arena == arena {
+                v.push(*p);
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
     // 0.9.131: the arena is really gone (the guard
     // above held while sibling threads remained); its
     // ignition evidence ring dies with it.
@@ -12893,13 +13497,30 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // 0.9.147 (s9-147-desk section 4): the delivery-
     // discipline ledger, settled at the same seat
     // like the accounts above.
+    // 0.9.150: the line grows the tc_gated column
+    // behind land_denied; the three .147 columns
+    // keep their positions and meanings.
     bsup!(
-        "binder: arena {arena} delivery-discipline account: suppressed={} flush_held={} land_denied={} t={}",
+        "binder: arena {arena} delivery-discipline account: suppressed={} flush_held={} land_denied={} tc_gated={} t={}",
         st.ds_suppressed.get(arena).copied().unwrap_or(0),
         st.ds_flush_held.get(arena).copied().unwrap_or(0),
         st.ds_land_denied.get(arena).copied().unwrap_or(0),
+        st.tc_gated.get(arena).copied().unwrap_or(0),
         field_t_ms()
     );
+    // 0.9.150 (s10-arrival-desk section 3): the M3
+    // park-registry and M4-lite thread-registry
+    // accounts settle at the same seat. cur counts
+    // this arena's pids still holding a park
+    // registration at this instant.
+    {
+        let cur = arena_pids
+            .iter()
+            .filter(|p| st.parked.contains_key(p))
+            .count();
+        bsup!("{}", park_registry_account(st, arena, cur));
+        bsup!("{}", thread_registry_account(st, arena));
+    }
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
     // an arena dies holding a backlog of unfreed parcels,
@@ -13068,6 +13689,17 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     let purged = before - st.mgr_pending.len();
     if purged > 0 {
         bsup!("binder: purged {purged} queued mgr txn(s) from dead arena {arena}");
+    }
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // dead arena's threads' completion-token
+    // accounts go with it, in the same sweep as
+    // the manager queue above. The per-thread exit
+    // seats clear their own entries first; this is
+    // the backstop for a thread whose exit never
+    // ran one -- a residue would otherwise gate a
+    // later tenure's recycled pid.
+    for p in &arena_pids {
+        st.tc_out.remove(p);
     }
     if st.mgr_arena.as_deref() == Some(arena) {
         st.mgr_arena = None;
@@ -15252,9 +15884,65 @@ fn fire_wedge_chain(
     solo: Option<i32>,
     wedge_leader: &mut Option<i32>,
     wedge_holder: &mut Option<i32>,
+    procs: &HashMap<i32, ProcState>,
 ) {
-    let (logs, holder, _servicers) = coord.wedge_chain(leader, solo.unwrap_or(0));
+    let (logs, holder, _servicers, snap_arena, coord_parked) =
+        coord.wedge_chain(leader, solo.unwrap_or(0));
     replay_logs(logs);
+    // 0.9.150 (s10-arrival-desk section 3.3): the
+    // two park books, diffed at the snapshot
+    // instant. This worker's book is its family
+    // threads whose pend stands binder-parked (the
+    // same flag the wedge-thread lines print as
+    // state=parked-binder); the coordinator's rode
+    // the reply. Only a non-empty difference
+    // prints -- agreement is the silent norm.
+    if !snap_arena.is_empty() {
+        let leader_of = |mut p: i32| -> i32 {
+            for _ in 0..512 {
+                match procs.get(&p) {
+                    Some(pr)
+                        if pr.parent != 0
+                            && pr.parent != p
+                            && procs.contains_key(&pr.parent) =>
+                    {
+                        p = pr.parent;
+                    }
+                    _ => break,
+                }
+            }
+            p
+        };
+        let mut tracer_parked: Vec<i32> = procs
+            .iter()
+            .filter(|(p, pr)| {
+                leader_of(**p) == leader
+                    && pr
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pd| pd.binder_parked)
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        tracer_parked.sort_unstable();
+        let coord_only: Vec<String> = coord_parked
+            .iter()
+            .filter(|p| !tracer_parked.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        let tracer_only: Vec<String> = tracer_parked
+            .iter()
+            .filter(|p| !coord_parked.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        if !coord_only.is_empty() || !tracer_only.is_empty() {
+            sup!(
+                "binder: park-registry diff arena={snap_arena} coord_only=[{}] tracer_only=[{}]",
+                coord_only.join(" "),
+                tracer_only.join(" ")
+            );
+        }
+    }
     *wedge_leader = Some(leader);
     *wedge_holder = if holder > 0 { Some(holder) } else { None };
 }
@@ -17233,6 +17921,7 @@ fn tracer_loop(ctx: TracerCtx) {
                                 solo,
                                 &mut wedge_leader,
                                 &mut wedge_holder,
+                                &procs,
                             );
                             // S10 I3: this worker's stop
                             // account settles beside the
@@ -17451,6 +18140,7 @@ fn tracer_loop(ctx: TracerCtx) {
                             solo,
                             &mut wedge_leader,
                             &mut wedge_holder,
+                            &procs,
                         );
                         // S10 I3: same settlement as the
                         // kill-hook seat above.
@@ -19019,5 +19709,264 @@ mod tests {
                 String::from_utf8_lossy(&c).into_owned()
             );
         }
+    }
+
+    // 0.9.150 (s10-arrival-desk section 4.1): the
+    // predicate's fourth seat. The send and reply
+    // seats run end to end against a two-arena
+    // state; discharges run through the same hinge
+    // the fill seats use (tc_settle_fill).
+    fn tc_state() -> BinderState {
+        let mut st = BinderState::default();
+        let mut app = test_proc();
+        app.base.insert(4242, 0x1000_0000);
+        st.procs.insert("app".to_string(), app);
+        let mut ss = test_proc();
+        ss.base.insert(900, 0x2000_0000);
+        st.procs.insert("ss".to_string(), ss);
+        st
+    }
+
+    fn tc_send(st: &mut BinderState, code: u32, flags: u32) {
+        let mut actions: Vec<BAction> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        binder_send_txn(
+            st,
+            &mut actions,
+            &mut notes,
+            "app",
+            4242,
+            1,
+            0,
+            0x1000,
+            0,
+            "ss",
+            code,
+            flags,
+            0,
+            &[],
+            &[],
+        );
+    }
+
+    #[test]
+    fn tc_oneway_send_opens_window_and_fill_closes_it() {
+        let mut st = tc_state();
+        // A one-way send records no registered wait:
+        // under the .147 predicate alone this thread
+        // is a free station -- the .149 blind spot.
+        tc_send(&mut st, 13, TF_ONE_WAY);
+        assert!(!binder_thread_waiting_registered(&st, 4242));
+        // The token sits in the sender's own queue,
+        // and the fourth seat holds the window open.
+        let fill = st.procs["app"].queues[&4242].clone();
+        assert_eq!(fill, BR_TRANSACTION_COMPLETE.to_le_bytes());
+        assert!(binder_thread_waiting(&st, 4242));
+        assert_eq!(
+            binder_wait_desc(&st, 4242),
+            Some(("waitForResponse".to_string(), 13))
+        );
+        // The fill that carries the token to the
+        // reader discharges the account at the
+        // hinge; the predicate falls back to false.
+        st.tc_settle_fill(4242, &fill);
+        assert!(!st.tc_out.contains_key(&4242));
+        assert!(!binder_thread_waiting(&st, 4242));
+        assert_eq!(binder_wait_desc(&st, 4242), None);
+    }
+
+    #[test]
+    fn tc_sends_stack_and_discharge_counts_tokens() {
+        let mut st = tc_state();
+        // Two sends inside one guest stream stack:
+        // the account is a count, not a flag.
+        tc_send(&mut st, 13, TF_ONE_WAY);
+        tc_send(&mut st, 7, TF_ONE_WAY);
+        assert_eq!(st.tc_out[&4242].count, 2);
+        assert_eq!(st.tc_out[&4242].last_code, 7);
+        // One token consumed (behind a notice, as
+        // ride-along fills arrive): the window
+        // stays open on the second.
+        let mut fill = unit12(BR_INCREFS, 1);
+        fill.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        st.tc_settle_fill(4242, &fill);
+        assert_eq!(st.tc_out[&4242].count, 1);
+        assert!(binder_thread_waiting(&st, 4242));
+        // An over-discharging fill saturates at
+        // zero and removes the entry -- a token
+        // nobody charged can never drive the count
+        // negative or leave a phantom window.
+        let mut fill2 = BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec();
+        fill2.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        st.tc_settle_fill(4242, &fill2);
+        assert!(!st.tc_out.contains_key(&4242));
+        assert!(!binder_thread_waiting(&st, 4242));
+    }
+
+    #[test]
+    fn tc_sync_send_stacks_beside_its_registered_wait() {
+        let mut st = tc_state();
+        tc_send(&mut st, 5, 0);
+        // The registered seat holds the sync wait
+        // and the token account stacks beside it.
+        assert!(binder_thread_waiting_registered(&st, 4242));
+        assert_eq!(st.tc_out[&4242].count, 1);
+        // Discharging the token leaves the
+        // registered wait standing: it ends at its
+        // claim / answer, not at the token.
+        let fill = st.procs["app"].queues[&4242].clone();
+        st.tc_settle_fill(4242, &fill);
+        assert!(!st.tc_out.contains_key(&4242));
+        assert!(binder_thread_waiting(&st, 4242));
+    }
+
+    #[test]
+    fn tc_reply_complete_opens_w2_window() {
+        let mut st = BinderState::default();
+        st.procs.insert("app".to_string(), test_proc());
+        let mut actions: Vec<BAction> = Vec::new();
+        binder_reply_complete(&mut st, &mut actions, "app", 4242);
+        // The replier's sendReply wait stands in
+        // the fourth seat alone.
+        assert!(!binder_thread_waiting_registered(&st, 4242));
+        assert!(binder_thread_waiting(&st, 4242));
+        assert_eq!(st.tc_out[&4242].count, 1);
+        // The replier's own fill carrying the token
+        // closes the window.
+        let fill = st.procs["app"].queues[&4242].clone();
+        st.tc_settle_fill(4242, &fill);
+        assert!(!binder_thread_waiting(&st, 4242));
+        // A token that never queued (arena gone)
+        // opens nothing -- the queued-only
+        // discipline the completes count beside it
+        // already keeps.
+        let mut actions: Vec<BAction> = Vec::new();
+        binder_reply_complete(&mut st, &mut actions, "gone", 777);
+        assert!(!st.tc_out.contains_key(&777));
+    }
+
+    #[test]
+    fn tc_gated_attribution_never_double_counts() {
+        let mut st = tc_state();
+        // Fourth seat alone: both gate kinds
+        // attribute to tc_gated.
+        st.tc_charge(4242, Some(13));
+        assert!(matches!(
+            ds_drain_counter(&st, 4242),
+            DsCounter::TcGated
+        ));
+        assert!(matches!(ds_land_counter(&st, 4242), DsCounter::TcGated));
+        let c = ds_drain_counter(&st, 4242);
+        ds_count(&mut st, "ss", "drain-inline", 4242, c, 2);
+        assert_eq!(st.tc_gated.get("ss"), Some(&2));
+        assert_eq!(st.ds_suppressed.get("ss"), None);
+        // A registered wait takes the attribution
+        // back: the same seat's units count
+        // suppressed / land_denied, and tc_gated
+        // does not move.
+        st.waiters
+            .entry("ss".to_string())
+            .or_default()
+            .push(ReplyWait {
+                sender_pid: 4242,
+                sender_arena: "app".to_string(),
+                cookie: 0,
+                target_handle: 1,
+                code: 5,
+            });
+        assert!(matches!(
+            ds_drain_counter(&st, 4242),
+            DsCounter::Suppressed
+        ));
+        assert!(matches!(
+            ds_land_counter(&st, 4242),
+            DsCounter::LandDenied
+        ));
+        let c = ds_drain_counter(&st, 4242);
+        ds_count(&mut st, "ss", "drain-inline", 4242, c, 3);
+        assert_eq!(st.ds_suppressed.get("ss"), Some(&3));
+        assert_eq!(st.tc_gated.get("ss"), Some(&2));
+    }
+
+    #[test]
+    fn tc_cleared_at_thread_exit() {
+        let mut st = tc_state();
+        st.thread_arena.insert(4242, "app".to_string());
+        st.tc_charge(4242, Some(13));
+        assert!(binder_thread_waiting(&st, 4242));
+        binder_thread_exit(4242, &mut st);
+        // The dead life's window must not gate a
+        // recycled pid.
+        assert!(!st.tc_out.contains_key(&4242));
+        assert!(!binder_thread_waiting(&st, 4242));
+    }
+
+    // 0.9.150 (s10-arrival-desk section 3): the M3
+    // park-registry account plumbing and the
+    // M4-lite thread ledger at its stream seats.
+    #[test]
+    fn park_registry_counts_and_settles() {
+        let mut st = BinderState::default();
+        park_count(&mut st, "ss", ParkCounter::Ins);
+        park_count(&mut st, "ss", ParkCounter::Ins);
+        park_count(&mut st, "ss", ParkCounter::Reins);
+        park_count(&mut st, "ss", ParkCounter::RmComplete);
+        park_lost(
+            &mut st,
+            "ss",
+            "complete-no-bp",
+            ParkCounter::LostNoBp,
+            4242,
+        );
+        // A second loss of the same class counts
+        // again (the first-occurrence line is a
+        // print budget, not a counting one).
+        park_lost(
+            &mut st,
+            "ss",
+            "complete-no-bp",
+            ParkCounter::LostNoBp,
+            4243,
+        );
+        let line = park_registry_account(&st, "ss", 1);
+        assert!(
+            line.contains(
+                "park-registry account: ins=2 reins=1 rm_complete=1 \
+                 lost_no_arena=0 lost_no_bp=2 rm_msg=0 rm_exit_ioctl=0 cur=1"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn thread_registry_counts_looper_stream() {
+        let mut st = BinderState::default();
+        st.procs.insert("ss".to_string(), test_proc());
+        let mut rd = |_pid: i32, _addr: u64, _len: usize| -> Option<Vec<u8>> { None };
+        let mut actions: Vec<BAction> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let stream = BC_ENTER_LOOPER.to_le_bytes();
+        binder_process_stream(
+            4242, "ss", &stream, &mut st, 0, &mut rd, &mut actions, &mut notes,
+        );
+        assert!(st.procs["ss"].loopers.contains(&4242));
+        let line = thread_registry_account(&st, "ss");
+        assert!(
+            line.contains(
+                "thread-registry account: loopers=1 seen=1 reg=1 \
+                 unreg=0 exit_ioctl=0 reaped=0"
+            ),
+            "{line}"
+        );
+        let stream = BC_EXIT_LOOPER.to_le_bytes();
+        binder_process_stream(
+            4242, "ss", &stream, &mut st, 0, &mut rd, &mut actions, &mut notes,
+        );
+        assert!(st.procs["ss"].loopers.is_empty());
+        let line = thread_registry_account(&st, "ss");
+        assert!(
+            line.contains("loopers=0 seen=1 reg=1 unreg=1"),
+            "{line}"
+        );
     }
 }
