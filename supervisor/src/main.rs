@@ -3024,6 +3024,25 @@ struct BinderState {
     /// the drop itself is unchanged.
     shield3_census: HashMap<(u32, u32, u32), u64>,
     shield3_census_total: u64,
+    /// 0.9.145 (s9-145-desk sections 2.2 / 5.1):
+    /// the reply-complete token ledger, per replier
+    /// arena. reply_pops counts every BC_REPLY whose
+    /// pop reached a disposition (delivered, shield3,
+    /// shield4, delivery failed -- the four exits of
+    /// binder_handle_txn's reply arm);
+    /// reply_completes counts the BR_TRANSACTION_
+    /// COMPLETE tokens actually queued to the
+    /// replier at those same seats. GB's sendReply
+    /// waits for exactly one such token per reply
+    /// served, so the two counts must agree at every
+    /// arena-death settlement (prediction P4); a gap
+    /// names an emission path the fix missed. The
+    /// ledger itself decides nothing -- the token
+    /// emission beside it (binder_reply_complete)
+    /// is this build's one behaviour change; the
+    /// counts only audit it.
+    reply_pops: HashMap<String, u64>,
+    reply_completes: HashMap<String, u64>,
 }
 
 /// One transaction held for the context manager (see
@@ -8473,6 +8492,55 @@ fn reply_source_collide(
     }
 }
 
+/// 0.9.145 (s9-145-desk section 5.1): close out one
+/// BC_REPLY whose pop has reached its disposition:
+/// queue the BR_TRANSACTION_COMPLETE the replier's
+/// sendReply is waiting for into the replier's own
+/// personal queue, behind any of its arena's pending
+/// inbound bytes flushed ahead of it -- the exact
+/// shape binder_send_txn uses for the transaction-
+/// side token (the 81e7dc2 ordering: reads serve the
+/// personal queue first, so a notice left in the
+/// inbound stream would be read only after the
+/// token). GB's waitForResponse in its (NULL, NULL)
+/// form -- sendReply's wait -- can be released by
+/// this token alone, and this supervisor never
+/// issued it on the reply path: when the waiter's
+/// own answer reached the replier inside that wait
+/// it was freed unread and the thread parked forever
+/// with its serving stack and the AMS monitor
+/// (s9-145-desk section 1.3). Token and ledger move
+/// together (section 2.2): the pop counts first,
+/// the token counts once queued; a replier whose
+/// arena is already gone queues nothing, silently
+/// like the transaction-side seat, and the gap
+/// shows in the settlement account (P4). The token
+/// goes only to the replier's personal queue --
+/// never to the inbound stream, where a pooled
+/// looper would read it as a bad command (M5).
+fn binder_reply_complete(
+    st: &mut BinderState,
+    actions: &mut Vec<BAction>,
+    arena: &str,
+    pid: i32,
+) {
+    *st.reply_pops.entry(arena.to_string()).or_default() += 1;
+    let mut queued = false;
+    if let Some(bp) = st.procs.get_mut(arena) {
+        if !bp.inbound.is_empty() {
+            let pending = std::mem::take(&mut bp.inbound);
+            bp.push_to(pid, &pending);
+            bsup!("binder: flushed pending inbound ahead of reply-complete to pid={pid}");
+        }
+        bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
+        queued = true;
+    }
+    if queued {
+        *st.reply_completes.entry(arena.to_string()).or_default() += 1;
+    }
+    binder_maybe_wake(st, arena, actions);
+}
+
 fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     pid: i32,
     arena: &str,
@@ -8913,6 +8981,10 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             // kind becomes the FAILED_REPLY it was.
             st.refine_sync_stamp_kind(w.sender_pid, claim_seq, AnswerKind::FailedReply);
             notes.push("REPLY with OOB object offset -> FAILED_REPLY (shield3)".to_string());
+            // 0.9.145: the replier's sendReply waits
+            // for its completion token on this exit
+            // too (see binder_reply_complete).
+            binder_reply_complete(st, actions, arena, pid);
             return;
         }
         // 0.9.129 c1/c2 separation, second half (telemetry
@@ -9084,6 +9156,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             // as at the shield3 exit above.
             st.refine_sync_stamp_kind(w.sender_pid, claim_seq, AnswerKind::FailedReply);
             notes.push("POISONED REPLY -> FAILED_REPLY (shield4)".to_string());
+            // 0.9.145: completion token, as at the
+            // shield3 exit above.
+            binder_reply_complete(st, actions, arena, pid);
             return;
         }
         let mut fd_fixups: Vec<(usize, i32)> = Vec::new();
@@ -9213,6 +9288,12 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 hex_head(&tdata, 32)
             );
         }
+        // 0.9.145: the two remaining exits land here
+        // -- the delivery above either succeeded or
+        // was answered FAILED_REPLY in its Err arm;
+        // the replier's completion token is owed
+        // either way (see binder_reply_complete).
+        binder_reply_complete(st, actions, arena, pid);
         notes.push(format!("REPLY -> pid {} ({}B)", w.sender_pid, tdata.len()));
         return;
     }
@@ -11746,6 +11827,18 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             parts.join(" ")
         );
     }
+    // 0.9.145 (s9-145-desk section 2.2): the
+    // reply-complete token ledger, settled at the
+    // same seat like the accounts above. reply_pops
+    // counts this arena's replies that reached a
+    // disposition; reply_completes counts the
+    // completion tokens queued to their repliers.
+    // The two must agree (prediction P4).
+    bsup!(
+        "binder: arena {arena} reply-complete account: reply_pops={} reply_completes={}",
+        st.reply_pops.get(arena).copied().unwrap_or(0),
+        st.reply_completes.get(arena).copied().unwrap_or(0)
+    );
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
     // an arena dies holding a backlog of unfreed parcels,
@@ -17126,5 +17219,67 @@ mod tests {
             st.stamp_tombstones.get(&pid),
             Some(&(StampOutcome::OverwrittenOrphan, 2))
         );
+    }
+
+    // 0.9.145 (s9-145-desk sections 2.2 / 5.1): the
+    // reply-complete seat -- token queued to the
+    // replier's personal queue behind flushed
+    // inbound, both ledger counts moving together;
+    // a missing arena counts the pop only (the P4
+    // gap shape).
+    fn test_proc() -> BinderProc {
+        let path = std::env::temp_dir().join(format!(
+            "paxvm-test-reply-complete-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("temp arena file");
+        BinderProc {
+            file,
+            base: HashMap::new(),
+            maplen: HashMap::new(),
+            bump: 0,
+            free: Vec::new(),
+            used: HashMap::new(),
+            parcels: HashMap::new(),
+            free_hit: 0,
+            free_nobase: 0,
+            free_stale: 0,
+            free_parcel_hit: 0,
+            free_miss: 0,
+            free_rescued: 0,
+            handles: HashMap::new(),
+            next_handle: 1,
+            inbound: Vec::new(),
+            queues: HashMap::new(),
+            loopers: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn reply_complete_queues_token_and_counts() {
+        let mut st = BinderState::default();
+        let mut bp = test_proc();
+        // Pending inbound bytes are flushed into the
+        // replier's personal queue ahead of the token.
+        bp.inbound = vec![0xaa; 8];
+        st.procs.insert("app".to_string(), bp);
+        let mut actions: Vec<BAction> = Vec::new();
+        binder_reply_complete(&mut st, &mut actions, "app", 4242);
+        assert_eq!(st.reply_pops.get("app"), Some(&1));
+        assert_eq!(st.reply_completes.get("app"), Some(&1));
+        let q = &st.procs["app"].queues[&4242];
+        assert_eq!(q.len(), 12);
+        assert_eq!(&q[..8], &[0xaa; 8]);
+        assert_eq!(&q[8..], &BR_TRANSACTION_COMPLETE.to_le_bytes());
+        assert!(st.procs["app"].inbound.is_empty());
+    }
+
+    #[test]
+    fn reply_complete_missing_arena_counts_pop_only() {
+        let mut st = BinderState::default();
+        let mut actions: Vec<BAction> = Vec::new();
+        binder_reply_complete(&mut st, &mut actions, "gone", 4242);
+        assert_eq!(st.reply_pops.get("gone"), Some(&1));
+        assert_eq!(st.reply_completes.get("gone"), None);
     }
 }
