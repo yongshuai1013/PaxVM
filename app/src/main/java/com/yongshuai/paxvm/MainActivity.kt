@@ -1287,121 +1287,68 @@ class MainActivity : Activity() {
         // file that did not exist. proc/net is the one
         // subdirectory the opening mkdirs does not make.
         writeFresh(
-                File(rootfs, "proc/meminfo"),
-                    "MemTotal:         262144 kB
-" +
-                    "MemFree:          104880 kB
-" +
-                    "Buffers:            8192 kB
-" +
-                    "Cached:            40960 kB
-" +
-                    "SwapCached:            0 kB
-" +
-                    "Active:            90112 kB
-" +
-                    "Inactive:          32768 kB
-" +
-                    "Active(anon):      61440 kB
-" +
-                    "Inactive(anon):    16384 kB
-" +
-                    "Active(file):      28672 kB
-" +
-                    "Inactive(file):    16384 kB
-" +
-                    "Unevictable:           0 kB
-" +
-                    "Mlocked:               0 kB
-" +
-                    "SwapTotal:             0 kB
-" +
-                    "SwapFree:              0 kB
-" +
-                    "Dirty:                 0 kB
-" +
-                    "Writeback:             0 kB
-" +
-                    "AnonPages:         57344 kB
-" +
-                    "Mapped:            24576 kB
-" +
-                    "Shmem:              1024 kB
-" +
-                    "Slab:              16384 kB
-" +
-                    "SReclaimable:       8192 kB
-" +
-                    "SUnreclaim:         8192 kB
-" +
-                    "KernelStack:        2048 kB
-" +
-                    "PageTables:         4096 kB
-" +
-                    "NFS_Unstable:          0 kB
-" +
-                    "Bounce:                0 kB
-" +
-                    "WritebackTmp:          0 kB
-" +
-                    "CommitLimit:      131072 kB
-" +
-                    "Committed_AS:     196608 kB
-" +
-                    "VmallocTotal:     876544 kB
-" +
-                    "VmallocUsed:       24576 kB
-" +
-                    "VmallocChunk:     798916 kB
-" +
-                    "HugePages_Total:       0
-" +
-                    "HugePages_Free:        0
-" +
-                    "HugePages_Rsvd:        0
-" +
-                    "HugePages_Surp:        0
-" +
-                    "Hugepagesize:       4096 kB
-" +
-                    "DirectMap4k:       16384 kB
-" +
-                    "DirectMap4M:      245760 kB
-",
+            File(rootfs, "proc/meminfo"),
+                "MemTotal:         262144 kB\n" +
+                "MemFree:          104880 kB\n" +
+                "Buffers:            8192 kB\n" +
+                "Cached:            40960 kB\n" +
+                "SwapCached:            0 kB\n" +
+                "Active:            90112 kB\n" +
+                "Inactive:          32768 kB\n" +
+                "Active(anon):      61440 kB\n" +
+                "Inactive(anon):    16384 kB\n" +
+                "Active(file):      28672 kB\n" +
+                "Inactive(file):    16384 kB\n" +
+                "Unevictable:           0 kB\n" +
+                "Mlocked:               0 kB\n" +
+                "SwapTotal:             0 kB\n" +
+                "SwapFree:              0 kB\n" +
+                "Dirty:                 0 kB\n" +
+                "Writeback:             0 kB\n" +
+                "AnonPages:         57344 kB\n" +
+                "Mapped:            24576 kB\n" +
+                "Shmem:              1024 kB\n" +
+                "Slab:              16384 kB\n" +
+                "SReclaimable:       8192 kB\n" +
+                "SUnreclaim:         8192 kB\n" +
+                "KernelStack:        2048 kB\n" +
+                "PageTables:         4096 kB\n" +
+                "NFS_Unstable:          0 kB\n" +
+                "Bounce:                0 kB\n" +
+                "WritebackTmp:          0 kB\n" +
+                "CommitLimit:      131072 kB\n" +
+                "Committed_AS:     196608 kB\n" +
+                "VmallocTotal:     876544 kB\n" +
+                "VmallocUsed:       24576 kB\n" +
+                "VmallocChunk:     798916 kB\n" +
+                "HugePages_Total:       0\n" +
+                "HugePages_Free:        0\n" +
+                "HugePages_Rsvd:        0\n" +
+                "HugePages_Surp:        0\n" +
+                "Hugepagesize:       4096 kB\n" +
+                "DirectMap4k:       16384 kB\n" +
+                "DirectMap4M:      245760 kB\n",
         )
         writeFresh(
-                File(rootfs, "proc/stat"),
-                    "cpu  120 5 95 6850 18 0 12 0 0 0
-" +
-                    "cpu0 120 5 95 6850 18 0 12 0 0 0
-" +
-                    "intr 12500 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-" +
-                    "ctxt 18300
-" +
-                    "btime 1325376000
-" +
-                    "processes 342
-" +
-                    "procs_running 1
-" +
-                    "procs_blocked 0
-",
+            File(rootfs, "proc/stat"),
+                "cpu  120 5 95 6850 18 0 12 0 0 0\n" +
+                "cpu0 120 5 95 6850 18 0 12 0 0 0\n" +
+                "intr 12500 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n" +
+                "ctxt 18300\n" +
+                "btime 1325376000\n" +
+                "processes 342\n" +
+                "procs_running 1\n" +
+                "procs_blocked 0\n",
         )
-        writeFresh(File(rootfs, "proc/loadavg"), "0.00 0.00 0.00 1/87 342
-")
+        writeFresh(File(rootfs, "proc/loadavg"), "0.00 0.00 0.00 1/87 342\n")
         File(rootfs, "proc/net").mkdirs()
         writeFresh(
-                File(rootfs, "proc/net/dev"),
-                    "Inter-|   Receive                                                |  Transmit
-" +
-                    " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-" +
-                    "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
-",
+            File(rootfs, "proc/net/dev"),
+                "Inter-|   Receive                                                |  Transmit\n" +
+                " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n" +
+                "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
         )
-        writeFresh(File(rootfs, "proc/version"), "Linux version 2.6.35.7-gebx0001 (android-build@build) (gcc version 4.4.0 (GCC) ) #1 PREEMPT Tue Nov 1 00:00:00 UTC 2011
-")
+        writeFresh(File(rootfs, "proc/version"), "Linux version 2.6.35.7-gebx0001 (android-build@build) (gcc version 4.4.0 (GCC) ) #1 PREEMPT Tue Nov 1 00:00:00 UTC 2011\n")
         writeFresh(File(rootfs, "dev/.coldboot_done"), "")
         writeFresh(File(rootfs, ".kmsg"), "")
         writeFresh(File(rootfs, ".gbloader-err"), "")
