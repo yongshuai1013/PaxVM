@@ -1172,6 +1172,13 @@ struct ProcState {
     /// SIGSEGV cell's counters and FATAL batch.
     /// Telemetry only.
     ss_family: bool,
+    /// 0.9.144 (s9-144-desk section 2.1): the
+    /// release chain of this thread's most recent
+    /// WRITE_READ fill (see FillRelease). Recorded
+    /// at the fill seats, advanced at the exit and
+    /// later stops, read only by the wedge
+    /// snapshot's fill-face line. Telemetry only.
+    fill_release: Option<FillRelease>,
 }
 
 /// 0.9.141 (s9-141-desk P3): per-thread counters over
@@ -1197,6 +1204,189 @@ struct WinProfile {
     maxdepth: u32,
 }
 
+/// 0.9.144 (s9-144-desk section 2.1): where in
+/// the release chain a recorded fill stopped.
+/// Written -- the fill's bytes and writeback
+/// words were written into the guest; Conted --
+/// the tracee was continued past them; ExitApplied
+/// -- its exit stop ran and applied the fabricated
+/// return; Superseded -- a later entry stop proved
+/// the thread moved on (the counters freeze there,
+/// so they read as "how far it got after return").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillStage {
+    Written,
+    Conted,
+    ExitApplied,
+    Superseded,
+}
+
+impl FillStage {
+    fn tag(self) -> &'static str {
+        match self {
+            FillStage::Written => "written",
+            FillStage::Conted => "conted",
+            FillStage::ExitApplied => "exit-applied",
+            FillStage::Superseded => "superseded",
+        }
+    }
+}
+
+/// Which of the two fill generation paths (plus
+/// the fd-ride variant of the inline path, whose
+/// return completes inside the ride and never
+/// reaches an exit stop) produced a recorded fill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillPath {
+    Parked,
+    Inline,
+    InlineRide,
+}
+
+impl FillPath {
+    fn tag(self) -> &'static str {
+        match self {
+            FillPath::Parked => "parked",
+            FillPath::Inline => "inline",
+            FillPath::InlineRide => "inline-ride",
+        }
+    }
+}
+
+/// The exit-stop readback verdict (s9-144-desk
+/// section 2.3): the generated bwr words compared
+/// against what the stopped tracee's memory
+/// actually holds just before the inject is
+/// applied. Bad names the first mismatching field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FillReadback {
+    Unknown,
+    Ok,
+    Bad(&'static str),
+    Unreadable,
+}
+
+impl FillReadback {
+    fn render(self) -> String {
+        match self {
+            FillReadback::Unknown => "unknown".to_string(),
+            FillReadback::Ok => "ok".to_string(),
+            FillReadback::Bad(f) => format!("bad-{f}"),
+            FillReadback::Unreadable => "unreadable".to_string(),
+        }
+    }
+}
+
+/// The outcome of comparing an expected writeback
+/// against a read-back one (fill_readback_check).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadbackCheck {
+    Ok,
+    Unreadable,
+    Bad {
+        field: &'static str,
+        expect: u32,
+        got: u32,
+        /// A later field mismatches too -- the
+        /// printed line names only the first.
+        others: bool,
+    },
+}
+
+/// 0.9.144 (s9-144-desk section 2.3): compare
+/// the bwr struct read back from the stopped
+/// tracee (and the read buffer's first word)
+/// against the values the fill generated.
+/// Field order rc, wc, first: read_consumed is
+/// the word that decides whether the guest sees
+/// a reply at all, so it judges first. A missing
+/// read is Unreadable, never a mismatch. Pure.
+fn fill_readback_check(
+    bwr: Option<&[u8]>,
+    first_word: Option<u32>,
+    expect_rc: u32,
+    expect_wc: u32,
+    expect_first: Option<u32>,
+) -> ReadbackCheck {
+    let Some(b) = bwr.filter(|b| b.len() >= 24) else {
+        return ReadbackCheck::Unreadable;
+    };
+    let rc = u32_at(b, 16);
+    let wc = u32_at(b, 4);
+    let rc_bad = rc != expect_rc;
+    let wc_bad = wc != expect_wc;
+    let first_bad = match (expect_first, first_word) {
+        (Some(_), None) => return ReadbackCheck::Unreadable,
+        (Some(e), Some(g)) => g != e,
+        (None, _) => false,
+    };
+    if rc_bad {
+        return ReadbackCheck::Bad {
+            field: "rc",
+            expect: expect_rc,
+            got: rc,
+            others: wc_bad || first_bad,
+        };
+    }
+    if wc_bad {
+        return ReadbackCheck::Bad {
+            field: "wc",
+            expect: expect_wc,
+            got: wc,
+            others: first_bad,
+        };
+    }
+    if first_bad {
+        return ReadbackCheck::Bad {
+            field: "first",
+            expect: expect_first.unwrap_or(0),
+            got: first_word.unwrap_or(0),
+            others: false,
+        };
+    }
+    ReadbackCheck::Ok
+}
+
+/// 0.9.144 (s9-144-desk section 2.1): one fill's
+/// release chain, recorded tracer-side in
+/// ProcState (see the recording points in
+/// complete_parked, the WRITE_READ entry branch
+/// and the exit stop). The bwr / read_buf /
+/// expect_wc fields are the readback's inputs
+/// (section 2.3); everything here is telemetry
+/// and feeds no pairing, claim, settle, delivery,
+/// wake or verdict path.
+#[derive(Clone, Copy)]
+struct FillRelease {
+    /// This worker's emit sequence at recording.
+    seq: u64,
+    /// The fill call's syscall number, the exit
+    /// stop's identity check against its pend.
+    nr: u64,
+    path: FillPath,
+    bytes_len: u32,
+    bwr: u32,
+    read_buf: u32,
+    /// The generated read_consumed.
+    expect_rc: u32,
+    /// The generated write_consumed (parked: the
+    /// park's captured write_size; inline: the
+    /// guest's write_size rewritten in full).
+    expect_wc: u32,
+    /// The fill's first command word; None when
+    /// the fill is shorter than a word.
+    expect_first: Option<u32>,
+    stage: FillStage,
+    /// Entry stops seen after ExitApplied (the
+    /// first also retires the record to
+    /// Superseded).
+    entry_after: u32,
+    /// Signal-delivery stops seen while the
+    /// record sat in Conted / ExitApplied.
+    signal_after: u32,
+    readback: FillReadback,
+}
+
 impl ProcState {
     fn new(vcwd: &str, is_root: bool, compat: bool) -> Self {
         ProcState {
@@ -1219,6 +1409,7 @@ impl ProcState {
             win: WinProfile::default(),
             last_stop_seq: 0,
             ss_family: false,
+            fill_release: None,
         }
     }
 }
@@ -2449,6 +2640,28 @@ impl AnswerKind {
     }
 }
 
+/// 0.9.144 (s9-144-desk section 3.2): the final
+/// disposition of one sender's sync-send stamp,
+/// kept as its per-pid tombstone after the stamp
+/// itself is settled or swept. SettledFill -- an
+/// answer command in a fill settled it (written
+/// by settle_one_answered_stamp). SettledDeath --
+/// a live un-answered stamp was still open at
+/// its arena's death settlement. AnsweredLeftover
+/// -- an answered stamp (live-answered or a
+/// reserve entry) was still unfilled at that
+/// settlement. OverwrittenOrphan -- an un-answered
+/// stamp was overwritten by a newer send and went
+/// to the orphan list (written by
+/// record_sync_stamp).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StampOutcome {
+    SettledFill,
+    SettledDeath,
+    AnsweredLeftover,
+    OverwrittenOrphan,
+}
+
 struct SyncStamp {
     sender_arena: String,
     /// Target arena as resolved through the handle /
@@ -2751,6 +2964,27 @@ struct BinderState {
     sync_stamp_reserve: HashMap<i32, VecDeque<SyncStamp>>,
     sync_stamp_reserve_dropped: u64,
     stamp_fill_unmatched: u64,
+    /// 0.9.144 (s9-144-desk section 3.2): per-pid
+    /// tombstones of settled sync-send stamps
+    /// (see StampOutcome): the stamp's final
+    /// disposition, kept after the stamp itself is
+    /// gone so the wedge-stamp-audit can tell a
+    /// parked thread whose wait the ledger saw and
+    /// settled (done) from one it never recorded
+    /// (unstamped). Written at fill settlement,
+    /// at an un-answered overwrite and at the
+    /// arena-death settlement; removed when the
+    /// thread itself exits, so a recycled pid
+    /// never inherits a dead life's disposition.
+    /// Telemetry only.
+    stamp_tombstones: HashMap<i32, (StampOutcome, u64)>,
+    /// 0.9.144 (s9-144-desk section 3.1): lines
+    /// of the two fill-unmatched kinds printed
+    /// per arena (cap 10 per arena per field;
+    /// further events count into
+    /// stamp_fill_unmatched and its death
+    /// settlement line only).
+    fill_unmatched_lines: HashMap<String, u32>,
     deliver_seq: u64,
     /// 0.9.142 (s9-142-desk section 3.2): per-thread
     /// binder profile rings for the SIGSEGV cell
@@ -2869,6 +3103,13 @@ impl BinderState {
             } else {
                 let arena = old.sender_arena.clone();
                 *self.sync_orphan_total.entry(arena.clone()).or_default() += 1;
+                // 0.9.144 (s9-144-desk section
+                // 3.2): the overwritten un-answered
+                // stamp leaves its tombstone here.
+                self.stamp_tombstones.insert(
+                    sender_pid,
+                    (StampOutcome::OverwrittenOrphan, old.send_seq),
+                );
                 let q = self.sync_orphans.entry(arena).or_default();
                 if q.len() >= 16 {
                     q.pop_front();
@@ -2943,31 +3184,37 @@ impl BinderState {
     /// reserve holds the older calls). Returns
     /// false when no answered stamp was waiting --
     /// the caller counts the unmatched answer.
+    /// 0.9.144 (s9-144-desk section 3.2): a stamp
+    /// settled here leaves a SettledFill tombstone
+    /// (see StampOutcome).
     fn settle_one_answered_stamp(&mut self, sender_pid: i32) -> bool {
-        let mut settled_from_reserve = false;
+        let mut settled_seq: Option<u64> = None;
         let mut reserve_now_empty = false;
         if let Some(q) = self.sync_stamp_reserve.get_mut(&sender_pid) {
-            if !q.is_empty() {
-                q.pop_front();
-                settled_from_reserve = true;
+            if let Some(old) = q.pop_front() {
+                settled_seq = Some(old.send_seq);
                 reserve_now_empty = q.is_empty();
             }
         }
         if reserve_now_empty {
             self.sync_stamp_reserve.remove(&sender_pid);
         }
-        if settled_from_reserve {
-            return true;
-        }
-        if self
-            .sync_stamps
-            .get(&sender_pid)
-            .is_some_and(|s| s.answered.is_some())
+        if settled_seq.is_none()
+            && self
+                .sync_stamps
+                .get(&sender_pid)
+                .is_some_and(|s| s.answered.is_some())
         {
-            self.sync_stamps.remove(&sender_pid);
-            return true;
+            settled_seq = self.sync_stamps.remove(&sender_pid).map(|s| s.send_seq);
         }
-        false
+        match settled_seq {
+            Some(seq) => {
+                self.stamp_tombstones
+                    .insert(sender_pid, (StampOutcome::SettledFill, seq));
+                true
+            }
+            None => false,
+        }
     }
     /// 0.9.143 (s9-143-desk section 2.1 item 4):
     /// the fill hinge. Scan the drained bytes for
@@ -2977,19 +3224,70 @@ impl BinderState {
     /// nothing and counts once as unmatched -- the
     /// scan is read-only and the fill's bytes,
     /// order, cutting and timing are untouched.
-    fn settle_fill_answers(&mut self, pid: i32, bytes: &[u8]) {
+    /// 0.9.144 (s9-144-desk section 3.1): both
+    /// unmatched kinds also print a per-event line
+    /// (site = the caller's literal tag, "parked"
+    /// at the decision seat, "inline" at the
+    /// write_read seat), throttled per arena; the
+    /// counts above are unchanged and keep
+    /// accumulating past the throttle.
+    fn settle_fill_answers(&mut self, pid: i32, bytes: &[u8], site: &'static str) {
         match scan_fill_answers(bytes) {
-            None => {
+            Err(fail_off) => {
                 self.stamp_fill_unmatched += 1;
+                if self.fill_unmatched_line_budget(pid) {
+                    let first_cmd = if bytes.len() >= 4 {
+                        u32_at(bytes, 0)
+                    } else {
+                        0
+                    };
+                    bsup!(
+                        "binder: fill-scan-unparseable pid={pid} site={site} len={} fail_off={fail_off} first_cmd=0x{first_cmd:08x}",
+                        bytes.len()
+                    );
+                }
             }
-            Some(answers) => {
-                for _ in answers {
+            Ok(answers) => {
+                for kind in answers {
                     if !self.settle_one_answered_stamp(pid) {
                         self.stamp_fill_unmatched += 1;
+                        if self.fill_unmatched_line_budget(pid) {
+                            let live = match self.sync_stamps.get(&pid) {
+                                None => "none",
+                                Some(s) if s.answered.is_some() => "answered",
+                                Some(_) => "unanswered",
+                            };
+                            let reserve = self
+                                .sync_stamp_reserve
+                                .get(&pid)
+                                .map(|q| q.len())
+                                .unwrap_or(0);
+                            bsup!(
+                                "binder: fill-answer-unmatched pid={pid} site={site} kind={} live={live} reserve={reserve}",
+                                kind.tag()
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// 0.9.144 (s9-144-desk section 3.1): the
+    /// per-arena line budget for the two
+    /// fill-unmatched lines -- at most ten printed
+    /// lines per arena per field across both
+    /// kinds; every event still counts into
+    /// stamp_fill_unmatched regardless.
+    fn fill_unmatched_line_budget(&mut self, pid: i32) -> bool {
+        let arena = self
+            .thread_arena
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| "?".to_string());
+        let n = self.fill_unmatched_lines.entry(arena).or_default();
+        *n += 1;
+        *n <= 10
     }
     /// 0.9.142 (s9-142-desk section 3.2): file one
     /// binder event in a thread's SIGSEGV-cell
@@ -4361,6 +4659,13 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
         }
     }
     binder_on_proc_exit(&a, st, &mut dwakes);
+    // 0.9.144 (s9-144-desk section 3.2): the
+    // exiting thread's stamp tombstone is cleared
+    // with its death settlement -- a recycled pid
+    // must not inherit the dead life's disposition
+    // (the claim accounts' pid-generation
+    // discipline).
+    st.stamp_tombstones.remove(&pid);
     Some(dwakes)
 }
 
@@ -4664,7 +4969,9 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     // fill settle the reader's answered stamps (see
     // settle_fill_answers). Same seat and same bytes
     // as the claim scan above; read-only.
-    st.settle_fill_answers(pid, &bytes);
+    // 0.9.144 (s9-144-desk section 3.1): this seat's
+    // unmatched lines carry site=parked.
+    st.settle_fill_answers(pid, &bytes, "parked");
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -7610,8 +7917,26 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     // the snapshot itself, not something forensics
     // has to reconstruct. unstamped is that gap,
     // counted live.
+    // 0.9.144 (s9-144-desk section 3.2): the
+    // tombstones split the gap. A parked thread
+    // with no live stamp whose tombstone reads
+    // SettledFill was seen by the ledger and its
+    // wait completed at a fill -- it counts as
+    // done, no longer as a gap. Column order of
+    // this line from 0.9.144: parked, stamped,
+    // answered, unstamped, done. CROSS-VERSION
+    // NOTE: the unstamped of 0.9.142/0.9.143
+    // lumped settled-at-fill and never-recorded
+    // threads together; from 0.9.144 unstamped
+    // counts only the never-recorded (or
+    // orphan-overwritten) residue and the settled
+    // part moved to done -- the two versions'
+    // unstamped values are NOT directly
+    // comparable, and forensics citing an older
+    // field's unstamped must say which semantics
+    // it carries.
     {
-        let (mut stamped, mut answered) = (0usize, 0usize);
+        let (mut stamped, mut answered, mut done) = (0usize, 0usize, 0usize);
         for ppid in &park_pids {
             let live = st.sync_stamps.get(ppid);
             let reserved = st
@@ -7620,15 +7945,21 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 .is_some_and(|q| !q.is_empty());
             if live.is_some() || reserved {
                 stamped += 1;
+            } else if st
+                .stamp_tombstones
+                .get(ppid)
+                .is_some_and(|(o, _)| *o == StampOutcome::SettledFill)
+            {
+                done += 1;
             }
             if live.is_some_and(|s| s.answered.is_some()) || reserved {
                 answered += 1;
             }
         }
         bsup!(
-            "binder: wedge-stamp-audit arena={arena} parked={} stamped={stamped} answered={answered} unstamped={}",
+            "binder: wedge-stamp-audit arena={arena} parked={} stamped={stamped} answered={answered} unstamped={} done={done}",
             park_pids.len(),
-            park_pids.len() - stamped
+            park_pids.len() - stamped - done
         );
     }
     // (S6) The servicer view (0.9.141): for each
@@ -9258,7 +9589,9 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // 0.9.143 (s9-143-desk section 2.1 item 4):
         // the fill hinge, same seat and bytes as the
         // claim scan (see settle_fill_answers).
-        st.settle_fill_answers(pid, &bytes);
+        // 0.9.144 (s9-144-desk section 3.1): this
+        // seat's unmatched lines carry site=inline.
+        st.settle_fill_answers(pid, &bytes, "inline");
         dump_mgr_read(st, &arena, pid, &bytes);
         // 0.9.136: this fill's delivery VAs, taken before
         // the bytes move into the action list; the fd
@@ -9344,12 +9677,18 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
 /// one synchronous wait). Walks the same command
 /// boundaries as br_prefix_len; a truncated tail
 /// or a command overrunning the segment makes
-/// the whole segment unparseable (None) -- the
-/// caller settles nothing from it and counts it
+/// the whole segment unparseable -- the caller
+/// settles nothing from it and counts it
 /// unmatched, rather than guessing from a partial
 /// walk. Pure and read-only: the fill's bytes are
 /// never written back.
-fn scan_fill_answers(bytes: &[u8]) -> Option<Vec<AnswerKind>> {
+/// 0.9.144 (s9-144-desk section 3.1): the Err
+/// carries the offset where the walk failed --
+/// the overrunning command's own offset, or the
+/// start of a trailing partial word. The stepping
+/// logic, the answers set and the unparseable
+/// judgement itself are unchanged.
+fn scan_fill_answers(bytes: &[u8]) -> Result<Vec<AnswerKind>, usize> {
     let mut out = Vec::new();
     let mut off = 0usize;
     while off + 4 <= bytes.len() {
@@ -9362,14 +9701,14 @@ fn scan_fill_answers(bytes: &[u8]) -> Option<Vec<AnswerKind>> {
         }
         let len = br_one_len(cmd);
         if off + len > bytes.len() {
-            return None;
+            return Err(off);
         }
         off += len;
     }
     if off != bytes.len() {
-        return None;
+        return Err(off);
     }
-    Some(out)
+    Ok(out)
 }
 
 fn br_one_len(cmd: u32) -> usize {
@@ -11181,6 +11520,35 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     let _ = write_mem(pid, park.read_buf as u64, &bytes);
     let _ = write_mem(pid, (park.bwr + 4) as u64, &park.write_consumed.to_le_bytes());
     let _ = write_mem(pid, (park.bwr + 16) as u64, &(bytes.len() as u32).to_le_bytes());
+    // 0.9.144 (s9-144-desk section 2.1 item 1):
+    // the parked path's fill-release record --
+    // Written now that the three writes are done
+    // (their results stay discarded exactly as
+    // before; whether they landed is the exit
+    // stop's readback question, section 2.3),
+    // Conted after the cont below.
+    if let Some(p) = procs.get_mut(&pid) {
+        let nr = p.pending.as_ref().map(|pd| pd.nr).unwrap_or(0);
+        p.fill_release = Some(FillRelease {
+            seq: emit_seq_now(),
+            nr,
+            path: FillPath::Parked,
+            bytes_len: bytes.len() as u32,
+            bwr: park.bwr,
+            read_buf: park.read_buf,
+            expect_rc: bytes.len() as u32,
+            expect_wc: park.write_consumed,
+            expect_first: if bytes.len() >= 4 {
+                Some(u32_at(&bytes, 0))
+            } else {
+                None
+            },
+            stage: FillStage::Written,
+            entry_after: 0,
+            signal_after: 0,
+            readback: FillReadback::Unknown,
+        });
+    }
     // The pending record must keep its inject: on this device
     // the SIGSYS belonging to a cancelled syscall is delivered
     // *after* its exit stop, and the signal-stop rescue can
@@ -11195,6 +11563,15 @@ fn complete_parked(pid: i32, procs: &mut HashMap<i32, ProcState>, coord: &mut Co
     // is rescued and consumes it. (No regs surgery here: the
     // exit stop applies the inject itself.)
     cont_syscall(pid, 0);
+    // 0.9.144 (section 2.1 item 1, second half):
+    // the record written above advances to Conted.
+    if let Some(p) = procs.get_mut(&pid) {
+        if let Some(fr) = &mut p.fill_release {
+            if fr.stage == FillStage::Written {
+                fr.stage = FillStage::Conted;
+            }
+        }
+    }
 }
 
 /// A tracee that held a binder arena exited (S5c). When it
@@ -11586,6 +11963,52 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // account like the issuance and poison ones).
     // The SIGSEGV profile rings need no sweep here:
     // binder_thread_exit removed each thread's.
+    // 0.9.144 (s9-144-desk section 3.2): before
+    // the sweep, the residue's dispositions are
+    // tombstoned per sender pid -- an answered
+    // residue (a live stamp already answered, or
+    // any reserve entry, answered by construction)
+    // is AnsweredLeftover; a live un-answered
+    // stamp is SettledDeath.
+    {
+        let mut pids: Vec<i32> = Vec::new();
+        for (pid, s) in &st.sync_stamps {
+            if s.sender_arena == arena {
+                pids.push(*pid);
+            }
+        }
+        for (pid, q) in &st.sync_stamp_reserve {
+            if q.iter().any(|s| s.sender_arena == arena) && !pids.contains(pid) {
+                pids.push(*pid);
+            }
+        }
+        for pid in pids {
+            let (outcome, seq) = {
+                let live = st
+                    .sync_stamps
+                    .get(&pid)
+                    .filter(|s| s.sender_arena == arena);
+                let reserve_seq = st.sync_stamp_reserve.get(&pid).and_then(|q| {
+                    q.iter()
+                        .rev()
+                        .find(|s| s.sender_arena == arena)
+                        .map(|s| s.send_seq)
+                });
+                if live.is_some_and(|s| s.answered.is_some()) || reserve_seq.is_some() {
+                    (
+                        StampOutcome::AnsweredLeftover,
+                        live.map(|s| s.send_seq).or(reserve_seq).unwrap_or(0),
+                    )
+                } else {
+                    (
+                        StampOutcome::SettledDeath,
+                        live.map(|s| s.send_seq).unwrap_or(0),
+                    )
+                }
+            };
+            st.stamp_tombstones.insert(pid, (outcome, seq));
+        }
+    }
     st.sync_stamps.retain(|_, s| s.sender_arena != arena);
     // 0.9.143: the answered reserve goes with the
     // live stamps (its entries are this arena's
@@ -13501,6 +13924,33 @@ fn wedge_snapshot(
         sup!(
             "binder: wedge-thread pid={pid} last_syscall={last_syscall} park={park} last_read_lines_ago=-{futex_face}"
         );
+        // 0.9.144 (s9-144-desk section 2.1): the
+        // thread's fill release face (see
+        // FillRelease) -- where its most recent
+        // fill's chain stopped, the dichotomy's
+        // reading. A binder-parked thread with no
+        // record self-reports stage=none (the
+        // instrument-gap cell of section 2.2);
+        // running threads without a fill stay
+        // silent.
+        match &p.fill_release {
+            Some(fr) => {
+                let age = emit_seq_now().saturating_sub(fr.seq);
+                sup!(
+                    "binder: fill-face pid={pid} stage={} path={} len={} stops_after=[e={},s={}] readback={} age={age}",
+                    fr.stage.tag(),
+                    fr.path.tag(),
+                    fr.bytes_len,
+                    fr.entry_after,
+                    fr.signal_after,
+                    fr.readback.render()
+                );
+            }
+            None if park == "binder" => {
+                sup!("binder: fill-face pid={pid} stage=none");
+            }
+            None => {}
+        }
     }
     // 0.9.140 (M1): group the family's in-flight futex
     // waiters by the address they wait on. A group with
@@ -14060,6 +14510,28 @@ fn tracer_loop(ctx: TracerCtx) {
                     last_futex: None,
                     last_wake: None,
                 };
+                // 0.9.144 (s9-144-desk section 2.1
+                // item 2): an inline fill produced by
+                // this entry stop's WRITE_READ branch
+                // is staged here and filed into
+                // proc.fill_release at the entry tail,
+                // where the pend's transition state
+                // (fd ride consumed or not) is known.
+                let mut inline_fill: Option<FillRelease> = None;
+                // 0.9.144 (section 2.1 item 4): this
+                // entry stop is itself evidence for
+                // the PREVIOUS fill's record -- after
+                // its exit stop applied the return,
+                // every further entry stop retires
+                // the record to Superseded (the count
+                // freezes at the first, by design of
+                // the transition).
+                if let Some(fr) = &mut proc.fill_release {
+                    if fr.stage == FillStage::ExitApplied {
+                        fr.entry_after += 1;
+                        fr.stage = FillStage::Superseded;
+                    }
+                }
                 if proc.compat && nr == 125 {
                     pend.mprot = Some((regs.arg(0), regs.arg(2)));
                 }
@@ -14813,6 +15285,15 @@ fn tracer_loop(ctx: TracerCtx) {
                                     (proc.win.depth - win_nreply as i32).max(0);
                             }
                             let veuid = vcreds.get(&pid).copied().unwrap_or((0, 0)).0;
+                            // 0.9.144 (section 2.1 item
+                            // 2): the guest's write_size,
+                            // taken before the rpc moves
+                            // the bwr -- the inline
+                            // fill's generated write_
+                            // consumed is this value,
+                            // rewritten in full.
+                            let guest_ws =
+                                bwr.as_ref().map(|b| u32_at(b, 0)).unwrap_or(0);
                             let (desc, logs, actions) = coord.write_read(
                                 pid,
                                 proc.compat,
@@ -14834,6 +15315,52 @@ fn tracer_loop(ctx: TracerCtx) {
                                 &mut wakes,
                             ) {
                                 proc.last_binder_read = Some(f);
+                                // 0.9.144 (s9-144-desk
+                                // section 2.1 item 2):
+                                // stage this inline
+                                // fill's release record;
+                                // the entry tail files
+                                // it (Written and the
+                                // same-instant cont are
+                                // one moment on this
+                                // path, so it is staged
+                                // as Conted; a fill whose
+                                // transition the fd ride
+                                // consumed is restaged
+                                // there as ExitApplied /
+                                // InlineRide). The first
+                                // word is read back from
+                                // the buffer the actions
+                                // just wrote, the guest
+                                // still stopped.
+                                {
+                                    let expect_first = if f.1 >= 4 {
+                                        read_mem_vec(pid, f.0 as u64, 4).and_then(|v| {
+                                            if v.len() >= 4 {
+                                                Some(u32_at(&v, 0))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    inline_fill = Some(FillRelease {
+                                        seq: emit_seq_now(),
+                                        nr,
+                                        path: FillPath::Inline,
+                                        bytes_len: f.1,
+                                        bwr: bwr_addr as u32,
+                                        read_buf: f.0,
+                                        expect_rc: f.1,
+                                        expect_wc: guest_ws,
+                                        expect_first,
+                                        stage: FillStage::Conted,
+                                        entry_after: 0,
+                                        signal_after: 0,
+                                        readback: FillReadback::Unknown,
+                                    });
+                                }
                                 // 0.9.141 (P3): the fill
                                 // just delivered deepens
                                 // this thread's serving
@@ -15005,6 +15532,23 @@ fn tracer_loop(ctx: TracerCtx) {
                 // result (pend.applied): the next stop is a
                 // fresh entry stop, not this call's exit.
                 let transition_consumed = pend.applied;
+                // 0.9.144 (s9-144-desk section 2.1
+                // item 2, tail half): file the inline
+                // fill record staged by the WRITE_READ
+                // branch. A fill whose entry->exit
+                // transition the fd ride consumed has
+                // already returned inside the ride and
+                // never reaches an exit stop: it is
+                // filed directly as ExitApplied on the
+                // InlineRide path, out of the exit-stop
+                // census's denominator.
+                if let Some(mut fr) = inline_fill.take() {
+                    if transition_consumed {
+                        fr.path = FillPath::InlineRide;
+                        fr.stage = FillStage::ExitApplied;
+                    }
+                    proc.fill_release = Some(fr);
+                }
                 proc.sigsys_preentry = 0;
                 proc.pending = Some(pend);
                 proc.expect_exit = !transition_consumed;
@@ -15031,6 +15575,68 @@ fn tracer_loop(ctx: TracerCtx) {
                 proc.win.stops += 1;
                 proc.last_stop_seq = emit_seq_now();
                 if let Some(mut pend) = proc.pending.take() {
+                    // 0.9.144 (s9-144-desk sections
+                    // 2.1 item 3 / 2.3): when this exit
+                    // stop settles the WRITE_READ pend
+                    // whose fill the release record
+                    // tracks, read the writeback back
+                    // BEFORE the inject below is
+                    // applied -- the tracee is stopped,
+                    // its memory stable, so the words
+                    // it holds now are the words the
+                    // guest will consume. The verdict
+                    // lands on the record; a mismatch
+                    // also prints one line (at most one
+                    // per pend, first bad field).
+                    let mut fill_exit = false;
+                    if proc
+                        .fill_release
+                        .as_ref()
+                        .is_some_and(|fr| fr.stage == FillStage::Conted && fr.nr == pend.nr)
+                    {
+                        let (bwr_back, first_back) = {
+                            let fr = proc.fill_release.as_ref().unwrap();
+                            let b = read_mem_vec(pid, fr.bwr as u64, 24);
+                            let f = if fr.expect_first.is_some() {
+                                read_mem_vec(pid, fr.read_buf as u64, 4).and_then(|v| {
+                                    if v.len() >= 4 {
+                                        Some(u32_at(&v, 0))
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+                            (b, f)
+                        };
+                        let fr = proc.fill_release.as_mut().unwrap();
+                        match fill_readback_check(
+                            bwr_back.as_deref(),
+                            first_back,
+                            fr.expect_rc,
+                            fr.expect_wc,
+                            fr.expect_first,
+                        ) {
+                            ReadbackCheck::Ok => fr.readback = FillReadback::Ok,
+                            ReadbackCheck::Unreadable => {
+                                fr.readback = FillReadback::Unreadable;
+                            }
+                            ReadbackCheck::Bad {
+                                field,
+                                expect,
+                                got,
+                                others,
+                            } => {
+                                fr.readback = FillReadback::Bad(field);
+                                sup!(
+                                    "binder: fill-readback-bad pid={pid} field={field} expect={expect} got={got}{}",
+                                    if others { " others=1" } else { "" }
+                                );
+                            }
+                        }
+                        fill_exit = true;
+                    }
                     if let Some(mut regs) = get_regs(pid, proc.compat) {
                         let mut ret = regs.retval();
                         if let Some(v) = pend.inject {
@@ -15040,6 +15646,17 @@ fn tracer_loop(ctx: TracerCtx) {
                                     pend.applied = true;
                                 }
                                 ret = v;
+                            }
+                        }
+                        // 0.9.144 (section 2.1 item 3,
+                        // second half): the inject is
+                        // applied -- the tracked fill's
+                        // chain reaches ExitApplied.
+                        if fill_exit {
+                            if let Some(fr) = &mut proc.fill_release {
+                                if fr.stage == FillStage::Conted {
+                                    fr.stage = FillStage::ExitApplied;
+                                }
                             }
                         }
                         // 0.9.142 (s9-142-desk section
@@ -15408,6 +16025,19 @@ fn tracer_loop(ctx: TracerCtx) {
             // left alone: if this stop arrived before the fake's
             // exit stop, that exit stop still follows, and the exit
             // path already tolerates a missing record.
+            // 0.9.144 (s9-144-desk section 2.1 item
+            // 4): a signal-delivery stop inside the
+            // tracked fill's return window (Conted /
+            // ExitApplied) counts on the record.
+            // Pure bookkeeping -- the delivery below
+            // proceeds exactly as before.
+            if let Some(p) = procs.get_mut(&pid) {
+                if let Some(fr) = &mut p.fill_release {
+                    if matches!(fr.stage, FillStage::Conted | FillStage::ExitApplied) {
+                        fr.signal_after += 1;
+                    }
+                }
+            }
             let mut deliver = sig;
             // Wedge forensics (0.9.122, telemetry only;
             // backstop since 0.9.123): the primary trigger
@@ -16329,7 +16959,7 @@ mod tests {
         st.record_sync_stamp(pid, test_stamp(7, 3));
         st.mark_sync_stamp_answered(pid, 7, 103, 4, AnswerKind::Reply);
         assert_eq!(st.sync_stamp_reserve.get(&pid).map(|q| q.len()), Some(2));
-        st.settle_fill_answers(pid, &reply_fill());
+        st.settle_fill_answers(pid, &reply_fill(), "parked");
         // Oldest first: A settled, B remains at the
         // reserve front, C still live.
         assert_eq!(
@@ -16339,13 +16969,13 @@ mod tests {
             Some(2)
         );
         assert!(st.sync_stamps.contains_key(&pid));
-        st.settle_fill_answers(pid, &reply_fill());
+        st.settle_fill_answers(pid, &reply_fill(), "parked");
         assert!(!st.sync_stamp_reserve.contains_key(&pid));
         assert!(st.sync_stamps.contains_key(&pid));
-        st.settle_fill_answers(pid, &reply_fill());
+        st.settle_fill_answers(pid, &reply_fill(), "parked");
         assert!(!st.sync_stamps.contains_key(&pid));
         // A fourth answer has nothing to settle.
-        st.settle_fill_answers(pid, &reply_fill());
+        st.settle_fill_answers(pid, &reply_fill(), "parked");
         assert_eq!(st.stamp_fill_unmatched, 1);
     }
 
@@ -16363,17 +16993,17 @@ mod tests {
     fn failed_and_dead_reply_fills_settle_like_replies() {
         assert_eq!(
             scan_fill_answers(&BR_FAILED_REPLY.to_le_bytes()),
-            Some(vec![AnswerKind::FailedReply])
+            Ok(vec![AnswerKind::FailedReply])
         );
         assert_eq!(
             scan_fill_answers(&BR_DEAD_REPLY.to_le_bytes()),
-            Some(vec![AnswerKind::DeadReply])
+            Ok(vec![AnswerKind::DeadReply])
         );
         let mut st = BinderState::default();
         let pid = 777;
         st.record_sync_stamp(pid, test_stamp(2, 1));
         st.mark_sync_stamp_answered(pid, 2, 55, 0, AnswerKind::DeadReply);
-        st.settle_fill_answers(pid, &BR_DEAD_REPLY.to_le_bytes());
+        st.settle_fill_answers(pid, &BR_DEAD_REPLY.to_le_bytes(), "parked");
         assert!(!st.sync_stamps.contains_key(&pid));
         assert_eq!(st.stamp_fill_unmatched, 0);
     }
@@ -16391,9 +17021,110 @@ mod tests {
         let mut fill = reply_fill();
         fill.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
         fill.extend_from_slice(&[0u8; 6]);
-        assert_eq!(scan_fill_answers(&fill), None);
-        st.settle_fill_answers(pid, &fill);
+        assert_eq!(scan_fill_answers(&fill), Err(44));
+        st.settle_fill_answers(pid, &fill, "parked");
         assert!(st.sync_stamps.contains_key(&pid));
         assert_eq!(st.stamp_fill_unmatched, 1);
+    }
+
+    // 0.9.144 (s9-144-desk sections 3.1 / 2.3):
+    // the scan's failure offset and the readback
+    // comparison, plus the tombstone write points
+    // of section 3.2. Pure functions and ledger
+    // state only -- no tracer, no guest.
+    #[test]
+    fn scan_fill_answers_reports_fail_offset() {
+        // Overrun: a whole BR_REPLY, then a
+        // BR_TRANSACTION command whose 44 bytes
+        // overrun the segment -- the walk fails
+        // at that command's offset.
+        let mut fill = reply_fill();
+        fill.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
+        fill.extend_from_slice(&[0u8; 6]);
+        assert_eq!(scan_fill_answers(&fill), Err(44));
+        // Trailing partial word: one complete 4B
+        // command plus two stray bytes -- the
+        // walk fails where the tail starts.
+        let mut tail = BR_FAILED_REPLY.to_le_bytes().to_vec();
+        tail.extend_from_slice(&[0u8; 2]);
+        assert_eq!(scan_fill_answers(&tail), Err(4));
+        // An empty segment parses to no answers.
+        assert_eq!(scan_fill_answers(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn readback_check_picks_first_bad_field() {
+        let mut bwr = [0u8; 24];
+        put_u32(&mut bwr, 4, 100); // write_consumed
+        put_u32(&mut bwr, 16, 44); // read_consumed
+        assert_eq!(
+            fill_readback_check(Some(&bwr), Some(0x7206), 44, 100, Some(0x7206)),
+            ReadbackCheck::Ok
+        );
+        // rc and wc both wrong: rc is reported,
+        // the rest noted as others.
+        assert_eq!(
+            fill_readback_check(Some(&bwr), Some(0x7206), 45, 101, Some(0x7206)),
+            ReadbackCheck::Bad {
+                field: "rc",
+                expect: 45,
+                got: 44,
+                others: true
+            }
+        );
+        // wc alone.
+        assert_eq!(
+            fill_readback_check(Some(&bwr), Some(0x7206), 44, 101, Some(0x7206)),
+            ReadbackCheck::Bad {
+                field: "wc",
+                expect: 101,
+                got: 100,
+                others: false
+            }
+        );
+        // The read buffer's first word alone.
+        assert_eq!(
+            fill_readback_check(Some(&bwr), Some(0x7207), 44, 100, Some(0x7206)),
+            ReadbackCheck::Bad {
+                field: "first",
+                expect: 0x7206,
+                got: 0x7207,
+                others: false
+            }
+        );
+        // A missing bwr read is Unreadable, never
+        // a mismatch; with no expected first word
+        // the buffer word is not judged.
+        assert_eq!(
+            fill_readback_check(None, None, 44, 100, None),
+            ReadbackCheck::Unreadable
+        );
+        assert_eq!(
+            fill_readback_check(Some(&bwr), None, 44, 100, None),
+            ReadbackCheck::Ok
+        );
+    }
+
+    #[test]
+    fn stamp_tombstones_track_outcomes() {
+        let mut st = BinderState::default();
+        let pid = 5150;
+        // A fill settlement tombstones SettledFill
+        // with the settled stamp's send sequence.
+        st.record_sync_stamp(pid, test_stamp(2, 1));
+        st.mark_sync_stamp_answered(pid, 2, 55, 16, AnswerKind::Reply);
+        st.settle_fill_answers(pid, &reply_fill(), "parked");
+        assert_eq!(
+            st.stamp_tombstones.get(&pid),
+            Some(&(StampOutcome::SettledFill, 1))
+        );
+        // An un-answered overwrite orphans the old
+        // stamp and tombstones OverwrittenOrphan.
+        st.record_sync_stamp(pid, test_stamp(2, 2));
+        st.record_sync_stamp(pid, test_stamp(2, 3));
+        assert_eq!(
+            st.stamp_tombstones.get(&pid),
+            Some(&(StampOutcome::OverwrittenOrphan, 2))
+        );
     }
 }
