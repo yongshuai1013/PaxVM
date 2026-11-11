@@ -1160,6 +1160,18 @@ struct ProcState {
     /// sequence at the last stop processed for this
     /// tracee; the servicer-face age field reads it.
     last_stop_seq: u64,
+    /// 0.9.142 (s9-142-desk section 3): this thread
+    /// belongs to the system_server candidate's
+    /// family. Set at birth: the candidate itself
+    /// when the slot is filled, inherited from the
+    /// parent otherwise (a family thread's children
+    /// are family; zygote's other children are not,
+    /// and an app child of the family root keeps
+    /// the mark the way the parent-chain walk in
+    /// wedge_snapshot would find it). Read by the
+    /// SIGSEGV cell's counters and FATAL batch.
+    /// Telemetry only.
+    ss_family: bool,
 }
 
 /// 0.9.141 (s9-141-desk P3): per-thread counters over
@@ -1206,6 +1218,7 @@ impl ProcState {
             sigsys_preentry: 0,
             win: WinProfile::default(),
             last_stop_seq: 0,
+            ss_family: false,
         }
     }
 }
@@ -2383,6 +2396,64 @@ struct WriteAuditRec {
     head: Vec<u8>,
 }
 
+/// 0.9.142 (s9-142-desk section 2.2): one thread's
+/// outstanding synchronous call, stamped at delivery
+/// time. The registered-wait model (waiters queues
+/// and serving stacks) has a proven hole: a class of
+/// calls is delivered, consumed by the peer, and
+/// awaited at reply position with no record in
+/// either home (.141 section 4's negative: the
+/// frozen waits all sit at reply side with the
+/// stream evidence gone). This stamp is the
+/// delivery-time key the wedge snapshot's reverse
+/// lookup (section 2.4) reads the wait back from.
+/// One stamp per sender thread (a GB binder thread's
+/// synchronous calls are blocking, so it can have at
+/// most one of its own outstanding); a second send
+/// over a live stamp moves the old one to the
+/// per-arena orphan list instead of overwriting it.
+/// Telemetry only, on the section 4 synthesized-line
+/// red line: read by the wedge trigger and the
+/// reverse lookup, never by pairing, claim, settle,
+/// delivery or the verdict.
+struct SyncStamp {
+    sender_arena: String,
+    /// Target arena as resolved through the handle /
+    /// node registry at send time; the literal
+    /// "unresolved" when resolution failed (the send
+    /// path in this tree always resolves before the
+    /// wait is recorded, so the field is carried for
+    /// the format's sake).
+    target_arena: String,
+    code: u32,
+    data_size: u32,
+    /// Coordinator delivery order (BinderState::
+    /// deliver_seq at write time).
+    send_seq: u64,
+    /// Backfilled by binder_claim_fills when a
+    /// serving thread claims this call's wait.
+    claim_seq: Option<u64>,
+}
+
+/// 0.9.142 (s9-142-desk section 3.2): one entry of
+/// the per-thread binder profile ring the SS native
+/// SIGSEGV cell reads at a FATAL: a transaction this
+/// thread sent, or a reply it sent answering a
+/// claimed wait, with the peer arena and size.
+/// Written in binder_handle_txn / binder_send_txn
+/// for every thread (the coordinator holds no
+/// system_server identity; the ring is only ever
+/// dumped for a faulting SS thread), capped at 64,
+/// removed at thread exit. Telemetry only.
+struct FatalProfRec {
+    /// "txn" (this thread as caller) or "reply"
+    /// (this thread as server, answering a claim).
+    kind: &'static str,
+    code: u32,
+    peer: String,
+    size: u32,
+}
+
 #[derive(Default)]
 struct BinderState {
     procs: HashMap<String, BinderProc>,
@@ -2608,6 +2679,46 @@ struct BinderState {
     /// parks in its read side meanwhile, exactly like a
     /// slow synchronous call.
     mgr_pending: Vec<PendingMgrTxn>,
+    /// 0.9.142 (s9-142-desk section 2.2): the sync
+    /// send stamp ledger (see SyncStamp). Keyed by
+    /// sender pid; orphans are the overwritten stamps
+    /// per sender arena (cap 16, oldest dropped) with
+    /// a cumulative total beside them. deliver_seq is
+    /// the coordinator delivery-order counter the
+    /// stamps take their send_seq from. Settlement
+    /// prints both on the arena-death account lines.
+    /// Telemetry only.
+    sync_stamps: HashMap<i32, SyncStamp>,
+    sync_orphans: HashMap<String, VecDeque<SyncStamp>>,
+    sync_orphan_total: HashMap<String, u64>,
+    deliver_seq: u64,
+    /// 0.9.142 (s9-142-desk section 3.2): per-thread
+    /// binder profile rings for the SIGSEGV cell
+    /// (see FatalProfRec). Telemetry only.
+    fatal_ring: HashMap<i32, VecDeque<FatalProfRec>>,
+    /// 0.9.142 (s9-142-desk section 4.2): injected-
+    /// open rides that failed inside the ride
+    /// machinery (never reached the kernel), counted
+    /// apart from open attempts. The work is
+    /// tracer-side; the counts arrive by
+    /// MSG_ONEWAY_FD_STATS like the other fd fixup
+    /// counters. Reported at arena death on its own
+    /// settlement line.
+    fd_fixup_ride_failed: u64,
+    /// 0.9.142 (s9-142-desk section 1, option B):
+    /// head-word templates of healthy fat replies,
+    /// sampled at delivery -- the (target handle,
+    /// code, word0, word1) shapes honest replies in
+    /// the poison fat family's size band (512..=
+    /// 1024B; observed fat poison 532-936B across
+    /// .140/.141) actually carry, counted so a
+    /// future pop-point repair discussion has a
+    /// reference book of what a correct head looks
+    /// like per call shape. Sampling only: the
+    /// shield4 judgement and every disposal are
+    /// untouched, and nothing reads this back.
+    fat_templates: HashMap<(u32, u32, u32, u32), u64>,
+    fat_template_samples: u64,
 }
 
 /// One transaction held for the context manager (see
@@ -2656,6 +2767,53 @@ impl BinderState {
         if self.noted.insert(what.to_string()) {
             bsup!("binder: {what} (first occurrence)");
         }
+    }
+    /// 0.9.142 (s9-142-desk section 2.2): stamp one
+    /// delivered two-way transaction (see SyncStamp).
+    /// A live stamp under the same sender is the
+    /// pairing ledger leaking an answer; it moves to
+    /// the sender arena's orphan list (cap 16, oldest
+    /// dropped) and the cumulative orphan total,
+    /// never silently overwritten.
+    fn record_sync_stamp(&mut self, sender_pid: i32, stamp: SyncStamp) {
+        if let Some(old) = self.sync_stamps.remove(&sender_pid) {
+            let arena = old.sender_arena.clone();
+            *self.sync_orphan_total.entry(arena.clone()).or_default() += 1;
+            let q = self.sync_orphans.entry(arena).or_default();
+            if q.len() >= 16 {
+                q.pop_front();
+            }
+            q.push_back(old);
+        }
+        self.sync_stamps.insert(sender_pid, stamp);
+    }
+    /// 0.9.142: settle one sender's stamp when its
+    /// wait is answered in any form (reply pop,
+    /// DEAD_REPLY at a serving thread's exit or at
+    /// the target arena's death). Guarded by the
+    /// wait's code: the stamp under a sender belongs
+    /// to its current outstanding call, and a pop
+    /// for an older call (its stamp already orphaned)
+    /// must not clear the newer call's stamp.
+    fn clear_sync_stamp(&mut self, sender_pid: i32, code: u32) {
+        if self
+            .sync_stamps
+            .get(&sender_pid)
+            .is_some_and(|s| s.code == code)
+        {
+            self.sync_stamps.remove(&sender_pid);
+        }
+    }
+    /// 0.9.142 (s9-142-desk section 3.2): file one
+    /// binder event in a thread's SIGSEGV-cell
+    /// profile ring (see FatalProfRec), newest last,
+    /// capped at 64.
+    fn record_fatal_prof(&mut self, pid: i32, rec: FatalProfRec) {
+        let q = self.fatal_ring.entry(pid).or_default();
+        if q.len() >= 64 {
+            q.pop_front();
+        }
+        q.push_back(rec);
     }
     fn node_for_local(&mut self, owner: &str, ptr: u32, cookie: u32) -> usize {
         if let Some(i) = self.nodes.iter().position(|n| {
@@ -2784,6 +2942,15 @@ const MSG_REQ_IGNITION_DUMP: u8 = 9;
 // rides the snapshot instant and the oneway log
 // channel provably loses lines there.
 const MSG_REQ_WEDGE_CHAIN: u8 = 10;
+// 0.9.142 (s9-142-desk section 3.2): the tracer
+// asks the coordinator for one faulting SS
+// thread's SIGSEGV-cell dump (phase / profile /
+// poison), handing over the phase fields only it
+// owns (tenure age in its emit lines, its apk
+// scan counters); the reply carries the captured
+// lines for in-order replay beside the FATAL
+// line, exactly like the ignition dump.
+const MSG_REQ_FATAL_DUMP: u8 = 11;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -2831,6 +2998,7 @@ const MSG_PUSH_SERVICER_FACE: u8 = 44;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
+const MSG_RESP_FATAL_DUMP: u8 = 111;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -3581,6 +3749,33 @@ impl CoordClient {
         (logs, holder, servicers)
     }
 
+    /// 0.9.142 (s9-142-desk section 3.2): ask the
+    /// coordinator for one faulting SS thread's
+    /// SIGSEGV-cell dump and hand the captured
+    /// lines back for in-order replay beside the
+    /// FATAL line, exactly like ignition_dump. The
+    /// phase fields only this side owns (the
+    /// tenure's age in this worker's emit lines,
+    /// the apk scan counters of the tenure) ride
+    /// the request; the coordinator reads the
+    /// rest off its binder state.
+    fn fatal_dump(
+        &mut self,
+        pid: i32,
+        birth_age_lines: u64,
+        apk_scanned: u32,
+        last_apk: &str,
+    ) -> Vec<(String, String)> {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.u64(birth_age_lines);
+        e.u32(apk_scanned);
+        e.string(last_apk);
+        let p = self.rpc(MSG_REQ_FATAL_DUMP, &e.0, MSG_RESP_FATAL_DUMP);
+        let mut d = Dec::new(&p);
+        d.logs()
+    }
+
     fn set_context_mgr(
         &mut self,
         pid: i32,
@@ -3683,13 +3878,22 @@ impl CoordClient {
     /// (low-slot dups performed, write-back
     /// verifications passed). 0.9.137 appends the
     /// injected-open retry deltas (retries performed,
-    /// fixups saved by one).
-    fn oneway_fd_stats(&mut self, dupped: u32, verified: u32, retried: u32, retry_saved: u32) {
+    /// fixups saved by one). 0.9.142 appends the
+    /// ride-failure delta (section 4.2).
+    fn oneway_fd_stats(
+        &mut self,
+        dupped: u32,
+        verified: u32,
+        retried: u32,
+        retry_saved: u32,
+        ride_failed: u32,
+    ) {
         let mut e = Enc::new();
         e.u32(dupped);
         e.u32(verified);
         e.u32(retried);
         e.u32(retry_saved);
+        e.u32(ride_failed);
         self.send(MSG_ONEWAY_FD_STATS, &e.0);
     }
 
@@ -3932,6 +4136,10 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
     // thread's parcels.
     st.claim_parcels.remove(&pid);
     st.send_src.remove(&pid);
+    // 0.9.142 (s9-142-desk section 3.2): the
+    // SIGSEGV-cell profile ring dies with the
+    // thread, like the collision rings above.
+    st.fatal_ring.remove(&pid);
     if let Some(stack) = st.serving.remove(&pid) {
         // 0.9.130: groups oldest-first, frames in claim
         // order -- the flat stack's iteration order, so
@@ -3942,6 +4150,10 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
                 if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                     bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
                 }
+                // 0.9.142 (s9-142-desk section 2.2):
+                // the DEAD_REPLY settles the caller's
+                // sync-send stamp with the wait.
+                st.clear_sync_stamp(w.sender_pid, w.code);
                 // 0.9.131: the DEAD_REPLY is an event in
                 // the waiter's evidence ring.
                 evidence_tag(
@@ -4826,6 +5038,17 @@ impl CoordServer {
                     self.push_servicer_face(&ss_arena, &servicers);
                 }
             }
+            MSG_REQ_FATAL_DUMP => {
+                let pid = d.i32();
+                let birth_age_lines = d.u64();
+                let apk_scanned = d.u32();
+                let last_apk = d.string();
+                cap_clear();
+                binder_fatal_dump(&self.st, pid, birth_age_lines, apk_scanned, &last_apk);
+                let mut e = Enc::new();
+                e.logs(&cap_take());
+                self.send_to(ci, MSG_RESP_FATAL_DUMP, &e.0);
+            }
             MSG_ONEWAY_PARK => {
                 let pid = d.i32();
                 let park = d.park();
@@ -4872,10 +5095,16 @@ impl CoordServer {
                 let verified = d.u32();
                 let retried = d.u32();
                 let retry_saved = d.u32();
+                // 0.9.142: ride failures ride the same
+                // message, appended at the end (Dec
+                // reads past a short frame as zero, so
+                // a shorter frame still decodes).
+                let ride_failed = d.u32();
                 self.st.fd_fixup_dupped += dupped as u64;
                 self.st.fd_fixup_verified += verified as u64;
                 self.st.fd_fixup_retried += retried as u64;
                 self.st.fd_fixup_retry_saved += retry_saved as u64;
+                self.st.fd_fixup_ride_failed += ride_failed as u64;
             }
             MSG_ONEWAY_ISSUANCE_STATS => {
                 let reads = d.u32();
@@ -5403,8 +5632,8 @@ fn exec_binder_actions(
                     put.push((k.clone(), -1));
                 }
                 coord.oneway_fd_cache_put(&put);
-                if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 {
-                    coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved);
+                if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
+                    coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
                 }
                 if !res.failed.is_empty() {
                     // 0.9.134 (fix (a)): convert the
@@ -6349,6 +6578,82 @@ fn binder_ignition_dump(st: &BinderState, pid: i32, trigger: &str) {
     bsup!("binder: ignition dump end pid={pid}");
 }
 
+/// 0.9.142 (s9-142-desk section 3.2): the
+/// coordinator half of the SS native SIGSEGV
+/// cell's FATAL batch, assembled at the tracer's
+/// request (see MSG_REQ_FATAL_DUMP) and replayed
+/// beside the FATAL line like the ignition dump.
+/// The phase fields split by ownership: the
+/// tracer passes its own (the tenure's age in its
+/// emit lines, its apk scan counters); the arena,
+/// the serving-based pms_done proxy and the two
+/// accounts below are read off this state.
+/// pms_done is a proxy, named as the spec names
+/// it: 1 when a thread of the arena currently
+/// holds serving frames (the arena has begun
+/// serving, so the PMS scan phase lies behind
+/// it), 0 while it holds none, - when the
+/// faulting thread's arena is unknown.
+fn binder_fatal_dump(
+    st: &BinderState,
+    pid: i32,
+    birth_age_lines: u64,
+    apk_scanned: u32,
+    last_apk: &str,
+) {
+    let arena = st.thread_arena.get(&pid).cloned();
+    let arena_s = arena.as_deref().unwrap_or("-");
+    let pms_done = match &arena {
+        Some(a) => {
+            if st.serving.values().any(|s| &s.arena == a && s.depth() > 0) {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        None => "-",
+    };
+    let last_s = if last_apk.is_empty() { "-" } else { last_apk };
+    bsup!(
+        "binder: fatal-phase arena={arena_s} pid={pid} birth_age_lines={birth_age_lines} apk_scanned={apk_scanned} last_apk={last_s} pms_done={pms_done}"
+    );
+    match st.fatal_ring.get(&pid) {
+        Some(q) if !q.is_empty() => {
+            let parts: Vec<String> = q
+                .iter()
+                .map(|r| format!("({},{},{},{})", r.kind, r.code, r.peer, r.size))
+                .collect();
+            bsup!("binder: fatal-profile pid={pid} entries=[{}]", parts.join(","));
+        }
+        _ => bsup!("binder: fatal-profile pid={pid} entries=[]"),
+    }
+    // Same-tenure poison co-occurrence (section
+    // 3.2 item 3): the arena's shield4 drops so
+    // far, read off its ignition evidence tags --
+    // the coordinator's existing record of them,
+    // no new bookkeeping.
+    let mut seqs: Vec<u64> = Vec::new();
+    if let Some(ev) = arena.as_ref().and_then(|a| st.evidence.get(a)) {
+        for t in &ev.tags {
+            if t.starts_with("shield4 ") {
+                for part in t.split_whitespace() {
+                    if let Some(v) = part.strip_prefix("seq=") {
+                        if let Ok(n) = v.parse::<u64>() {
+                            seqs.push(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let seq_s: Vec<String> = seqs.iter().map(|n| n.to_string()).collect();
+    bsup!(
+        "binder: fatal-poison arena={arena_s} drops={} seqs=[{}]",
+        seqs.len(),
+        seq_s.join(",")
+    );
+}
+
 /// 0.9.140 (M2): the first outstanding wait one
 /// thread owns as sender, wherever it currently
 /// lives -- the shared per-target queues, or claimed
@@ -6664,6 +6969,169 @@ fn print_inferred(arena: &str, pid: i32, inf: &[InferredWait]) {
     }
 }
 
+/// 0.9.142 (s9-142-desk section 2.4): the reverse
+/// lookup for one unregistered reply wait. The
+/// frozen thread P waits for the reply to a call
+/// the registered model never recorded; its
+/// sync-send stamp (section 2.2) names the target
+/// arena and code, and this reads the call's
+/// in-flight state back out of that arena's three
+/// live tables -- its waiters queue, its serving
+/// stacks, its parcel table -- as one of four
+/// states: queued-unclaimed (still in the queue,
+/// nobody took it), claimed (a serving thread
+/// holds it; that thread's v1 servicer face
+/// follows), evaporated (in none of the tables;
+/// the next step is an offline claim-seq join,
+/// not another live probe), with the parcel
+/// table's record as a side annotation on any
+/// state. Pure telemetry on the usual red line:
+/// reads tables and stamps, feeds no pairing,
+/// claim, settle, delivery or verdict path.
+#[allow(clippy::too_many_arguments)]
+fn wedge_servicer2<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
+    st: &BinderState,
+    arena: &str,
+    p: i32,
+    stamp: &SyncStamp,
+    rd: &mut R,
+    face_out: &mut Vec<(String, i32)>,
+) {
+    let s_arena = stamp.target_arena.as_str();
+    let claim_s = match stamp.claim_seq {
+        Some(n) => n.to_string(),
+        None => "none".to_string(),
+    };
+    bsup!(
+        "binder: wedge-servicer2-head arena={arena} servicer_arena={s_arena} pid={p} code={} data_size={} send_seq={} claim_seq={claim_s}",
+        stamp.code, stamp.data_size, stamp.send_seq
+    );
+    let queued = st.waiters.get(s_arena).is_some_and(|q| {
+        q.iter()
+            .any(|w| w.sender_pid == p && w.code == stamp.code)
+    });
+    let mut claimed: Option<(i32, u64, usize)> = None;
+    for (x, stack) in &st.serving {
+        if stack.arena != s_arena {
+            continue;
+        }
+        for g in &stack.groups {
+            for fr in &g.frames {
+                if let ServingFrame::Reply(w, seq) = fr {
+                    if w.sender_pid == p && w.code == stamp.code {
+                        claimed = Some((*x, *seq, stack.depth()));
+                    }
+                }
+            }
+        }
+    }
+    let parcel_s = match st.procs.get(s_arena).and_then(|bp| {
+        bp.parcels
+            .values()
+            .find(|pp| pp.from_pid == p && pp.code == stamp.code)
+            .map(|pp| (pp.target_ptr, pp.txn_cookie))
+    }) {
+        Some((tp, tc)) => {
+            format!(" parcel=present target_ptr=0x{tp:x} txn_cookie=0x{tc:x}")
+        }
+        None => String::new(),
+    };
+    if queued {
+        bsup!(
+            "binder: wedge-servicer2-state arena={arena} servicer_arena={s_arena} pid={p} state=queued-unclaimed{parcel_s}"
+        );
+        // Why has nobody claimed it: the servicer
+        // arena's parked threads by park kind, one
+        // line (section 2.4 item 4).
+        let mut lpids: Vec<i32> = st
+            .parked
+            .keys()
+            .copied()
+            .filter(|q| st.thread_arena.get(q) == Some(&stamp.target_arena))
+            .collect();
+        lpids.sort_unstable();
+        let (mut idle, mut wait_reply, mut other) = (0usize, 0usize, 0usize);
+        for q in &lpids {
+            if find_wait_for_sender(st, *q).is_some() {
+                wait_reply += 1;
+            } else {
+                let has_stamp = st.sync_stamps.contains_key(q);
+                let fs = decode_frozen_stream(rd, *q, &st.parked[q]);
+                let inf = frozen_inferred(st, s_arena, *q, &fs);
+                if has_stamp || !inf.is_empty() {
+                    other += 1;
+                } else {
+                    idle += 1;
+                }
+            }
+        }
+        bsup!(
+            "binder: wedge-servicer2-looper servicer_arena={s_arena} parked={} idle={idle} wait_reply={wait_reply} other={other}",
+            lpids.len()
+        );
+        return;
+    }
+    if let Some((x, seq, depth)) = claimed {
+        bsup!(
+            "binder: wedge-servicer2-state arena={arena} servicer_arena={s_arena} pid={p} state=claimed serving_pid={x} claim_seq={seq} depth={depth}{parcel_s}"
+        );
+        // The servicer's face, in the v1 forms (see
+        // the S6 block in binder_wedge_chain): its
+        // serving stack, its own frozen stream when
+        // parked, and a tracer-side face line via
+        // the caller's broadcast list.
+        let frames = match st.serving.get(&x) {
+            Some(stack) => {
+                let mut parts: Vec<String> = Vec::new();
+                for g in &stack.groups {
+                    for fr in &g.frames {
+                        match fr {
+                            ServingFrame::Reply(w, _) => {
+                                parts.push(format!("({},{})", w.sender_pid, w.code))
+                            }
+                            ServingFrame::Other => {
+                                parts.push("(-,oneway)".to_string())
+                            }
+                        }
+                    }
+                }
+                parts.join(",")
+            }
+            None => String::new(),
+        };
+        bsup!(
+            "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={x} depth={depth} frames=[{frames}]"
+        );
+        if let Some(park) = st.parked.get(&x) {
+            let fs = decode_frozen_stream(rd, x, park);
+            let inferred = frozen_inferred(st, s_arena, x, &fs);
+            let (kind, t_s, c_s) = match find_wait_for_sender(st, x) {
+                Some((t, c)) => ("wait-reply", t, c.to_string()),
+                None => match inferred.first() {
+                    Some(f) => (
+                        "wait-reply-inferred",
+                        f.target_arena
+                            .clone()
+                            .unwrap_or_else(|| "unresolved".to_string()),
+                        f.code.to_string(),
+                    ),
+                    None => ("idle", "-".to_string(), "-".to_string()),
+                },
+            };
+            let skel = frozen_skeleton(&fs);
+            bsup!(
+                "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
+            );
+            print_inferred(s_arena, x, &inferred);
+        }
+        face_out.push((s_arena.to_string(), x));
+        return;
+    }
+    bsup!(
+        "binder: wedge-servicer2-state arena={arena} servicer_arena={s_arena} pid={p} state=evaporated{parcel_s} next=offline-claim-seq"
+    );
+}
+
 /// 0.9.140 (s9-140-desk-ignition M2/M3/M6): the
 /// wedge chain dump for one system_server arena,
 /// assembled coordinator-side at the tracer's
@@ -6832,6 +7300,13 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         .filter(|p| st.thread_arena.get(p) == Some(&arena))
         .collect();
     park_pids.sort_unstable();
+    // 0.9.142 (s9-142-desk section 2.3): reverse
+    // lookups spent by this snapshot (cap 2, like
+    // the v1 servicer view) and the servicers they
+    // name as claimed, who join the face broadcast
+    // beside the v1 set.
+    let mut servicer2_used = 0usize;
+    let mut v2_servicers: Vec<(String, i32)> = Vec::new();
     for ppid in &park_pids {
         let park = &st.parked[ppid];
         // 0.9.141 (S4): the full stream decode, and
@@ -6842,6 +7317,16 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // the same stream the lines were read off.
         let fs = decode_frozen_stream(rd, *ppid, park);
         let inferred = frozen_inferred(st, &arena, *ppid, &fs);
+        // 0.9.142 (section 2.3): the fourth park
+        // kind. No registered wait (step 1) and no
+        // unconsumed transaction in the stream
+        // (step 2, the inferred set covers every
+        // TRANSACTION the decode found), but a live
+        // sync-send stamp: the thread is waiting for
+        // the reply to a call the model never
+        // registered, and the stamp is the key the
+        // reverse lookup reads it back from.
+        let stamp = st.sync_stamps.get(ppid);
         let (kind, t_arena_s, code_s) = match find_wait_for_sender(st, *ppid) {
             Some((t, c)) => ("wait-reply", t, c.to_string()),
             None => match inferred.first() {
@@ -6852,7 +7337,14 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                         .unwrap_or_else(|| "unresolved".to_string()),
                     f.code.to_string(),
                 ),
-                None => ("idle", "-".to_string(), "-".to_string()),
+                None => match stamp {
+                    Some(s) => (
+                        "wait-reply-unregistered",
+                        s.target_arena.clone(),
+                        s.code.to_string(),
+                    ),
+                    None => ("idle", "-".to_string(), "-".to_string()),
+                },
             },
         };
         let frozen = frozen_skeleton(&fs);
@@ -6860,6 +7352,21 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             "binder: wedge-park arena={arena} pid={ppid} park_kind={kind} target_arena={t_arena_s} code={code_s} frozen_write=[{frozen}]"
         );
         print_inferred(&arena, *ppid, &inferred);
+        if kind == "wait-reply-unregistered" {
+            let s = stamp.expect("v2 kind implies a stamp");
+            if s.target_arena == "unresolved" {
+                bsup!(
+                    "binder: wedge-servicer2-skip pid={ppid} reason=unresolved"
+                );
+            } else if servicer2_used >= 2 {
+                bsup!(
+                    "binder: wedge-servicer2-skip pid={ppid} reason=cap"
+                );
+            } else {
+                servicer2_used += 1;
+                wedge_servicer2(st, &arena, *ppid, s, rd, &mut v2_servicers);
+            }
+        }
     }
     // (S6) The servicer view (0.9.141): for each
     // distinct servicer behind a frozen claimed
@@ -7017,7 +7524,16 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             "-".to_string()
         }
     );
-    (holder, servicer_hits)
+    // 0.9.142 (section 2.4): servicers the v2
+    // reverse lookups found claimed join the face
+    // broadcast beside the v1 set.
+    let mut all_servicers = servicer_hits;
+    for s in v2_servicers {
+        if !all_servicers.contains(&s) {
+            all_servicers.push(s);
+        }
+    }
+    (holder, all_servicers)
 }
 
 /// Cap on the write-overlap audit table (0.9.132):
@@ -7577,6 +8093,27 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             );
             return;
         };
+        // 0.9.142 (s9-142-desk section 2.2): the pop
+        // settles the wait in every form downstream
+        // of here (delivery, or FAILED_REPLY via
+        // shield3 / shield4 / a failed delivery), so
+        // the waiter's sync-send stamp settles with
+        // it, here at the pairing hinge.
+        st.clear_sync_stamp(w.sender_pid, w.code);
+        // 0.9.142 (s9-142-desk section 3.2): the
+        // reply joins the replier's SIGSEGV-cell
+        // profile ring, filed at the pop -- what the
+        // thread was serving, named by the claimed
+        // wait it answers.
+        st.record_fatal_prof(
+            pid,
+            FatalProfRec {
+                kind: "reply",
+                code: w.code,
+                peer: w.sender_arena.clone(),
+                size: data.len() as u32,
+            },
+        );
         // 0.9.128 telemetry: photograph the pop itself --
         // the claim sequence of the frame this BC_REPLY
         // is answering (its source claim, stamped in
@@ -7985,6 +8522,21 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 format!("reply size={} seq={claim_seq} from={pid}", tdata.len()),
             );
         }
+        // 0.9.142 (s9-142-desk section 1, option B):
+        // sample the head words of healthy delivered
+        // replies in the poison fat family's size
+        // band into the repair-template account (see
+        // BinderState::fat_templates). Sampling only,
+        // after the delivery above; the shield4
+        // judgement and this delivery are untouched.
+        if delivered_ok && (512..=1024).contains(&tdata.len()) {
+            let w0 = u32_at(&tdata, 0);
+            let w1 = u32_at(&tdata, 4);
+            *st.fat_templates
+                .entry((w.target_handle, w.code, w0, w1))
+                .or_default() += 1;
+            st.fat_template_samples += 1;
+        }
         // 0.9.124 telemetry: photograph any parcel this
         // pairing path actually sent out as a reply whose
         // size falls outside the honest reply set {4, 8,
@@ -8266,7 +8818,37 @@ fn binder_send_txn(
             target_handle: target,
             code,
         });
+        // 0.9.142 (s9-142-desk section 2.2): stamp
+        // the call at the same instant its wait is
+        // recorded (see SyncStamp). The wedge
+        // snapshot's reverse lookup reads this back
+        // for the class of waits the registered model
+        // loses; nothing else consults it.
+        st.deliver_seq += 1;
+        let send_seq = st.deliver_seq;
+        st.record_sync_stamp(
+            pid,
+            SyncStamp {
+                sender_arena: arena.to_string(),
+                target_arena: owner.to_string(),
+                code,
+                data_size: data.len() as u32,
+                send_seq,
+                claim_seq: None,
+            },
+        );
     }
+    // 0.9.142 (s9-142-desk section 3.2): the send
+    // joins the sender's SIGSEGV-cell profile ring.
+    st.record_fatal_prof(
+        pid,
+        FatalProfRec {
+            kind: "txn",
+            code,
+            peer: owner.to_string(),
+            size: data.len() as u32,
+        },
+    );
     if let Some(bp) = st.procs.get_mut(arena) {
         // Kernel ordering: 81e7dc2 flushed the shared
         // inbound stream ahead of BR_REPLY (and ahead of
@@ -8628,6 +9210,18 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                         // same helper the big-reply dump
                         // uses, so the two lines join).
                         st.claim_seq += 1;
+                        // 0.9.142 (s9-142-desk section
+                        // 2.2): the claim backfills the
+                        // sender's sync-send stamp with
+                        // this claim's sequence, so a
+                        // wedge reverse lookup can join
+                        // the stamped call to the claim
+                        // that took it on.
+                        if let Some(s) = st.sync_stamps.get_mut(&w.sender_pid) {
+                            if s.code == w.code {
+                                s.claim_seq = Some(st.claim_seq);
+                            }
+                        }
                         let (kptr, kcookie) = claim_key_node(st, &w);
                         claimed_key = Some((
                             st.claim_seq,
@@ -9018,14 +9612,14 @@ fn inject_mmap(
     }
     cont_syscall(pid, 0);
     match wait_one_syscall_stop(pid) {
-        Some(()) => match get_regs(pid, compat) {
+        Ok(()) => match get_regs(pid, compat) {
             Some(r) => {
                 *regs = r;
                 r.retval()
             }
             None => -1,
         },
-        None => -1,
+        Err(_) => -1,
     }
 }
 
@@ -9172,26 +9766,33 @@ fn dump_mgr_read(st: &BinderState, arena: &str, pid: i32, bytes: &[u8]) {
 /// suppressing any signal stops on the way. Event stops
 /// abort: they belong to the main loop's bookkeeping and
 /// must not be silently swallowed.
-fn wait_one_syscall_stop(pid: i32) -> Option<()> {
+/// 0.9.142 (s9-142-desk section 4.2): the failure exits
+/// are enumerated, not folded into one None -- the four
+/// ways this wait can end without a syscall stop (the
+/// waitpid itself failing, the tracee dying mid-ride, an
+/// event stop, the stop budget running out) are exactly
+/// the ride-failure tags the fd telemetry prints, and
+/// two of them used to be silent.
+fn wait_one_syscall_stop(pid: i32) -> Result<(), &'static str> {
     for _ in 0..32 {
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(pid, &mut status, WALL) };
         if r <= 0 {
-            return None;
+            return Err("wait-waitpid");
         }
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
             sup!("binder: fd injection lost pid={pid} (exited during injection)");
-            return None;
+            return Err("wait-lost");
         }
         if libc::WIFSTOPPED(status) {
             let sig = libc::WSTOPSIG(status);
             let event = (status >> 16) & 0xffff;
             if sig == (libc::SIGTRAP | 0x80) && event == 0 {
-                return Some(());
+                return Ok(());
             }
             if event != 0 {
                 sup!("binder: fd injection hit an event stop pid={pid} event={event}; aborting");
-                return None;
+                return Err("wait-event");
             }
             // Signal stop: suppress and keep waiting. (A late
             // SIGSYS belonging to the parked call is harmless
@@ -9200,7 +9801,7 @@ fn wait_one_syscall_stop(pid: i32) -> Option<()> {
             cont_syscall(pid, 0);
         }
     }
-    None
+    Err("wait-exhausted")
 }
 
 /// 0.9.139 (s9-138-verify Q2/Q5): is the 4-byte word at
@@ -9222,12 +9823,32 @@ fn svc_anchor_ok(pid: i32, compat: bool, addr: u64) -> bool {
     }
 }
 
+/// 0.9.142 (s9-142-desk section 4.2): what one
+/// inject_syscall ride actually came back with.
+/// Kernel is the guest's own r0 when the injected
+/// call really ran -- the only value the fd
+/// telemetry may render as an errno. Failed names
+/// the ride-machinery exit that kept the call from
+/// ever asking the kernel; every exit of
+/// inject_syscall fills exactly one of the two.
+/// The pre-.142 Option<i64> out-param could not
+/// tell them apart (six exits, one wrote the slot),
+/// so the resolver billed ride failures against
+/// the open's attempt cap as if the kernel had
+/// answered -1, and a bare errno=na was the only
+/// trace they left.
+enum RideR0 {
+    Kernel(i64),
+    Failed(&'static str),
+}
+
 /// Run one syscall inside a tracee stopped at a syscall
 /// stop and return its result (or a negative value). The
 /// first ride uses the stop we are already sitting on;
 /// later rides rewind the PC to the svc instruction and
 /// drive entry+exit privately. On return `regs` holds
-/// the exit-stop registers of the injected call.
+/// the exit-stop registers of the injected call, and
+/// `ride_r0` holds the ride's outcome (see RideR0).
 #[allow(clippy::too_many_arguments)]
 fn inject_syscall(
     pid: i32,
@@ -9237,7 +9858,7 @@ fn inject_syscall(
     entry_pc: u64,
     rewind: bool,
     regs: &mut Regs,
-    raw_r0: &mut Option<i64>,
+    ride_r0: &mut RideR0,
 ) -> i64 {
     if rewind {
         // 0.9.139 (s9-138-verify Q2/Q5): entry_pc comes
@@ -9259,6 +9880,7 @@ fn inject_syscall(
             sup!(
                 "binder: fd injection rewind-anchor-bad pid={pid} nr={nr} entry_pc=0x{entry_pc:x} landing=0x{landing:x}; obtain aborted"
             );
+            *ride_r0 = RideR0::Failed("anchor-bad");
             return -1;
         }
         regs.set_pc(landing);
@@ -9268,36 +9890,43 @@ fn inject_syscall(
         regs.set_arg(i, *a);
     }
     if !set_regs(pid, regs) {
+        *ride_r0 = RideR0::Failed("set-regs");
         return -1;
     }
     if !set_syscallno(pid, nr as i32) {
         sup!("binder: fd injection NT_ARM_SYSTEM_CALL failed pid={pid}");
+        *ride_r0 = RideR0::Failed("set-syscallno");
         return -1;
     }
     cont_syscall(pid, 0);
     let mut stops_needed = if rewind { 2 } else { 1 };
     loop {
         match wait_one_syscall_stop(pid) {
-            Some(()) => {
+            Ok(()) => {
                 stops_needed -= 1;
                 if stops_needed == 0 {
                     match get_regs(pid, compat) {
                         Some(r) => {
                             *regs = r;
-                            // 0.9.141 (S3.3): the one
+                            // 0.9.141 (S3.3) / 0.9.142
+                            // (section 4.2): the one
                             // place a return value is
-                            // the guest's own r0 --
-                            // every other return path
-                            // of this function is a
-                            // synthetic -1, and the fd
+                            // the guest's own r0, now
+                            // carried as RideR0::Kernel
+                            // -- every other exit of
+                            // this function is a named
+                            // ride failure, and the fd
                             // telemetry's errno field
                             // must never wear a
                             // synthetic value as the
                             // kernel's.
-                            *raw_r0 = Some(r.retval());
+                            *ride_r0 = RideR0::Kernel(r.retval());
                             return r.retval();
                         }
-                        None => return -1,
+                        None => {
+                            *ride_r0 = RideR0::Failed("get-regs");
+                            return -1;
+                        }
                     }
                 }
                 // A rewind ride's intermediate entry
@@ -9320,12 +9949,16 @@ fn inject_syscall(
                         sup!(
                             "binder: fd injection ride-entry-mismatch pid={pid} nr={nr} entry_sysno={n}; obtain aborted"
                         );
+                        *ride_r0 = RideR0::Failed("entry-mismatch");
                         return -1;
                     }
                 }
                 cont_syscall(pid, 0);
             }
-            None => return -1,
+            Err(tag) => {
+                *ride_r0 = RideR0::Failed(tag);
+                return -1;
+            }
         }
     }
 }
@@ -9374,10 +10007,10 @@ fn inject_openat(
     regs: &mut Regs,
     sender_pid: i32,
     sender_fd: i32,
-) -> (i64, Option<i64>) {
+) -> (i64, RideR0) {
     let nr_openat: u64 = if compat { 322 } else { 56 };
     let flags = sender_fd_open_flags(sender_pid, sender_fd);
-    let mut raw = None;
+    let mut raw = RideR0::Failed("unused");
     let r = inject_syscall(
         pid,
         compat,
@@ -9388,10 +10021,11 @@ fn inject_openat(
         regs,
         &mut raw,
     );
-    // 0.9.141 (S3.3): the raw guest r0 rides beside
-    // the collapsed return, so the resolver's errno
-    // rendering can tell a kernel errno from the
-    // ride's own synthetic -1.
+    // 0.9.141 (S3.3) / 0.9.142 (section 4.2): the
+    // ride outcome rides beside the collapsed
+    // return, so the resolver can tell a kernel
+    // errno from a ride failure that never asked
+    // the kernel (see RideR0).
     (r, raw)
 }
 
@@ -9410,6 +10044,7 @@ fn inject_dupfd_min(
     regs: &mut Regs,
 ) -> i64 {
     let nr_fcntl: u64 = if compat { 55 } else { 25 };
+    let mut sink = RideR0::Failed("unused");
     inject_syscall(
         pid,
         compat,
@@ -9418,7 +10053,7 @@ fn inject_dupfd_min(
         entry_pc,
         rewind,
         regs,
-        &mut None,
+        &mut sink,
     )
 }
 
@@ -9433,6 +10068,7 @@ fn inject_close(
     regs: &mut Regs,
 ) -> i64 {
     let nr_close: u64 = if compat { 6 } else { 57 };
+    let mut sink = RideR0::Failed("unused");
     inject_syscall(
         pid,
         compat,
@@ -9441,7 +10077,7 @@ fn inject_close(
         entry_pc,
         rewind,
         regs,
-        &mut None,
+        &mut sink,
     )
 }
 
@@ -9589,6 +10225,12 @@ struct FdResolution {
     /// the delivery-failure path).
     retried: u32,
     retry_saved: u32,
+    /// 0.9.142 (s9-142-desk section 4.2): obtain
+    /// rides that died inside the ride machinery
+    /// (RideR0::Failed) during this resolution --
+    /// billed against their own cap, never the
+    /// open's, and settled under this name.
+    ride_failed: u32,
 }
 
 /// Dispositions reported to the coordinator with each
@@ -9757,11 +10399,35 @@ fn fd_fail_convert_local(
 /// kernel errno; anything else -- including the
 /// ride's own synthetic -1 on its failure paths,
 /// which never sets the raw slot -- renders na,
-/// never a fabricated 1.
-fn errno_of_raw(raw: Option<i64>) -> String {
-    match raw {
-        Some(r) if (-4095..=-1).contains(&r) => format!("{}", -r),
+/// never a fabricated 1. 0.9.142 (s9-142-desk
+/// section 4.2): the raw slot is now the RideR0
+/// enumeration -- a ride failure carries its exit
+/// tag instead of an absent slot, and the resolver
+/// below bills it against its own cap and counter,
+/// never the open's.
+fn errno_of_ride(r0: &RideR0) -> String {
+    match r0 {
+        RideR0::Kernel(r) if (-4095..=-1).contains(r) => format!("{}", -r),
         _ => "na".to_string(),
+    }
+}
+
+/// 0.9.142 (s9-142-desk section 4.2): the single
+/// rendering of an obtain failure's why/errno pair,
+/// shared by the retry and fail lines so the two
+/// can never drift apart (the pre-.142 lines
+/// rendered the same fact from two places). A
+/// kernel answer renders why=open_ret=<r> with its
+/// errno; a ride failure renders why=ride_fail with
+/// its exit tag, errno=na and errno_src=none -- a
+/// bare errno=na with no named reason is the shape
+/// this section retires.
+fn fd_why_suffix(r: i64, r0: &RideR0) -> String {
+    match r0 {
+        RideR0::Kernel(_) => format!("why=open_ret={r} errno={}", errno_of_ride(r0)),
+        RideR0::Failed(tag) => {
+            format!("why=ride_fail tag={tag} errno=na errno_src=none")
+        }
     }
 }
 
@@ -9800,12 +10466,14 @@ fn resolve_fd_fixups_core(
         // at least one retry; a fixup that then reaches
         // its write-back counts as saved by the retry.
         let mut open_retried = false;
-        // 0.9.141 (S3.3): the errno the failing open
-        // itself produced, when the failure is the
-        // open's; later failure stages (verify, dup)
-        // have no kernel errno of their own and keep
-        // na.
-        let mut why_errno = "na".to_string();
+        // 0.9.142 (section 4.2): the obtain failure's
+        // rendered why/errno pair, set by the obtain
+        // loop when it gives up (fd_why_suffix: one
+        // rendering shared by the retry and fail
+        // lines). Later failure stages (verify, dup)
+        // leave it empty; the fail line renders their
+        // word with errno=na errno_src=none.
+        let mut why_render = String::new();
         if let Some(fd) = cache.get(&cache_key) {
             candidate = Some(*fd);
         } else {
@@ -9819,9 +10487,22 @@ fn resolve_fd_fixups_core(
             // and is counted and logged as it launches,
             // so the fd-fixup-retry lines and the
             // fd_fixup_retried counter reconcile 1:1.
-            let mut attempt = 0u32;
+            // 0.9.142 (s9-142-desk section 4.2): the two
+            // failure kinds now keep separate budgets.
+            // A kernel answer (RideR0::Kernel) spends
+            // the open's attempt budget exactly as .137
+            // set it; a ride failure (RideR0::Failed)
+            // never asked the kernel, so it spends only
+            // its own budget (also three) and its own
+            // settlement counter (ride_failed), leaving
+            // the open's cap untouched. The ride shape
+            // and the settle point are unchanged, and a
+            // re-ride still counts as a performed retry,
+            // so the retry lines and fd_fixup_retried
+            // keep reconciling 1:1 across both kinds.
+            let mut open_attempts = 0u32;
+            let mut ride_fails = 0u32;
             loop {
-                attempt += 1;
                 // 0.9.140: the 0.9.138 ride photograph
                 // (fd-ride-photo) retires here -- the fd
                 // line closed in .139 on its evidence
@@ -9831,9 +10512,12 @@ fn resolve_fd_fixups_core(
                 // lines and the two guardrail lines
                 // (rewind-anchor-bad, ride-entry-mismatch)
                 // stay on watch. The rides themselves are
-                // byte-for-byte the .139 ones.
+                // byte-for-byte the .139 ones. A scratch
+                // page that cannot be written is a ride
+                // failure of the same kind (tag scratch):
+                // the open was never attempted.
                 let rw = res.rides > 0;
-                let (r, raw_r0) = match scratch_write(pid, &mut cursor, &path) {
+                let (r, ride_r0) = match scratch_write(pid, &mut cursor, &path) {
                     Some(addr) => inject_openat(
                         pid,
                         compat,
@@ -9844,36 +10528,60 @@ fn resolve_fd_fixups_core(
                         fx.sender_pid,
                         fx.sender_fd,
                     ),
-                    None => (-1, None),
+                    None => (-1, RideR0::Failed("scratch")),
                 };
                 res.rides += 1;
                 if r >= 0 {
                     candidate = Some(r as i32);
                     break;
                 }
-                let w = format!("open_ret={r}");
-                // 0.9.141 (S3.3): the failed attempt's
-                // own errno / sender link / sender
-                // face, appended to the retry line
-                // (and kept for the fail line when
-                // this failure is the final one).
-                let errno_s = errno_of_raw(raw_r0);
-                if attempt >= 3 {
-                    why_errno = errno_s;
-                    why = Some(w);
-                    break;
+                // 0.9.142: one rendering of this
+                // failure for both the retry line here
+                // and the fail line below.
+                let suffix = fd_why_suffix(r, &ride_r0);
+                match &ride_r0 {
+                    RideR0::Kernel(_) => {
+                        open_attempts += 1;
+                        if open_attempts >= 3 {
+                            why = Some(format!("open_ret={r}"));
+                            why_render = suffix;
+                            break;
+                        }
+                        open_retried = true;
+                        res.retried += 1;
+                        sup!(
+                            "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} {} host_fd={} path_link={} sender_state={}",
+                            fx.sender_pid,
+                            fx.sender_fd,
+                            open_attempts + 1,
+                            suffix,
+                            fx.sender_fd,
+                            sender_link(fx.sender_pid, fx.sender_fd),
+                            sender_face(fx.sender_pid)
+                        );
+                    }
+                    RideR0::Failed(tag) => {
+                        ride_fails += 1;
+                        res.ride_failed += 1;
+                        if ride_fails >= 3 {
+                            why = Some(format!("ride_fail tag={tag}"));
+                            why_render = suffix;
+                            break;
+                        }
+                        open_retried = true;
+                        res.retried += 1;
+                        sup!(
+                            "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} {} host_fd={} path_link={} sender_state={}",
+                            fx.sender_pid,
+                            fx.sender_fd,
+                            ride_fails + 1,
+                            suffix,
+                            fx.sender_fd,
+                            sender_link(fx.sender_pid, fx.sender_fd),
+                            sender_face(fx.sender_pid)
+                        );
+                    }
                 }
-                open_retried = true;
-                res.retried += 1;
-                sup!(
-                    "binder: fd-fixup-retry sender_pid={} sender_fd={} recv_pid={pid} attempt={} why={w} errno={errno_s} host_fd={} path_link={} sender_state={}",
-                    fx.sender_pid,
-                    fx.sender_fd,
-                    attempt + 1,
-                    fx.sender_fd,
-                    sender_link(fx.sender_pid, fx.sender_fd),
-                    sender_face(fx.sender_pid)
-                );
             }
         }
         if let Some(fd0) = candidate {
@@ -9960,12 +10668,24 @@ fn resolve_fd_fixups_core(
             }
         }
         if let Some(w) = why {
+            // 0.9.142: obtain failures carry their
+            // rendered pair from the loop (the same
+            // fd_why_suffix the retry lines used);
+            // later-stage failures (verify, dup) render
+            // their word with errno=na errno_src=none.
+            // No stage prints a bare errno=na any more.
+            let render = if why_render.is_empty() {
+                format!("why={w} errno=na errno_src=none")
+            } else {
+                why_render.clone()
+            };
             sup!(
-                "binder: fd-fixup-fail sender_pid={} sender_fd={} recv_pid={pid} data_va=0x{:x} file_off=0x{:x} why={w} errno={why_errno} host_fd={} path_link={} sender_state={}",
+                "binder: fd-fixup-fail sender_pid={} sender_fd={} recv_pid={pid} data_va=0x{:x} file_off=0x{:x} {} host_fd={} path_link={} sender_state={}",
                 fx.sender_pid,
                 fx.sender_fd,
                 fx.data_va,
                 fx.file_off,
+                render,
                 fx.sender_fd,
                 sender_link(fx.sender_pid, fx.sender_fd),
                 sender_face(fx.sender_pid)
@@ -10041,8 +10761,8 @@ fn resolve_fd_fixups(
         put.push((k.clone(), -1));
     }
     coord.oneway_fd_cache_put(&put);
-    if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 {
-        coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved);
+    if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
+        coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
     }
     if res.rides == 0 {
         return res;
@@ -10230,6 +10950,45 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         st.poison_word0[5],
         st.poison_word0[6]
     );
+    // 0.9.142 (s9-142-desk sections 2.2 / 4.2 / 1):
+    // this build's new accounts, at the same
+    // settlement on their own lines, like the
+    // accounts above. sync_stamp_open counts this
+    // arena's senders whose stamped calls are still
+    // unanswered at this instant (the teardown below
+    // sweeps them); a count that grows tenure over
+    // tenure instead of falling back names a
+    // clearing path the stamps leak through.
+    bsup!(
+        "binder: arena {arena} sync stamp account: sync_stamp_open={} sync_stamp_orphan={}",
+        st.sync_stamps
+            .values()
+            .filter(|s| s.sender_arena == arena)
+            .count(),
+        st.sync_orphan_total.get(arena).copied().unwrap_or(0)
+    );
+    bsup!(
+        "binder: arena {arena} fd ride account: fd_fixup_ride_failed={}",
+        st.fd_fixup_ride_failed
+    );
+    {
+        let mut tops: Vec<(&(u32, u32, u32, u32), &u64)> =
+            st.fat_templates.iter().collect();
+        tops.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let parts: Vec<String> = tops
+            .iter()
+            .take(6)
+            .map(|(k, n)| {
+                format!("(h{},c{},0x{:x},0x{:x})x{}", k.0, k.1, k.2, k.3, n)
+            })
+            .collect();
+        bsup!(
+            "binder: arena {arena} fat template account: samples={} distinct={} top=[{}]",
+            st.fat_template_samples,
+            st.fat_templates.len(),
+            parts.join(" ")
+        );
+    }
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
     // an arena dies holding a backlog of unfreed parcels,
@@ -10413,12 +11172,25 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
             }
+            // 0.9.142 (s9-142-desk section 2.2): the
+            // DEAD_REPLY settles the waiter's stamp.
+            st.clear_sync_stamp(w.sender_pid, w.code);
             binder_maybe_wake_pids(st, &w.sender_arena, wakes);
         }
     }
     for v in st.waiters.values_mut() {
         v.retain(|w| w.sender_arena != arena);
     }
+    // 0.9.142 (s9-142-desk section 2.2): the dead
+    // arena's own senders are gone; their stamps
+    // and orphan list go with them (the settlement
+    // line above counted the open stamps first; the
+    // cumulative orphan total stays, a global-style
+    // account like the issuance and poison ones).
+    // The SIGSEGV profile rings need no sweep here:
+    // binder_thread_exit removed each thread's.
+    st.sync_stamps.retain(|_, s| s.sender_arena != arena);
+    st.sync_orphans.remove(arena);
     // 0.9.125: claimed waits sent BY the dead arena are
     // scrubbed from the surviving serving stacks too
     // (mirror of the queue retain above -- their callers
@@ -12372,6 +13144,69 @@ fn wedge_snapshot(
 /// here, in order, straight after the snapshot lines.
 /// The holder the coordinator's provisional verdict
 /// names is kept for the traces harvest (M5).
+/// 0.9.142 (s9-142-desk sections 3.1 / 3.2 item
+/// 4): name a SIGSEGV's shape against the reading
+/// key. Both field faults of the SS native
+/// SIGSEGV cell landed inside dlfree in the guest
+/// libc, dereferencing heap structures: +0x13628
+/// walks a bin link node and reads its +0xc word
+/// through r7 (bin-link: the node pointer is the
+/// bad one), +0x137de indexes the bin array and
+/// reads the head's +0x4 word through r2
+/// (bin-head). The offset is taken against the
+/// lowest mapping of the library the pc lives in
+/// -- its load base, the way the key was derived
+/// offline from the same system image's libc.
+/// Any other library or offset is "other", with
+/// the siginfo fault address standing as bad_ptr
+/// when one was read (0 when it was not).
+/// Read-only maps inspection of the stopped
+/// tracee; prints nothing itself.
+fn fatal_form(
+    pid: i32,
+    pc: u64,
+    regs: &Option<Regs>,
+    siginfo_addr: Option<u64>,
+) -> (&'static str, u64) {
+    let mut libname = String::new();
+    let mut base: Option<u64> = None;
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        let mut ranges: Vec<(u64, u64, String)> = Vec::new();
+        for line in maps.lines() {
+            let mut it = line.split_whitespace();
+            let Some(range) = it.next() else { continue };
+            let Some((lo, hi)) = range.split_once('-') else {
+                continue;
+            };
+            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+            let name = line
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            ranges.push((lo, hi, name));
+        }
+        if let Some((_, _, name)) =
+            ranges.iter().find(|(lo, hi, _)| pc >= *lo && pc < *hi)
+        {
+            libname = name.clone();
+            base = ranges
+                .iter()
+                .filter(|(_, _, n)| *n == libname && !n.is_empty())
+                .map(|(lo, _, _)| *lo)
+                .min();
+        }
+    }
+    let off = base.map(|b| pc.wrapping_sub(b));
+    match (libname.as_str(), off, regs) {
+        ("libc.so", Some(0x13628), Some(r)) => ("bin-link", r.arg(7)),
+        ("libc.so", Some(0x137de), Some(r)) => ("bin-head", r.arg(2)),
+        _ => ("other", siginfo_addr.unwrap_or(0)),
+    }
+}
+
 fn fire_wedge_chain(
     coord: &mut CoordClient,
     leader: i32,
@@ -12626,6 +13461,19 @@ fn tracer_loop(ctx: TracerCtx) {
     // tenure's leader dies (see wedge_traces_harvest).
     let mut wedge_leader: Option<i32> = None;
     let mut wedge_holder: Option<i32> = None;
+    // 0.9.142 (s9-142-desk section 3.2): the
+    // SIGSEGV cell's tracer-side tenure state --
+    // this worker's emit sequence when the current
+    // system_server candidate was born (the
+    // tenure's age at a FATAL is the difference),
+    // the candidate family's apk scan counters
+    // (the PMS phase proxy), and the per-thread
+    // allocator rings. All reset when the
+    // candidate slot changes hands.
+    let mut candidate_birth_seq: u64 = 0;
+    let mut ss_apk_count: u32 = 0;
+    let mut ss_apk_last: String = String::new();
+    let mut ss_alloc: HashMap<i32, VecDeque<(u32, bool)>> = HashMap::new();
 
     // ---- main tracing loop over the whole guest tree ----
     // (S2: one loop body for every tracer process. The
@@ -12855,6 +13703,36 @@ fn tracer_loop(ctx: TracerCtx) {
                     || (!proc.compat && matches!(nr, 214 | 215 | 222))
                 {
                     proc.win.alloc += 1;
+                }
+                // 0.9.142 (s9-142-desk section 3.2
+                // item 1): the PMS scan progress
+                // proxy -- open/stat-family calls by
+                // system_server family threads whose
+                // path names an apk under /system/app
+                // or /data/app, counted with the most
+                // recent path kept, so the next
+                // SIGSEGV sample can be placed inside
+                // the scan instead of just named as
+                // being in it. Pure read of the path
+                // argument; the call itself proceeds
+                // untouched.
+                if proc.compat && proc.ss_family {
+                    let path_idx = match nr {
+                        5 | 18 | 33 | 195 => Some(0usize),
+                        322 | 327 => Some(1usize),
+                        _ => None,
+                    };
+                    if let Some(idx) = path_idx {
+                        if let Some(path) = read_path(pid, regs.arg(idx)) {
+                            if (path.starts_with("/system/app/")
+                                || path.starts_with("/data/app/"))
+                                && path.ends_with(".apk")
+                            {
+                                ss_apk_count += 1;
+                                ss_apk_last = path;
+                            }
+                        }
+                    }
                 }
                 let mut dirty = false;
                 if (nr == nr_execve(proc.compat) || nr == nr_execveat(proc.compat))
@@ -13760,6 +14638,25 @@ fn tracer_loop(ctx: TracerCtx) {
                                 ret = v;
                             }
                         }
+                        // 0.9.142 (s9-142-desk section
+                        // 3.2 item 2): the allocator
+                        // half of the SIGSEGV-cell
+                        // profile, tracer-side -- a
+                        // system_server family thread's
+                        // allocator syscalls with their
+                        // outcome, ringed per thread
+                        // (cap 64) for its FATAL batch.
+                        if proc.ss_family
+                            && ((proc.compat && matches!(pend.nr, 45 | 91 | 192))
+                                || (!proc.compat
+                                    && matches!(pend.nr, 214 | 215 | 222)))
+                        {
+                            let q = ss_alloc.entry(pid).or_default();
+                            if q.len() >= 64 {
+                                q.pop_front();
+                            }
+                            q.push_back((pend.nr as u32, ret >= 0));
+                        }
                         if let Some(d) = &pend.desc {
                             sys!("{d} => {ret}");
                         }
@@ -14004,6 +14901,13 @@ fn tracer_loop(ctx: TracerCtx) {
                     .get(&pid)
                     .map(|p| (p.vcwd.clone(), p.compat))
                     .unwrap_or_else(|| ("/".to_string(), guest_compat));
+                // 0.9.142 (section 3): family
+                // membership is inherited at birth
+                // (see ProcState::ss_family).
+                let parent_ssf = procs
+                    .get(&pid)
+                    .map(|p| p.ss_family)
+                    .unwrap_or(false);
                 match procs.get_mut(&child) {
                     Some(cp) => {
                         // Registered early by its own initial stop.
@@ -14012,6 +14916,7 @@ fn tracer_loop(ctx: TracerCtx) {
                         // vcwd and adopting the parent's current
                         // vcwd is still exact.
                         cp.parent = pid;
+                        cp.ss_family = cp.ss_family || parent_ssf;
                         if !cp.syscall_seen {
                             cp.vcwd = parent_vcwd;
                             cp.compat = parent_compat;
@@ -14020,6 +14925,7 @@ fn tracer_loop(ctx: TracerCtx) {
                     None => {
                         let mut nps = ProcState::new(&parent_vcwd, false, parent_compat);
                         nps.parent = pid;
+                        nps.ss_family = parent_ssf;
                         procs.insert(child, nps);
                     }
                 }
@@ -14060,6 +14966,17 @@ fn tracer_loop(ctx: TracerCtx) {
                     // bookkeeping from any earlier one.
                     wedge_leader = None;
                     wedge_holder = None;
+                    // 0.9.142 (section 3): the new
+                    // candidate is its family's root,
+                    // and the SIGSEGV cell's tenure
+                    // state starts with it.
+                    if let Some(cp) = procs.get_mut(&child) {
+                        cp.ss_family = true;
+                    }
+                    candidate_birth_seq = emit_seq_now();
+                    ss_apk_count = 0;
+                    ss_apk_last = String::new();
+                    ss_alloc.clear();
                 }
             }
             cont_syscall(pid, 0);
@@ -14159,12 +15076,18 @@ fn tracer_loop(ctx: TracerCtx) {
                     std::ptr::null_mut(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                 ) == 0;
+                // 0.9.142 (section 3.2 item 4): the
+                // siginfo fault address, kept for the
+                // SIGSEGV cell's bad_ptr when the pc
+                // matches neither known dlfree form.
+                let mut siginfo_addr: Option<u64> = None;
                 if ok {
                     let addr = if fcompat {
                         u32::from_ne_bytes(buf[12..16].try_into().unwrap()) as u64
                     } else {
                         u64::from_ne_bytes(buf[16..24].try_into().unwrap())
                     };
+                    siginfo_addr = Some(addr);
                     sup!(
                         "FATAL sig={sig} pid={pid} pc=0x{pc:x} fault_addr=0x{addr:x}{regdump}"
                     );
@@ -14206,6 +15129,44 @@ fn tracer_loop(ctx: TracerCtx) {
                 if sig == 4 {
                     let logs = coord.ignition_dump(pid, "sigill");
                     replay_logs(logs);
+                }
+                // 0.9.142 (s9-142-desk section 3):
+                // the SS native SIGSEGV cell. A
+                // SIGSEGV on a thread of this
+                // worker's system_server candidate
+                // family earns its own batch beside
+                // the FATAL line: the fault form
+                // against the section 3.1 reading key
+                // (both field faults so far sit
+                // inside dlfree, dereferencing heap
+                // structures), the coordinator's
+                // phase / profile / poison lines,
+                // and this side's allocator ring.
+                // Capture only -- the signal and
+                // everything downstream of this
+                // block proceed exactly as before.
+                if sig == 11 && procs.get(&pid).is_some_and(|p| p.ss_family) {
+                    let (form, bad) = fatal_form(pid, pc, &fregs, siginfo_addr);
+                    sup!(
+                        "binder: fatal-form pid={pid} fault_form={form} bad_ptr=0x{bad:x}"
+                    );
+                    let age = emit_seq_now().saturating_sub(candidate_birth_seq);
+                    let logs = coord.fatal_dump(pid, age, ss_apk_count, &ss_apk_last);
+                    replay_logs(logs);
+                    if let Some(q) = ss_alloc.get(&pid) {
+                        if !q.is_empty() {
+                            let parts: Vec<String> = q
+                                .iter()
+                                .map(|(nr, ok)| {
+                                    format!("(alloc,{nr},-,{})", *ok as u8)
+                                })
+                                .collect();
+                            sup!(
+                                "binder: fatal-profile-alloc pid={pid} entries=[{}]",
+                                parts.join(",")
+                            );
+                        }
+                    }
                 }
                 // 0.9.102: dump the tracee's binder input
                 // buffer (its most recent read fill) verbatim.
@@ -14852,4 +15813,78 @@ fn main() {
 
     let _ = reader.join();
     sup!("supervisor done");
+}
+
+/// 0.9.142 (s9-142-desk section 4.3): enumeration
+/// self-tests. The ride tests drive inject_syscall
+/// against a pid that does not exist, so every exit
+/// is reached deterministically without a tracee:
+/// a rewind ride must die at the anchor check, a
+/// plain ride at set_regs -- and both must carry
+/// their RideR0::Failed tag out, which is the whole
+/// point of the enumeration. The rendering tests pin
+/// fd_why_suffix's two shapes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ride_rewind_dead_pid_is_anchor_bad() {
+        let mut regs = Regs::A64(UserPtRegs::default());
+        let mut out = RideR0::Failed("unused");
+        let r = inject_syscall(
+            i32::MAX,
+            false,
+            56,
+            [0; 4],
+            0x1004,
+            true,
+            &mut regs,
+            &mut out,
+        );
+        assert_eq!(r, -1);
+        match out {
+            RideR0::Failed(tag) => assert_eq!(tag, "anchor-bad"),
+            RideR0::Kernel(v) => panic!("expected ride failure, got kernel {v}"),
+        }
+    }
+
+    #[test]
+    fn ride_plain_dead_pid_is_set_regs() {
+        let mut regs = Regs::A64(UserPtRegs::default());
+        let mut out = RideR0::Failed("unused");
+        let r = inject_syscall(
+            i32::MAX,
+            false,
+            56,
+            [0; 4],
+            0x1000,
+            false,
+            &mut regs,
+            &mut out,
+        );
+        assert_eq!(r, -1);
+        match out {
+            RideR0::Failed(tag) => assert_eq!(tag, "set-regs"),
+            RideR0::Kernel(v) => panic!("expected ride failure, got kernel {v}"),
+        }
+    }
+
+    #[test]
+    fn why_suffix_kernel_renders_errno() {
+        assert_eq!(
+            fd_why_suffix(-13, &RideR0::Kernel(-13)),
+            "why=open_ret=-13 errno=13"
+        );
+        assert_eq!(errno_of_ride(&RideR0::Kernel(-2)), "2");
+    }
+
+    #[test]
+    fn why_suffix_ride_renders_tag() {
+        assert_eq!(
+            fd_why_suffix(-1, &RideR0::Failed("wait-exhausted")),
+            "why=ride_fail tag=wait-exhausted errno=na errno_src=none"
+        );
+        assert_eq!(errno_of_ride(&RideR0::Failed("anchor-bad")), "na");
+    }
 }
