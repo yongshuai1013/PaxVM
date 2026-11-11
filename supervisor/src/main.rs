@@ -467,6 +467,25 @@ macro_rules! bsup {
     ($($a:tt)*) => { cap_log("sup", &format!($($a)*)) };
 }
 
+/// S10 I1 (s10-perf-desk section 3): the field's
+/// monotonic base. Set once at the top of main();
+/// the coordinator and the workers are forked from
+/// that same process image, so every supervisor
+/// process shares the base (an Instant is a
+/// CLOCK_MONOTONIC reading, identical across the
+/// fork). Account and snapshot lines carry the
+/// elapsed as a trailing `t=<ms>` column -- a pure
+/// readout of the clock, feeding no decision.
+static FIELD_START: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
+
+fn field_t_ms() -> u64 {
+    FIELD_START
+        .get()
+        .map(|t| t.elapsed().as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Freeze forensics (0.9.81): leave W0's pid where
 /// the shell can find it -- supervisor.pid in the vm
 /// directory. The vm directory is the rootfs's
@@ -750,12 +769,23 @@ fn get_event_msg(pid: i32) -> Option<u64> {
 /// u32, _syscall@16 i32, _arch@20 u32).
 fn dump_sigsys_info(pid: i32, compat: bool) {
     let mut buf = [0u8; 128];
+    // S10 I3: the GETSIGINFO attempt is timed into
+    // the sigsys sub-account (the .147 census
+    // showed it failing on every rescue; its cost
+    // share is C2's missing number). Timing only;
+    // the call and its handling are unchanged.
+    let gi_t0 = std::time::Instant::now();
     let rc = ptrace4(
         PTRACE_GETSIGINFO,
         pid,
         std::ptr::null_mut(),
         buf.as_mut_ptr() as *mut libc::c_void,
     );
+    SIGSYS_GI_US.fetch_add(
+        gi_t0.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
+    SIGSYS_GI_N.fetch_add(1, Ordering::Relaxed);
     if rc != 0 {
         sup!("SIGSYS detail pid={pid}: GETSIGINFO failed errno={}", errno());
     } else {
@@ -782,7 +812,13 @@ fn dump_sigsys_info(pid: i32, compat: bool) {
             "SIGSYS detail pid={pid}: si_code={si_code} syscall={sc} name={name} arch=0x{arch:x} call_addr=0x{call_addr:x}"
         );
     }
-    if let Some(r) = get_regs(pid, compat) {
+    let regs_t0 = std::time::Instant::now();
+    let got_regs = get_regs(pid, compat);
+    SIGSYS_REGS_US.fetch_add(
+        regs_t0.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
+    if let Some(r) = got_regs {
         sup!(
             "SIGSYS regs pid={pid}: pc=0x{:x} nr_reg=0x{:x} a0=0x{:x} a1=0x{:x} a2=0x{:x}",
             r.pc(),
@@ -5276,7 +5312,7 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
 /// length marks the connection dead.
 fn extract_frames(
     inbuf: &mut Vec<u8>,
-    queue: &mut std::collections::VecDeque<(u8, Vec<u8>)>,
+    queue: &mut std::collections::VecDeque<(u8, Vec<u8>, std::time::Instant)>,
     dead: &mut bool,
 ) {
     loop {
@@ -5294,7 +5330,12 @@ fn extract_frames(
         let frame: Vec<u8> = inbuf.drain(..4 + len).collect();
         let kind = frame[4];
         let payload = frame[5..].to_vec();
-        queue.push_back((kind, payload));
+        // S10 I2: the arrival stamp rides the frame
+        // so the drain loop can charge the time the
+        // frame spent queued (queue_wait) to its
+        // request class. Read-only bookkeeping: the
+        // stamp never influences handling.
+        queue.push_back((kind, payload, std::time::Instant::now()));
     }
 }
 
@@ -5303,9 +5344,109 @@ fn extract_frames(
 struct CConn {
     s: UnixStream,
     inbuf: Vec<u8>,
-    queue: std::collections::VecDeque<(u8, Vec<u8>)>,
+    queue: std::collections::VecDeque<(u8, Vec<u8>, std::time::Instant)>,
     wid: Option<u8>,
     dead: bool,
+    /// The tracer process on the other end
+    /// (SO_PEERCRED at accept). S10 I4 reads it for
+    /// the host census' supervisor set; nothing
+    /// else consults it.
+    pid: i32,
+}
+
+/// S10 I2 (s10-perf-desk section 3): the
+/// coordinator's own time account -- per request
+/// class, how many frames it handled, how long
+/// they sat queued (arrival stamp to handle start:
+/// the serialization bill) and how long handling
+/// took (handle time includes a decision's
+/// reverse-read waits and drain-verify arena
+/// reads: while either runs, the single
+/// coordinator is busy and every other frame
+/// queues behind it). Integer accumulation in
+/// the drain loop only; settles in the
+/// wedge-chain reply beside the arena accounts.
+/// Feeds no decision, alters no handling.
+#[derive(Default)]
+struct CoordAcct {
+    count: [u64; 4],
+    queue_wait_us: [u64; 4],
+    handle_us: [u64; 4],
+}
+
+/// Request classes for the coordinator account:
+/// 0 = binder/ashmem driver decisions, 1 =
+/// credential-book traffic, 2 = fd-repair
+/// traffic, 3 = everything else (registration,
+/// parks, handoffs, dump requests).
+fn coord_class(kind: u8) -> usize {
+    match kind {
+        MSG_REQ_WRITE_READ
+        | MSG_REQ_COMPLETE_PARKED
+        | MSG_REQ_THREAD_EXIT
+        | MSG_REQ_SET_CONTEXT_MGR
+        | MSG_REQ_OPEN_BINDER
+        | MSG_REQ_OPEN_ASHMEM
+        | MSG_REQ_ASHMEM_GET
+        | MSG_ONEWAY_ASHMEM_SET_NAME
+        | MSG_ONEWAY_ASHMEM_SET_SIZE
+        | MSG_ONEWAY_ASHMEM_SET_PROT => 0,
+        MSG_REQ_VCRED | MSG_ONEWAY_VCRED_PUBLISH => 1,
+        MSG_ONEWAY_FD_CACHE_PUT | MSG_ONEWAY_FD_FAIL | MSG_ONEWAY_FD_STATS => 2,
+        _ => 3,
+    }
+}
+
+const COORD_CLASS_NAMES: [&str; 4] = ["binder", "vcred", "fd", "other"];
+
+impl CoordAcct {
+    fn add(
+        &mut self,
+        kind: u8,
+        queue_wait: std::time::Duration,
+        handle: std::time::Duration,
+    ) {
+        let c = coord_class(kind);
+        self.count[c] += 1;
+        self.queue_wait_us[c] += queue_wait.as_micros() as u64;
+        self.handle_us[c] += handle.as_micros() as u64;
+    }
+}
+
+/// S10 I4 helper: (ppid, utime+stime in clock
+/// ticks) from /proc/<pid>/stat. The comm field
+/// is parenthesised and may contain spaces, so
+/// the split starts after the last ')'.
+fn proc_stat(pid: i32) -> Option<(i32, u64)> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = s.rfind(')')?;
+    let rest: Vec<&str> = s[close + 2..].split_whitespace().collect();
+    // rest[0] is field 3 (state); ppid is field 4
+    // (rest[1]), utime field 14 (rest[11]), stime
+    // field 15 (rest[12]).
+    let ppid: i32 = rest.get(1)?.parse().ok()?;
+    let utime: u64 = rest.get(11)?.parse().ok()?;
+    let stime: u64 = rest.get(12)?.parse().ok()?;
+    Some((ppid, utime + stime))
+}
+
+/// S10 I4 helper: resident set size from
+/// /proc/<pid>/status (0 when unreadable).
+fn proc_rss_kb(pid: i32) -> u64 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return 0;
+    };
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            return v
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+    0
 }
 
 /// The coordinator process (S2): BinderState plus the
@@ -5331,6 +5472,8 @@ struct CoordServer {
     /// the offering tracer (W0 for root-service
     /// handoffs, a worker for kin re-shards).
     handoff_from: HashMap<i32, usize>,
+    /// S10 I2: the coordinator time account.
+    acct: CoordAcct,
 }
 
 impl CoordServer {
@@ -5355,6 +5498,115 @@ impl CoordServer {
     fn extract(&mut self, ci: usize) {
         let c = &mut self.conns[ci];
         extract_frames(&mut c.inbuf, &mut c.queue, &mut c.dead);
+    }
+
+    /// S10 I2 + I4 settlement, printed into the
+    /// wedge-chain reply's captured lines beside
+    /// the arena accounts: the coordinator time
+    /// account (one line per request class) and
+    /// the host census. Pure /proc and counter
+    /// reads; nothing here feeds a decision.
+    fn settle_perf_accounts(&self) {
+        for c in 0..4 {
+            bsup!(
+                "binder: coordinator time account: class={} count={} queue_wait_us={} handle_us={} t={}",
+                COORD_CLASS_NAMES[c],
+                self.acct.count[c],
+                self.acct.queue_wait_us[c],
+                self.acct.handle_us[c],
+                field_t_ms()
+            );
+        }
+        self.census_lines();
+    }
+
+    /// S10 I4 (s10-perf-desk section 3): at
+    /// snapshot time, one /proc census of the
+    /// whole complex -- the supervisor set (this
+    /// coordinator, the main process, every
+    /// tracer, from the connections' peer pids),
+    /// the guest set (every routed pid) and the
+    /// shell itself (the main process's parent).
+    /// A pid that dies mid-census is skipped, so
+    /// the proc counts are read successes, not a
+    /// roster.
+    fn census_lines(&self) {
+        let tps_raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let tps: u64 = if tps_raw > 0 { tps_raw as u64 } else { 100 };
+        let main_pid = unsafe { libc::getppid() };
+        let mut sup_set: std::collections::HashSet<i32> =
+            std::collections::HashSet::new();
+        sup_set.insert(std::process::id() as i32);
+        sup_set.insert(main_pid);
+        for c in &self.conns {
+            if c.pid > 0 {
+                sup_set.insert(c.pid);
+            }
+        }
+        let shell_pid = if main_pid > 0 {
+            proc_stat(main_pid).map(|(pp, _)| pp).unwrap_or(0)
+        } else {
+            0
+        };
+        let sum = |pids: &[i32]| -> (usize, u64, u64) {
+            let (mut n, mut ticks, mut rss) = (0usize, 0u64, 0u64);
+            for &pid in pids {
+                if let Some((_, t)) = proc_stat(pid) {
+                    n += 1;
+                    ticks += t;
+                    rss += proc_rss_kb(pid);
+                }
+            }
+            (n, ticks * 1_000_000 / tps, rss)
+        };
+        let sup_pids: Vec<i32> = sup_set.into_iter().collect();
+        let (sn, scpu, srss) = sum(&sup_pids);
+        bsup!(
+            "host census: supervisor procs={sn} cpu_us={scpu} rss_kb={srss} t={}",
+            field_t_ms()
+        );
+        let guest_pids: Vec<i32> = self.routes.keys().copied().collect();
+        let (gn, gcpu, grss) = sum(&guest_pids);
+        bsup!(
+            "host census: guest procs={gn} cpu_us={gcpu} rss_kb={grss} t={}",
+            field_t_ms()
+        );
+        if shell_pid > 0 {
+            let (_, shcpu, shrss) = sum(&[shell_pid]);
+            bsup!(
+                "host census: shell pid={shell_pid} cpu_us={shcpu} rss_kb={shrss} t={}",
+                field_t_ms()
+            );
+        }
+        // 附帶: where a guest read of /proc/meminfo
+        // lands. Path translation sends /proc/*
+        // into the rootfs' own proc directory
+        // (the /.binder/ suffix of any live arena
+        // names that rootfs), so AMS's low-memory
+        // input is whatever that static file says.
+        if let Some(arena) = self.st.procs.keys().next() {
+            match arena.split_once("/.binder/") {
+                Some((root, _)) => {
+                    let path = format!("{root}/proc/meminfo");
+                    let first = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| {
+                            s.lines().next().map(|l| l.trim().to_string())
+                        })
+                        .unwrap_or_else(|| "absent".to_string());
+                    bsup!(
+                        "host census: guest /proc/meminfo lands on {path} [{first}] t={}",
+                        field_t_ms()
+                    );
+                }
+                None => {
+                    bsup!(
+                        "host census: guest /proc/meminfo landing unresolvable from arena {arena} t={}",
+                        field_t_ms()
+                    );
+                }
+            }
+        }
     }
 
     fn send_to(&mut self, ci: usize, kind: u8, payload: &[u8]) {
@@ -5485,7 +5737,7 @@ impl CoordServer {
                             return None;
                         }
                         loop {
-                            if let Some((k, p)) = conn.queue.pop_front() {
+                            if let Some((k, p, _stamp)) = conn.queue.pop_front() {
                                 if k == MSG_REV_READ_RESP {
                                     return Dec::new(&p).opt_bytes();
                                 }
@@ -5698,7 +5950,7 @@ impl CoordServer {
                             return None;
                         }
                         loop {
-                            if let Some((k, p)) = conn.queue.pop_front() {
+                            if let Some((k, p, _stamp)) = conn.queue.pop_front() {
                                 if k == MSG_REV_READ_RESP {
                                     return Dec::new(&p).opt_bytes();
                                 }
@@ -5748,6 +6000,11 @@ impl CoordServer {
                     };
                     binder_wedge_chain(st, leader, solo, &mut rd)
                 };
+                // S10 I2/I4: the coordinator's own
+                // time account and the host census
+                // settle in the same captured reply,
+                // behind the chain dump's lines.
+                self.settle_perf_accounts();
                 let (holder, servicers) = holder;
                 let mut e = Enc::new();
                 e.logs(&cap_take());
@@ -6125,6 +6382,30 @@ impl CoordServer {
 /// socket (a stale file from a previous run is
 /// unlinked first), accept tracer connections, and
 /// serve frames one at a time until W0 goes away.
+/// S10 I4 helper: the pid of the process on the
+/// other end of an accepted coordinator socket
+/// (0 when the kernel will not say). Census use
+/// only.
+fn peer_pid(s: &std::os::unix::net::UnixStream) -> i32 {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        cred.pid
+    } else {
+        0
+    }
+}
+
 fn coordinator_main(sock_path: &str) -> ! {
     use std::os::unix::io::AsRawFd;
     let _ = std::fs::remove_file(sock_path);
@@ -6141,6 +6422,7 @@ fn coordinator_main(sock_path: &str) -> ! {
         vcreds_g: HashMap::new(),
         w0: None,
         handoff_from: HashMap::new(),
+        acct: CoordAcct::default(),
     };
     loop {
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(srv.conns.len() + 1);
@@ -6164,12 +6446,14 @@ fn coordinator_main(sock_path: &str) -> ! {
         if n > 0 {
             if pfds[0].revents & libc::POLLIN != 0 {
                 if let Ok((s, _)) = listener.accept() {
+                    let pid = peer_pid(&s);
                     srv.conns.push(CConn {
                         s,
                         inbuf: Vec::new(),
                         queue: std::collections::VecDeque::new(),
                         wid: None,
                         dead: false,
+                        pid,
                     });
                 }
             }
@@ -6198,9 +6482,18 @@ fn coordinator_main(sock_path: &str) -> ! {
                 if srv.conns[ci].dead {
                     continue;
                 }
-                if let Some((k, p)) = srv.conns[ci].queue.pop_front() {
+                if let Some((k, p, stamp)) = srv.conns[ci].queue.pop_front() {
                     progress = true;
+                    // S10 I2: charge this frame's
+                    // queue wait and handle time to
+                    // its request class (integer
+                    // accumulation only; the account
+                    // settles at wedge-snapshot time
+                    // and feeds no decision).
+                    let queue_wait = stamp.elapsed();
+                    let h0 = std::time::Instant::now();
                     srv.handle(ci, k, &p);
+                    srv.acct.add(k, queue_wait, h0.elapsed());
                 }
             }
         }
@@ -8567,12 +8860,13 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             ("unknown", 0, "none")
         };
     bsup!(
-        "binder: wedge-verdict arena={arena} class={class} holder={} basis={basis} (provisional)",
+        "binder: wedge-verdict arena={arena} class={class} holder={} basis={basis} (provisional) t={}",
         if holder > 0 {
             holder.to_string()
         } else {
             "-".to_string()
-        }
+        },
+        field_t_ms()
     );
     // 0.9.146 (s9-146-desk section 5): the
     // reply-complete ledger also settles here, at
@@ -8592,9 +8886,10 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         acct_arenas.sort();
         for a in acct_arenas {
             bsup!(
-                "binder: arena {a} reply-complete account: reply_pops={} reply_completes={}",
+                "binder: arena {a} reply-complete account: reply_pops={} reply_completes={} t={}",
                 st.reply_pops.get(a).copied().unwrap_or(0),
-                st.reply_completes.get(a).copied().unwrap_or(0)
+                st.reply_completes.get(a).copied().unwrap_or(0),
+                field_t_ms()
             );
         }
     }
@@ -8608,10 +8903,11 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         acct_arenas.sort();
         for a in acct_arenas {
             bsup!(
-                "binder: arena {a} delivery-discipline account: suppressed={} flush_held={} land_denied={}",
+                "binder: arena {a} delivery-discipline account: suppressed={} flush_held={} land_denied={} t={}",
                 st.ds_suppressed.get(a).copied().unwrap_or(0),
                 st.ds_flush_held.get(a).copied().unwrap_or(0),
-                st.ds_land_denied.get(a).copied().unwrap_or(0)
+                st.ds_land_denied.get(a).copied().unwrap_or(0),
+                field_t_ms()
             );
         }
     }
@@ -12248,25 +12544,29 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // free-counters format above is byte-stable field
     // tooling and does not grow new fields.
     bsup!(
-        "binder: arena {arena} crash-report account: token_miss={}",
-        st.crash_token_miss
+        "binder: arena {arena} crash-report account: token_miss={} t={}",
+        st.crash_token_miss,
+        field_t_ms()
     );
     // 0.9.141 (P1/P2): the issuance double-read and
     // poison word0 accounts, at the same settlement
     // on their own lines, like the account above.
     bsup!(
-        "binder: arena {arena} issuance account: reads={} differs={}",
-        st.issuance_reads, st.issuance_differs
+        "binder: arena {arena} issuance account: reads={} differs={} t={}",
+        st.issuance_reads,
+        st.issuance_differs,
+        field_t_ms()
     );
     bsup!(
-        "binder: arena {arena} poison account: word0_rel self-8={} self={} self-page={} heap-other={} libc={} stack={} other={}",
+        "binder: arena {arena} poison account: word0_rel self-8={} self={} self-page={} heap-other={} libc={} stack={} other={} t={}",
         st.poison_word0[0],
         st.poison_word0[1],
         st.poison_word0[2],
         st.poison_word0[3],
         st.poison_word0[4],
         st.poison_word0[5],
-        st.poison_word0[6]
+        st.poison_word0[6],
+        field_t_ms()
     );
     // 0.9.142 (s9-142-desk sections 2.2 / 4.2 / 1):
     // this build's new accounts, at the same
@@ -12288,7 +12588,7 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // reserve_dropped are global-style counters
     // like the fd ride one below.
     bsup!(
-        "binder: arena {arena} sync stamp account: sync_stamp_open={} sync_stamp_orphan={} sync_stamp_answered={} stamp_fill_unmatched={} sync_stamp_reserve_dropped={}",
+        "binder: arena {arena} sync stamp account: sync_stamp_open={} sync_stamp_orphan={} sync_stamp_answered={} stamp_fill_unmatched={} sync_stamp_reserve_dropped={} t={}",
         st.sync_stamps
             .values()
             .filter(|s| s.sender_arena == arena)
@@ -12311,11 +12611,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
                 .filter(|s| s.sender_arena == arena)
                 .count(),
         st.stamp_fill_unmatched,
-        st.sync_stamp_reserve_dropped
+        st.sync_stamp_reserve_dropped,
+        field_t_ms()
     );
     bsup!(
-        "binder: arena {arena} fd ride account: fd_fixup_ride_failed={}",
-        st.fd_fixup_ride_failed
+        "binder: arena {arena} fd ride account: fd_fixup_ride_failed={} t={}",
+        st.fd_fixup_ride_failed,
+        field_t_ms()
     );
     {
         let mut tops: Vec<(&(u32, u32, u32, u32), &u64)> =
@@ -12329,10 +12631,11 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             })
             .collect();
         bsup!(
-            "binder: arena {arena} fat template account: samples={} distinct={} top=[{}]",
+            "binder: arena {arena} fat template account: samples={} distinct={} top=[{}] t={}",
             st.fat_template_samples,
             st.fat_templates.len(),
-            parts.join(" ")
+            parts.join(" "),
+            field_t_ms()
         );
     }
     // 0.9.143 (s9-143-desk section 4.3): the
@@ -12350,9 +12653,10 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             .map(|(k, n)| format!("(c{},d{},o{})x{}", k.0, k.1, k.2, n))
             .collect();
         bsup!(
-            "binder: arena {arena} shield3 account: total={} top=[{}]",
+            "binder: arena {arena} shield3 account: total={} top=[{}] t={}",
             st.shield3_census_total,
-            parts.join(" ")
+            parts.join(" "),
+            field_t_ms()
         );
     }
     // 0.9.145 (s9-145-desk section 2.2): the
@@ -12363,18 +12667,20 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // completion tokens queued to their repliers.
     // The two must agree (prediction P4).
     bsup!(
-        "binder: arena {arena} reply-complete account: reply_pops={} reply_completes={}",
+        "binder: arena {arena} reply-complete account: reply_pops={} reply_completes={} t={}",
         st.reply_pops.get(arena).copied().unwrap_or(0),
-        st.reply_completes.get(arena).copied().unwrap_or(0)
+        st.reply_completes.get(arena).copied().unwrap_or(0),
+        field_t_ms()
     );
     // 0.9.147 (s9-147-desk section 4): the delivery-
     // discipline ledger, settled at the same seat
     // like the accounts above.
     bsup!(
-        "binder: arena {arena} delivery-discipline account: suppressed={} flush_held={} land_denied={}",
+        "binder: arena {arena} delivery-discipline account: suppressed={} flush_held={} land_denied={} t={}",
         st.ds_suppressed.get(arena).copied().unwrap_or(0),
         st.ds_flush_held.get(arena).copied().unwrap_or(0),
-        st.ds_land_denied.get(arena).copied().unwrap_or(0)
+        st.ds_land_denied.get(arena).copied().unwrap_or(0),
+        field_t_ms()
     );
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
@@ -13984,7 +14290,12 @@ fn install_sigchld_pipe() -> i32 {
 }
 
 enum NextStop {
-    Stop(i32, i32),
+    /// A reaped stop: pid, status, the instant the
+    /// waitpid reaped it, and the time this call
+    /// spent blocked in poll (idle time belongs to
+    /// no stop; S10 I3 charges handling time as
+    /// reap-to-reap minus it).
+    Stop(i32, i32, std::time::Instant, std::time::Duration),
     End,
 }
 
@@ -14005,12 +14316,16 @@ fn next_stop(
     dump_candidate: &mut Option<i32>,
     selfpipe_rd: i32,
 ) -> NextStop {
+    // S10 I3: time blocked in this call's poll is
+    // accumulated so the caller can subtract it
+    // from the previous stop's reap-to-reap span.
+    let mut idle = std::time::Duration::ZERO;
     loop {
         // 1) Drain every pending ptrace stop.
         let mut status: i32 = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, WALL | libc::WNOHANG) };
         if r > 0 {
-            return NextStop::Stop(r, status);
+            return NextStop::Stop(r, status, std::time::Instant::now(), idle);
         }
         if r < 0 && errno() == libc::ECHILD {
             if wid == 0 {
@@ -14152,7 +14467,9 @@ fn next_stop(
                 revents: 0,
             },
         ];
+        let poll_t0 = std::time::Instant::now();
         let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        idle += poll_t0.elapsed();
         if n > 0 {
             if pfds[1].revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 128];
@@ -14488,8 +14805,9 @@ fn wedge_snapshot(
         procs.keys().copied().filter(|p| in_family(*p)).collect();
     family.sort_unstable();
     sup!(
-        "binder: wedge-snapshot arena={leader} threads={}",
-        family.len()
+        "binder: wedge-snapshot arena={leader} threads={} t={}",
+        family.len(),
+        field_t_ms()
     );
     // 0.9.140 (M1): futex waiter groups by address,
     // accumulated inside the per-thread loop below
@@ -14927,6 +15245,98 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     }
 }
 
+/// S10 I3 (s10-perf-desk section 3): the worker
+/// stop-time account. Every stop the loop reaps
+/// is classified before its handling runs
+/// (syscall entry / syscall exit / SIGSYS rescue
+/// / other signal delivery / other, where other
+/// carries the ptrace event stops and the death
+/// reaps), and its handling time -- reap instant
+/// to the next stop's reap instant, minus the
+/// time next_stop spent blocked in poll in
+/// between -- is accumulated per bucket.
+/// Coordinator-push servicing inside next_stop
+/// rides the span unseparated (small, and itself
+/// supervisor work); idle time never does.
+/// Integer accumulation only, settled beside
+/// the wedge snapshot; feeds no decision.
+#[derive(Default)]
+struct StopAcct {
+    count: [u64; 5],
+    us: [u64; 5],
+}
+
+const STOP_BUCKET_NAMES: [&str; 5] =
+    ["sys_in", "sys_out", "sigsys", "signal", "other"];
+
+fn stop_bucket(procs: &HashMap<i32, ProcState>, pid: i32, status: i32) -> usize {
+    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+        return 4;
+    }
+    let sig = libc::WSTOPSIG(status);
+    if sig == SYSCALL_STOP_SIG {
+        // The handler's own entry/exit test, read
+        // before handling runs.
+        if procs.get(&pid).map(|p| p.expect_exit).unwrap_or(false) {
+            1
+        } else {
+            0
+        }
+    } else if sig == SIGSYS {
+        2
+    } else if sig == SIGTRAP {
+        4
+    } else {
+        3
+    }
+}
+
+impl StopAcct {
+    fn add(&mut self, bucket: usize, d: std::time::Duration) {
+        self.count[bucket] += 1;
+        self.us[bucket] += d.as_micros() as u64;
+    }
+}
+
+/// SIGSYS sub-accounts (S10 I3): the GETSIGINFO
+/// attempt and the register read/write segments
+/// inside the rescue path, timed at their seats
+/// (dump_sigsys_info and the delivery-stop
+/// rescue) into process-wide atomics -- each
+/// worker is its own process, so the account is
+/// per-worker by construction. The remainder of
+/// the sigsys bucket (total minus these two) is
+/// the fake body and the branch's own work,
+/// computed at settlement.
+static SIGSYS_GI_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SIGSYS_GI_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SIGSYS_REGS_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn print_stop_account(a: &StopAcct) {
+    let gi = SIGSYS_GI_US.load(Ordering::Relaxed);
+    let regs = SIGSYS_REGS_US.load(Ordering::Relaxed);
+    let rest = a.us[2].saturating_sub(gi).saturating_sub(regs);
+    let mut parts: Vec<String> = Vec::new();
+    for b in 0..5 {
+        parts.push(format!(
+            "{} count={} us={}",
+            STOP_BUCKET_NAMES[b], a.count[b], a.us[b]
+        ));
+    }
+    sup!("stop account: {} t={}", parts.join(" "), field_t_ms());
+    sup!(
+        "stop account sigsys: getsiginfo count={} us={} regs_us={} rest_us={} t={}",
+        SIGSYS_GI_N.load(Ordering::Relaxed),
+        gi,
+        regs,
+        rest,
+        field_t_ms()
+    );
+}
+
 fn tracer_loop(ctx: TracerCtx) {
     let TracerCtx {
         wid,
@@ -14986,6 +15396,12 @@ fn tracer_loop(ctx: TracerCtx) {
     // wedge_snapshot; nothing else reads them.
     let mut futex_acct: HashMap<(i32, u32), FutexAcct> = HashMap::new();
     let mut futex_acct_addrs: HashMap<i32, usize> = HashMap::new();
+    // S10 I3: this worker's stop-time account and
+    // the stop currently being handled (bucket +
+    // reap instant), closed out when the next stop
+    // is reaped (see StopAcct).
+    let mut stop_acct = StopAcct::default();
+    let mut cur_stop: Option<(usize, std::time::Instant)> = None;
 
     // ---- main tracing loop over the whole guest tree ----
     // (S2: one loop body for every tracer process. The
@@ -15002,8 +15418,27 @@ fn tracer_loop(ctx: TracerCtx) {
             &mut dump_candidate,
             selfpipe_rd,
         ) {
-            NextStop::Stop(p, s) => (p, s),
-            NextStop::End => break 'main_loop,
+            NextStop::Stop(p, s, reap, idle) => {
+                // S10 I3: close the previous stop's
+                // handling span (reap to reap, minus
+                // this call's poll-blocked time) into
+                // its bucket, then classify the new
+                // stop from pre-handling state.
+                if let Some((b, t0)) = cur_stop.take() {
+                    stop_acct.add(
+                        b,
+                        reap.duration_since(t0).saturating_sub(idle),
+                    );
+                }
+                cur_stop = Some((stop_bucket(&procs, p, s), reap));
+                (p, s)
+            }
+            NextStop::End => {
+                if let Some((b, t0)) = cur_stop.take() {
+                    stop_acct.add(b, t0.elapsed());
+                }
+                break 'main_loop;
+            }
         };
 
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
@@ -16566,6 +17001,10 @@ fn tracer_loop(ctx: TracerCtx) {
                                 &mut wedge_leader,
                                 &mut wedge_holder,
                             );
+                            // S10 I3: this worker's stop
+                            // account settles beside the
+                            // snapshot.
+                            print_stop_account(&stop_acct);
                         }
                     }
                 }
@@ -16780,6 +17219,9 @@ fn tracer_loop(ctx: TracerCtx) {
                             &mut wedge_leader,
                             &mut wedge_holder,
                         );
+                        // S10 I3: same settlement as the
+                        // kill-hook seat above.
+                        print_stop_account(&stop_acct);
                     }
                 }
             }
@@ -17255,13 +17697,22 @@ fn tracer_loop(ctx: TracerCtx) {
                         .map(|p| (p.nr, p.inject.unwrap(), p.applied));
                     if let Some((fnr, value, applied)) = fake {
                         let mut pc = 0u64;
-                        if let Some(mut regs) = get_regs(pid, proc.compat) {
+                        // S10 I3: this branch's register
+                        // read/write segment joins the
+                        // sigsys sub-account's regs sum.
+                        let regs_t0 = std::time::Instant::now();
+                        let rescued_regs = get_regs(pid, proc.compat);
+                        if let Some(mut regs) = rescued_regs {
                             pc = regs.pc();
                             if !applied {
                                 regs.set_retval(value);
                                 set_regs(pid, &regs);
                             }
                         }
+                        SIGSYS_REGS_US.fetch_add(
+                            regs_t0.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
                         sup!(
                             "SIGSYS rescued pid={pid} fake={}({fnr}) pc=0x{pc:x}",
                             nr_name(proc.compat, fnr)
@@ -17323,6 +17774,10 @@ fn tracer_loop(ctx: TracerCtx) {
 }
 
 fn main() {
+    // S10 I1: the field clock starts here, before
+    // any mode branch or fork, so the coordinator
+    // and worker children inherit this same base.
+    let _ = FIELD_START.set(std::time::Instant::now());
     // Coordinator / worker modes (multi-process split,
     // spec S1b + S2): this same binary also runs the
     // binder-driver coordinator (`--coordinator-sock
@@ -18091,5 +18546,97 @@ mod tests {
             binder_wait_desc(&st, 101),
             Some(("ss".to_string(), 7))
         );
+    }
+
+    // S10 I2: the coordinator account charges each
+    // frame to its request class and accumulates
+    // count / queue-wait / handle independently.
+    #[test]
+    fn coord_acct_classes_and_sums() {
+        assert_eq!(coord_class(MSG_REQ_WRITE_READ), 0);
+        assert_eq!(coord_class(MSG_REQ_COMPLETE_PARKED), 0);
+        assert_eq!(coord_class(MSG_REQ_OPEN_ASHMEM), 0);
+        assert_eq!(coord_class(MSG_ONEWAY_ASHMEM_SET_SIZE), 0);
+        assert_eq!(coord_class(MSG_REQ_VCRED), 1);
+        assert_eq!(coord_class(MSG_ONEWAY_VCRED_PUBLISH), 1);
+        assert_eq!(coord_class(MSG_ONEWAY_FD_CACHE_PUT), 2);
+        assert_eq!(coord_class(MSG_ONEWAY_FD_FAIL), 2);
+        assert_eq!(coord_class(MSG_HELLO), 3);
+        assert_eq!(coord_class(MSG_REQ_WEDGE_CHAIN), 3);
+        let mut a = CoordAcct::default();
+        a.add(
+            MSG_REQ_WRITE_READ,
+            std::time::Duration::from_micros(30),
+            std::time::Duration::from_micros(70),
+        );
+        a.add(
+            MSG_REQ_WRITE_READ,
+            std::time::Duration::from_micros(10),
+            std::time::Duration::from_micros(20),
+        );
+        a.add(
+            MSG_REQ_VCRED,
+            std::time::Duration::from_micros(5),
+            std::time::Duration::from_micros(6),
+        );
+        assert_eq!(a.count[0], 2);
+        assert_eq!(a.queue_wait_us[0], 40);
+        assert_eq!(a.handle_us[0], 90);
+        assert_eq!(a.count[1], 1);
+        assert_eq!(a.queue_wait_us[1], 5);
+        assert_eq!(a.count[2], 0);
+        assert_eq!(a.count[3], 0);
+    }
+
+    // S10 I3: the stop account accumulates per
+    // bucket, and the classifier splits syscall
+    // entry from exit on the pre-handling
+    // expect_exit flag (a stopped status is
+    // fabricated as SIGTRAP|0x80 in bits 8..16).
+    #[test]
+    fn stop_acct_buckets_and_classify() {
+        let mut a = StopAcct::default();
+        a.add(0, std::time::Duration::from_micros(11));
+        a.add(0, std::time::Duration::from_micros(13));
+        a.add(2, std::time::Duration::from_micros(50));
+        assert_eq!(a.count[0], 2);
+        assert_eq!(a.us[0], 24);
+        assert_eq!(a.count[2], 1);
+        assert_eq!(a.us[2], 50);
+        let stopped = |sig: i32| (sig << 8) | 0x7f;
+        let mut procs: HashMap<i32, ProcState> = HashMap::new();
+        assert_eq!(stop_bucket(&procs, 42, stopped(SYSCALL_STOP_SIG)), 0);
+        let mut p = ProcState::new("/", false, true);
+        p.expect_exit = true;
+        procs.insert(42, p);
+        assert_eq!(stop_bucket(&procs, 42, stopped(SYSCALL_STOP_SIG)), 1);
+        assert_eq!(stop_bucket(&procs, 42, stopped(SIGSYS)), 2);
+        assert_eq!(stop_bucket(&procs, 42, stopped(17)), 3);
+        assert_eq!(stop_bucket(&procs, 42, stopped(SIGTRAP)), 4);
+        // An exited status (exit code 3) is a death
+        // reap: other.
+        assert_eq!(stop_bucket(&procs, 42, 3 << 8), 4);
+    }
+
+    // S10 I4: the /proc/<pid>/stat parser skips a
+    // comm containing spaces and parentheses and
+    // reads ppid / utime / stime by field number.
+    #[test]
+    fn proc_stat_parse_fields() {
+        // Fabricate through the same split the
+        // parser performs: fields after the last
+        // ')' start at field 3.
+        let line = "123 (weird (name) x) S 45 1 2 3 4 5 6 7 8 9 900 700";
+        let close = line.rfind(')').unwrap();
+        let rest: Vec<&str> =
+            line[close + 2..].split_whitespace().collect();
+        assert_eq!(rest[1], "45");
+        assert_eq!(rest[11], "900");
+        assert_eq!(rest[12], "700");
+        // The live parser agrees on this process.
+        let (ppid, ticks) = proc_stat(std::process::id() as i32)
+            .expect("own stat must parse");
+        assert!(ppid > 0);
+        assert!(ticks > 0 || ppid > 0);
     }
 }

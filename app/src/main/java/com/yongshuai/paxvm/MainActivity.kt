@@ -124,6 +124,15 @@ class MainActivity : Activity() {
     @Volatile
     private var startupDiagnostics: StartupDiagnostics.Session? = null
 
+    // S10 I1 (s10-perf-desk section 3): the field
+    // clock on the shell side -- System.nanoTime
+    // (CLOCK_MONOTONIC, the supervisor's own clock
+    // source) captured at each supervisor launch.
+    // The heartbeat prints the elapsed as t=<ms>
+    // beside the supervisor's account stamps.
+    @Volatile
+    private var fieldStartNanos: Long = 0
+
     private val rootfsDir: File
         get() = File(filesDir, "vm0/rootfs")
 
@@ -606,8 +615,17 @@ class MainActivity : Activity() {
                         // at pss 833 MB -- our own code.
                         val rt = Runtime.getRuntime()
                         val heapKb = (rt.totalMemory() - rt.freeMemory()) / 1024
+                        // S10 I1: the field clock rides
+                        // the heartbeat (elapsed since
+                        // this session's supervisor
+                        // launch, monotonic).
+                        val tMs = if (fieldStartNanos != 0L) {
+                            (System.nanoTime() - fieldStartNanos) / 1_000_000
+                        } else {
+                            -1
+                        }
                         writeLogLineToFile(
-                            "[shell] heartbeat (app alive) heapKB=$heapKb rssKB=${selfRssKb()}",
+                            "[shell] heartbeat (app alive) heapKB=$heapKb rssKB=${selfRssKb()} t=$tMs",
                         )
                     }
                 }
@@ -1788,6 +1806,7 @@ class MainActivity : Activity() {
             return
         }
         supervisor = proc
+        fieldStartNanos = System.nanoTime()
         sessionRan = true
         diagnostics?.record("supervisor process 已啟動。")
         if (gb) {
