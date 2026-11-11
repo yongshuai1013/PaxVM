@@ -2381,6 +2381,98 @@ impl BinderProc {
         }
         (out, from_inbound)
     }
+    /// 0.9.147 (s9-147-desk section 2 R2): the flush
+    /// discipline. Move the inbound stream's
+    /// non-transaction units into `pid`'s personal
+    /// queue, in their original relative order, and
+    /// leave every BR_TRANSACTION unit where it is.
+    /// The four flush seats used to move the whole
+    /// stream ahead of an answer word, which put any
+    /// pooled transaction ahead of the very reply /
+    /// completion token the move exists to order
+    /// (the S-B notice ordering only ever covered
+    /// the notice units). Returns how many
+    /// transaction units were held back. A trailing
+    /// partial unit (or a unit overrunning the
+    /// stream) ends the walk: everything from there
+    /// on stays in the stream untouched.
+    fn flush_inbound_notices_to(&mut self, pid: i32) -> u64 {
+        if self.inbound.is_empty() {
+            return 0;
+        }
+        let mut held = 0u64;
+        let mut kept: Vec<u8> = Vec::new();
+        let mut moved: Vec<u8> = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= self.inbound.len() {
+            let cmd = u32_at(&self.inbound, off);
+            let len = br_one_len(cmd);
+            if off + len > self.inbound.len() {
+                break;
+            }
+            if cmd == BR_TRANSACTION {
+                held += 1;
+                kept.extend_from_slice(&self.inbound[off..off + len]);
+            } else {
+                moved.extend_from_slice(&self.inbound[off..off + len]);
+            }
+            off += len;
+        }
+        kept.extend_from_slice(&self.inbound[off..]);
+        self.inbound = kept;
+        if !moved.is_empty() {
+            self.push_to(pid, &moved);
+        }
+        held
+    }
+    /// 0.9.147 (s9-147-desk section 2 R1): the gated
+    /// drain, for a reader with an unanswered
+    /// synchronous call outstanding (see
+    /// binder_thread_waiting). Only the reader's own
+    /// queue is touched -- the inbound stream is not
+    /// read at all -- and inside that queue every
+    /// BR_TRANSACTION unit is skipped in place while
+    /// the remaining units are taken in their
+    /// original order, up to `cap` bytes, cutting
+    /// only on command boundaries: the first unit
+    /// that no longer fits ends the fill and the
+    /// whole tail from there stays byte-identical
+    /// (the br_prefix_len discipline). Skipping
+    /// rather than stopping at the first transaction
+    /// is load-bearing (desk section 2.3): a
+    /// transaction queued before the reader started
+    /// waiting, with its answer delivered behind it
+    /// ([TXN..., REPLY]), would otherwise wall the
+    /// answer off behind the gate forever. Returns
+    /// the fill bytes and how many transaction units
+    /// this walk left in place.
+    fn drain_gated_for(&mut self, pid: i32, cap: usize) -> (Vec<u8>, u64) {
+        let mut out = Vec::new();
+        let mut suppressed = 0u64;
+        if let Some(q) = self.queues.get_mut(&pid) {
+            let mut kept: Vec<u8> = Vec::new();
+            let mut off = 0usize;
+            while off + 4 <= q.len() {
+                let cmd = u32_at(q, off);
+                let len = br_one_len(cmd);
+                if off + len > q.len() {
+                    break;
+                }
+                if cmd == BR_TRANSACTION {
+                    suppressed += 1;
+                    kept.extend_from_slice(&q[off..off + len]);
+                } else if out.len() + len <= cap {
+                    out.extend_from_slice(&q[off..off + len]);
+                } else {
+                    break;
+                }
+                off += len;
+            }
+            kept.extend_from_slice(&q[off..]);
+            *q = kept;
+        }
+        (out, suppressed)
+    }
 }
 
 struct BinderNode {
@@ -3113,6 +3205,32 @@ struct BinderState {
     /// counts only audit it.
     reply_pops: HashMap<String, u64>,
     reply_completes: HashMap<String, u64>,
+    /// 0.9.147 (s9-147-desk section 4): the delivery-
+    /// discipline ledger, per arena, counted at the
+    /// discipline's own seats (same-seat counting
+    /// like the reply-complete ledger above; snapshot
+    /// and arena-death settlements print it as the
+    /// delivery-discipline account). ds_suppressed
+    /// counts BR_TRANSACTION units a gated drain left
+    /// in place for a waiting reader (R1, both drain
+    /// seats); ds_flush_held counts BR_TRANSACTION
+    /// units a flush left behind in the inbound
+    /// stream (R2, all four flush seats);
+    /// ds_land_denied counts transactions that fell
+    /// back to the pooled arm because every parked-
+    /// looper landing candidate was itself waiting
+    /// (R4). Red line, same as the token ledger: the
+    /// counts feed nothing -- not the predicate, not
+    /// delivery, not wakes.
+    ds_suppressed: HashMap<String, u64>,
+    ds_flush_held: HashMap<String, u64>,
+    ds_land_denied: HashMap<String, u64>,
+    /// Arenas whose discipline ledger has already
+    /// printed its first-occurrence line (section 4:
+    /// once per arena per tenure; an arena string
+    /// carries its leader pid, so one string is one
+    /// tenure). Telemetry only.
+    ds_noted: HashSet<String>,
 }
 
 /// One transaction held for the context manager (see
@@ -5040,7 +5158,27 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     let Some(arena) = st.thread_arena.get(&pid).cloned() else {
         return ParkedOutcome::Nothing;
     };
-    let (bytes, from_inbound) = {
+    // 0.9.147 (s9-147-desk section 2 R1, parked
+    // seat): a reader with an unanswered synchronous
+    // call outstanding is filled from its own queue
+    // alone, transactions skipped in place -- the
+    // inbound stream is not read at all. This is the
+    // .146 ignition seat: the lock holder parked in
+    // its transact wait was woken for inbound work
+    // and served the crash report nested inside the
+    // wait. A gated fill that comes up empty falls
+    // into the existing empty path below and
+    // re-parks, until its answer lands in its own
+    // queue.
+    let waiting = binder_thread_waiting(st, pid);
+    let (bytes, from_inbound) = if waiting {
+        let Some(bp) = st.procs.get_mut(&arena) else {
+            return ParkedOutcome::Nothing;
+        };
+        let (b, suppressed) = bp.drain_gated_for(pid, park.read_size as usize);
+        ds_count(st, &arena, "drain-parked", pid, DsCounter::Suppressed, suppressed);
+        (b, 0)
+    } else {
         let Some(bp) = st.procs.get_mut(&arena) else {
             return ParkedOutcome::Nothing;
         };
@@ -6566,6 +6704,34 @@ fn binder_deliver(
                 data_va: base + off,
             });
     }
+    // 0.9.147 (s9-147-desk section 2 R4): parked
+    // loopers of this arena that are themselves
+    // waiting on an unanswered synchronous call may
+    // not be landed on. Evaluated here, ahead of the
+    // procs borrow below: the predicate reads the
+    // whole coordinator state, which the landing
+    // search's field-disjoint closure captures
+    // cannot do once `bp` is alive.
+    let waiting_parked: HashSet<i32> = st
+        .parked
+        .keys()
+        .filter(|p| {
+            st.thread_arena
+                .get(p)
+                .map(|a| a == target)
+                .unwrap_or(false)
+        })
+        .filter(|p| binder_thread_waiting(st, **p))
+        .copied()
+        .collect();
+    // Discipline events this delivery raises, counted
+    // after the queue work below (the counters live on
+    // the state the borrowed proc blocks access to).
+    let mut ds_flush_held = 0u64;
+    let mut ds_flush_site = "flush-reply";
+    let mut ds_flush_reader: i32 = 0;
+    let mut ds_denied: Option<i32> = None;
+    let mut ds_pooled_denied = false;
     let Some(bp) = st.procs.get_mut(target) else {
         return Err("arena state vanished after alloc");
     };
@@ -6666,9 +6832,22 @@ fn binder_deliver(
             // temporaries died exactly this way: mRefs read
             // back as a small integer). Drain the shared
             // stream into the waiting thread's queue first.
+            // 0.9.147 (s9-147-desk section 2 R2): the
+            // flush moves the notice units only -- a
+            // pooled transaction flushed here would
+            // sit ahead of this reply in the waiter's
+            // own read and be dispatched nested inside
+            // its wait. The notices keep their order
+            // and still land ahead of the reply, as
+            // 81e7dc2 requires; the transaction stays
+            // in the inbound stream for a station
+            // thread to claim.
             if !bp.inbound.is_empty() {
-                let pending = std::mem::take(&mut bp.inbound);
-                bp.push_to(pid, &pending);
+                let held = bp.flush_inbound_notices_to(pid);
+                if held > 0 {
+                    ds_flush_held = held;
+                    ds_flush_reader = pid;
+                }
                 bsup!("binder: flushed pending inbound ahead of reply to pid={pid}");
             }
             bp.push_to(pid, &br_cmd.to_le_bytes());
@@ -6682,16 +6861,35 @@ fn binder_deliver(
             // stream whenever possible starved once already:
             // the looper kept waking for its own replies and
             // its drain never reached the pooled transaction.
+            // 0.9.147 (s9-147-desk section 2 R4): the
+            // landing search additionally requires the
+            // candidate not be waiting on an unanswered
+            // synchronous call of its own (waiting_
+            // parked, evaluated ahead of the borrow);
+            // a denied candidate is remembered for the
+            // ledger, and with no eligible looper the
+            // transaction takes the pooled fallback
+            // exactly as before.
             let parked_looper = st
                 .parked
                 .keys()
                 .find(|p| {
-                    bp.loopers.contains(p)
+                    let eligible = bp.loopers.contains(p)
                         && st
                             .thread_arena
                             .get(p)
                             .map(|a| a == target)
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                    if !eligible {
+                        return false;
+                    }
+                    if waiting_parked.contains(p) {
+                        if ds_denied.is_none() {
+                            ds_denied = Some(**p);
+                        }
+                        return false;
+                    }
+                    true
                 })
                 .copied();
             match parked_looper {
@@ -6701,14 +6899,22 @@ fn binder_deliver(
                     // whatever the shared stream already
                     // holds for this arena was queued before
                     // this transaction and must be read first.
+                    // 0.9.147 (R2, same seat): notices only
+                    // move -- this transaction's future
+                    // claim-mates stay pooled.
                     if !bp.inbound.is_empty() {
-                        let pending = std::mem::take(&mut bp.inbound);
-                        bp.push_to(p, &pending);
+                        let held = bp.flush_inbound_notices_to(p);
+                        if held > 0 {
+                            ds_flush_held = held;
+                            ds_flush_site = "land";
+                            ds_flush_reader = p;
+                        }
                     }
                     bp.push_to(p, &br_cmd.to_le_bytes());
                     bp.push_to(p, &txn);
                 }
                 None => {
+                    ds_pooled_denied = ds_denied.is_some();
                     let parked_here: Vec<String> = st
                         .parked
                         .keys()
@@ -6730,6 +6936,27 @@ fn binder_deliver(
             }
         }
     }
+    // 0.9.147 (s9-147-desk section 4): settle this
+    // delivery's discipline events. A landing denial
+    // counts only when the transaction actually fell
+    // back to the pooled arm because of it (a denial
+    // that still landed on another station thread
+    // cost the delivery nothing).
+    if ds_flush_held > 0 {
+        ds_count(
+            st,
+            target,
+            ds_flush_site,
+            ds_flush_reader,
+            DsCounter::FlushHeld,
+            ds_flush_held,
+        );
+    }
+    if ds_pooled_denied {
+        if let Some(dp) = ds_denied {
+            ds_count(st, target, "land", dp, DsCounter::LandDenied, 1);
+        }
+    }
     // 0.9.132: file this delivery in the write-overlap
     // audit table (see WriteAuditRec). Global FIFO with
     // a hard cap; the oldest records fall off first.
@@ -6740,6 +6967,133 @@ fn binder_deliver(
         }
     }
     Ok(off)
+}
+
+/// 0.9.147 (s9-147-desk sections 1.4 / 2): the
+/// delivery-discipline predicate -- thread `pid` has
+/// an unanswered synchronous call outstanding. The
+/// union of the three seats where such a wait is
+/// registered, and no fourth: the shared waiters
+/// queues (sent, not yet claimed), the Reply frames
+/// of the serving stacks (claimed, not yet popped),
+/// and mgr_pending (sent to handle 0 before the
+/// context manager registered, its sender already
+/// parked in its transact wait with no waiters entry
+/// yet). Read-only over coordinator state -- the
+/// predicate opens no registry of its own, and the
+/// tracer channel does not change. The sendReply
+/// wait (W2) and the one-way completion wait (W1')
+/// are deliberately not seats here: their token is
+/// queued into the waiting thread's own queue inside
+/// the same call that opens the wait (binder_reply_
+/// complete / binder_send_txn), so it is always in
+/// place before any later fill is assembled; their
+/// residual exposure is flush ordering, which R2
+/// covers unconditionally.
+fn binder_thread_waiting(st: &BinderState, pid: i32) -> bool {
+    if st
+        .waiters
+        .values()
+        .any(|q| q.iter().any(|w| w.sender_pid == pid))
+    {
+        return true;
+    }
+    if st.serving.values().any(|s| {
+        s.groups.iter().any(|g| {
+            g.frames
+                .iter()
+                .any(|f| matches!(f, ServingFrame::Reply(w, _) if w.sender_pid == pid))
+        })
+    }) {
+        return true;
+    }
+    st.mgr_pending.iter().any(|q| q.sender_pid == pid)
+}
+
+/// The outstanding wait a first-occurrence line names
+/// for `pid`: (target arena, code) of its first
+/// registered unanswered call, in waiters / serving /
+/// mgr order -- the join key the forensics needs to
+/// place a suppression on the wait graph. A claimed
+/// frame does not store its target arena; it is named
+/// through the sender arena's handle table, falling
+/// back to the handle itself. Telemetry only.
+fn binder_wait_desc(st: &BinderState, pid: i32) -> Option<(String, u32)> {
+    for (target, q) in &st.waiters {
+        if let Some(w) = q.iter().find(|w| w.sender_pid == pid) {
+            return Some((target.clone(), w.code));
+        }
+    }
+    for s in st.serving.values() {
+        for g in &s.groups {
+            for f in &g.frames {
+                if let ServingFrame::Reply(w, _) = f {
+                    if w.sender_pid == pid {
+                        let owner = st
+                            .procs
+                            .get(&w.sender_arena)
+                            .and_then(|bp| bp.handles.get(&w.target_handle))
+                            .and_then(|&n| st.nodes.get(n))
+                            .map(|n| n.owner.clone())
+                            .unwrap_or_else(|| format!("handle{}", w.target_handle));
+                        return Some((owner, w.code));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(q) = st.mgr_pending.iter().find(|q| q.sender_pid == pid) {
+        return Some(("handle0".to_string(), q.code));
+    }
+    None
+}
+
+/// Which delivery-discipline counter a seat counts
+/// into (s9-147-desk section 4).
+#[derive(Clone, Copy)]
+enum DsCounter {
+    Suppressed,
+    FlushHeld,
+    LandDenied,
+}
+
+/// Count one delivery-discipline event against its
+/// arena (s9-147-desk section 4: same-seat counting,
+/// first occurrence prints once per arena). The line
+/// names the seat, the reader the gate acted on, and
+/// the wait that reader was gated on. Counters only
+/// -- the reply-complete ledger's red line: nothing
+/// reads them back into the predicate, delivery or
+/// wakes.
+fn ds_count(
+    st: &mut BinderState,
+    arena: &str,
+    site: &str,
+    reader: i32,
+    counter: DsCounter,
+    n: u64,
+) {
+    if n == 0 {
+        return;
+    }
+    match counter {
+        DsCounter::Suppressed => {
+            *st.ds_suppressed.entry(arena.to_string()).or_default() += n
+        }
+        DsCounter::FlushHeld => {
+            *st.ds_flush_held.entry(arena.to_string()).or_default() += n
+        }
+        DsCounter::LandDenied => {
+            *st.ds_land_denied.entry(arena.to_string()).or_default() += n
+        }
+    }
+    if st.ds_noted.insert(arena.to_string()) {
+        let (tgt, code) = binder_wait_desc(st, reader)
+            .unwrap_or_else(|| ("?".to_string(), 0));
+        bsup!(
+            "binder: delivery-discipline first hit arena={arena} site={site} reader={reader} wait=({tgt}, code={code})"
+        );
+    }
 }
 
 /// Which parked threads of `arena` have work they may
@@ -6768,7 +7122,20 @@ fn binder_wake_candidates(st: &BinderState, arena: &str) -> Vec<i32> {
             continue;
         }
         let own = bp.queues.get(pid).map_or(0, |q| q.len());
-        if own > 0 || (!bp.inbound.is_empty() && bp.loopers.contains(pid)) {
+        // 0.9.147 (s9-147-desk section 2 R3): a parked
+        // thread with an unanswered synchronous call
+        // outstanding is a candidate on its own queue
+        // alone -- the inbound stream no longer wakes
+        // it, since the gated drain (R1) would only
+        // assemble an empty fill for it and re-park.
+        // This gate guards the rhythm, not correctness:
+        // R1 alone already keeps transactions out of
+        // its fills. Non-waiting threads are unchanged.
+        if own > 0
+            || (!bp.inbound.is_empty()
+                && bp.loopers.contains(pid)
+                && !binder_thread_waiting(st, *pid))
+        {
             out.push(*pid);
         }
     }
@@ -8231,6 +8598,23 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             );
         }
     }
+    // 0.9.147 (s9-147-desk section 4): the delivery-
+    // discipline ledger settles at the same seat, in
+    // the same shape, for every live arena (the
+    // proc-exit settlement in binder_on_proc_exit
+    // prints the same line again at arena death).
+    {
+        let mut acct_arenas: Vec<&String> = st.procs.keys().collect();
+        acct_arenas.sort();
+        for a in acct_arenas {
+            bsup!(
+                "binder: arena {a} delivery-discipline account: suppressed={} flush_held={} land_denied={}",
+                st.ds_suppressed.get(a).copied().unwrap_or(0),
+                st.ds_flush_held.get(a).copied().unwrap_or(0),
+                st.ds_land_denied.get(a).copied().unwrap_or(0)
+            );
+        }
+    }
     // 0.9.142 (section 2.4): servicers the v2
     // reverse lookups found claimed join the face
     // broadcast beside the v1 set.
@@ -8620,10 +9004,16 @@ fn binder_reply_complete(
 ) {
     *st.reply_pops.entry(arena.to_string()).or_default() += 1;
     let mut queued = false;
+    let mut ds_flush_held = 0u64;
     if let Some(bp) = st.procs.get_mut(arena) {
+        // 0.9.147 (s9-147-desk section 2 R2): notices
+        // only move ahead of the token -- a pooled
+        // transaction flushed here would be dispatched
+        // nested inside the replier's sendReply wait,
+        // ahead of the very token that ends it (the
+        // .145 M2 accomplice shape).
         if !bp.inbound.is_empty() {
-            let pending = std::mem::take(&mut bp.inbound);
-            bp.push_to(pid, &pending);
+            ds_flush_held = bp.flush_inbound_notices_to(pid);
             bsup!("binder: flushed pending inbound ahead of reply-complete to pid={pid}");
         }
         bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
@@ -8632,6 +9022,7 @@ fn binder_reply_complete(
     if queued {
         *st.reply_completes.entry(arena.to_string()).or_default() += 1;
     }
+    ds_count(st, arena, "flush-complete", pid, DsCounter::FlushHeld, ds_flush_held);
     binder_maybe_wake(st, arena, actions);
 }
 
@@ -9648,6 +10039,11 @@ fn binder_send_txn(
             size: data.len() as u32,
         },
     );
+    // 0.9.147: transaction units this block's flush
+    // holds back, counted after the block (the
+    // counters live on the state the proc borrow
+    // blocks access to).
+    let mut ds_flush_held = 0u64;
     if let Some(bp) = st.procs.get_mut(arena) {
         // Kernel ordering: 81e7dc2 flushed the shared
         // inbound stream ahead of BR_REPLY (and ahead of
@@ -9664,13 +10060,23 @@ fn binder_send_txn(
         // then incStrong'd a dead cookie (S-B). Drain
         // the stream into the sender's queue first, so
         // it reads [..., notices, TRANSACTION_COMPLETE].
+        // 0.9.147 (s9-147-desk section 2 R2): the
+        // flush moves the notice units only. The S-B
+        // ordering this block exists for -- the sender
+        // reads [..., notices, TRANSACTION_COMPLETE] --
+        // covers the notices; a pooled transaction
+        // flushed ahead of the token would be
+        // dispatched nested inside the wait this very
+        // send just opened (or, for a one-way send,
+        // inside the station read that follows, ahead
+        // of the completion word).
         if !bp.inbound.is_empty() {
-            let pending = std::mem::take(&mut bp.inbound);
-            bp.push_to(pid, &pending);
+            ds_flush_held = bp.flush_inbound_notices_to(pid);
             bsup!("binder: flushed pending inbound ahead of transaction-complete to pid={pid}");
         }
         bp.push_to(pid, &BR_TRANSACTION_COMPLETE.to_le_bytes());
     }
+    ds_count(st, arena, "flush-send", pid, DsCounter::FlushHeld, ds_flush_held);
     binder_maybe_wake(st, &owner, actions);
     notes.push(format!("TRANSACTION code {code} -> node in {owner} ({}B)", tdata.len()));
 }
@@ -9734,6 +10140,27 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         put_u32(&mut b, 20, rb);
         b
     };
+    // 0.9.147 (s9-147-desk section 2 R1, inline
+    // seat): a reader with an unanswered synchronous
+    // call outstanding is filled from its own queue
+    // alone, transactions skipped in place, the
+    // inbound stream untouched. The predicate is
+    // evaluated after the write phase, so a wait this
+    // very call just registered counts (W-3). A gated
+    // fill that comes up empty falls through to the
+    // park arm below, exactly like an empty queue.
+    let waiting = binder_thread_waiting(st, pid);
+    let gated: Option<Vec<u8>> = if waiting && rs > 0 {
+        let (b, suppressed) = st
+            .procs
+            .get_mut(&arena)
+            .map(|bp| bp.drain_gated_for(pid, rs as usize))
+            .unwrap_or_default();
+        ds_count(st, &arena, "drain-inline", pid, DsCounter::Suppressed, suppressed);
+        Some(b)
+    } else {
+        None
+    };
     let queue_len = st
         .procs
         .get(&arena)
@@ -9743,7 +10170,9 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     // br_prefix_len): fill only up to a command
     // boundary inside the reader's buffer; the rest
     // stays queued for its next read.
-    let fill_n = if rs > 0 && queue_len > 0 {
+    let fill_n = if gated.is_some() {
+        0
+    } else if rs > 0 && queue_len > 0 {
         let peek = st
             .procs
             .get(&arena)
@@ -9753,12 +10182,17 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     } else {
         0
     };
-    if fill_n > 0 {
-        let bytes: Vec<u8> = st
-            .procs
+    let bytes: Vec<u8> = if let Some(b) = gated {
+        b
+    } else if fill_n > 0 {
+        st.procs
             .get_mut(&arena)
             .map(|bp| bp.drain_for(pid, fill_n).0)
-            .unwrap_or_default();
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !bytes.is_empty() {
         let bytes = shield_ref_pairs(st, &arena, pid, bytes);
         binder_claim_fills(st, &arena, pid, &bytes);
         // 0.9.143 (s9-143-desk section 2.1 item 4):
@@ -11932,6 +12366,15 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         "binder: arena {arena} reply-complete account: reply_pops={} reply_completes={}",
         st.reply_pops.get(arena).copied().unwrap_or(0),
         st.reply_completes.get(arena).copied().unwrap_or(0)
+    );
+    // 0.9.147 (s9-147-desk section 4): the delivery-
+    // discipline ledger, settled at the same seat
+    // like the accounts above.
+    bsup!(
+        "binder: arena {arena} delivery-discipline account: suppressed={} flush_held={} land_denied={}",
+        st.ds_suppressed.get(arena).copied().unwrap_or(0),
+        st.ds_flush_held.get(arena).copied().unwrap_or(0),
+        st.ds_land_denied.get(arena).copied().unwrap_or(0)
     );
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
@@ -17498,5 +17941,155 @@ mod tests {
         assert!(!map.contains_key(&(100, 0x9999)));
         futex_acct_add(&mut map, &mut addrs, 100, 0x1000, false, 101);
         assert_eq!(map[&(100, 0x1000)].wakes, 1);
+    }
+
+    // 0.9.147 (s9-147-desk section 2): the gated
+    // drain, the notice-only flush and the waiting
+    // predicate. Queue state only -- no tracer, no
+    // guest.
+    fn unit44(cmd: u32, tag: u32) -> Vec<u8> {
+        let mut u = cmd.to_le_bytes().to_vec();
+        u.extend_from_slice(&tag.to_le_bytes());
+        u.resize(44, 0);
+        u
+    }
+
+    fn unit12(cmd: u32, tag: u32) -> Vec<u8> {
+        let mut u = cmd.to_le_bytes().to_vec();
+        u.extend_from_slice(&tag.to_le_bytes());
+        u.resize(12, 0);
+        u
+    }
+
+    #[test]
+    fn gated_drain_skips_transactions_and_reaches_answer() {
+        let mut bp = test_proc();
+        let pid = 4242;
+        // [TXN, REPLY, TXN]: the answer sits behind
+        // a transaction queued before the wait began
+        // (desk section 2.3). A prefix-shaped gate
+        // would wall it off forever; the skip must
+        // reach it, and the two transactions stay in
+        // place, in order.
+        let mut q = unit44(BR_TRANSACTION, 1);
+        q.extend_from_slice(&unit44(BR_REPLY, 2));
+        q.extend_from_slice(&unit44(BR_TRANSACTION, 3));
+        bp.queues.insert(pid, q);
+        let (out, suppressed) = bp.drain_gated_for(pid, 4096);
+        assert_eq!(out, unit44(BR_REPLY, 2));
+        assert_eq!(suppressed, 2);
+        let mut left = unit44(BR_TRANSACTION, 1);
+        left.extend_from_slice(&unit44(BR_TRANSACTION, 3));
+        assert_eq!(bp.queues[&pid], left);
+    }
+
+    #[test]
+    fn gated_drain_stops_at_first_unit_that_does_not_fit() {
+        let mut bp = test_proc();
+        let pid = 4242;
+        let mut q = unit44(BR_TRANSACTION, 1);
+        q.extend_from_slice(&unit44(BR_REPLY, 2));
+        bp.queues.insert(pid, q.clone());
+        // Cap one byte short of the reply: the walk
+        // passes the transaction (counted as held)
+        // and stops at the reply; the whole queue
+        // stays byte-identical.
+        let (out, suppressed) = bp.drain_gated_for(pid, 43);
+        assert!(out.is_empty());
+        assert_eq!(suppressed, 1);
+        assert_eq!(bp.queues[&pid], q);
+        // Cap exactly the reply: it is taken, the
+        // transaction stays.
+        let (out, suppressed) = bp.drain_gated_for(pid, 44);
+        assert_eq!(out, unit44(BR_REPLY, 2));
+        assert_eq!(suppressed, 1);
+        assert_eq!(bp.queues[&pid], unit44(BR_TRANSACTION, 1));
+    }
+
+    #[test]
+    fn flush_moves_notices_only_and_holds_transactions() {
+        let mut bp = test_proc();
+        let pid = 4242;
+        // [INCREFS, TXN, DEAD_BINDER]: the notices
+        // move in order, the transaction stays in
+        // the inbound stream.
+        let mut inbound = unit12(BR_INCREFS, 1);
+        inbound.extend_from_slice(&unit44(BR_TRANSACTION, 2));
+        let mut dead = BR_DEAD_BINDER.to_le_bytes().to_vec();
+        dead.extend_from_slice(&9u32.to_le_bytes());
+        inbound.extend_from_slice(&dead);
+        bp.inbound = inbound;
+        let held = bp.flush_inbound_notices_to(pid);
+        assert_eq!(held, 1);
+        let mut moved = unit12(BR_INCREFS, 1);
+        moved.extend_from_slice(&dead);
+        assert_eq!(bp.queues[&pid], moved);
+        assert_eq!(bp.inbound, unit44(BR_TRANSACTION, 2));
+    }
+
+    #[test]
+    fn waiting_predicate_unions_three_registries() {
+        fn wait(pid: i32) -> ReplyWait {
+            ReplyWait {
+                sender_pid: pid,
+                sender_arena: "app".to_string(),
+                cookie: 0,
+                target_handle: 1,
+                code: 7,
+            }
+        }
+        let mut st = BinderState::default();
+        // Seat 1: an unclaimed wait in a waiters
+        // queue.
+        st.waiters
+            .entry("ss".to_string())
+            .or_default()
+            .push(wait(101));
+        // Seat 2: a claimed wait as a serving Reply
+        // frame. (An Other frame on another stack
+        // must not count.)
+        st.serving.insert(
+            900,
+            ServingStack {
+                arena: "ss".to_string(),
+                groups: vec![ServingGroup {
+                    fill_id: 1,
+                    frames: vec![ServingFrame::Reply(wait(102), 1)],
+                }],
+            },
+        );
+        st.serving.insert(
+            901,
+            ServingStack {
+                arena: "ss".to_string(),
+                groups: vec![ServingGroup {
+                    fill_id: 2,
+                    frames: vec![ServingFrame::Other],
+                }],
+            },
+        );
+        // Seat 3: a pre-manager send parked in
+        // mgr_pending.
+        st.mgr_pending.push(PendingMgrTxn {
+            sender_arena: "app".to_string(),
+            sender_pid: 103,
+            target_handle: 0,
+            cookie: 0,
+            code: 2,
+            flags: 0,
+            veuid: 0,
+            data: Vec::new(),
+            offs: Vec::new(),
+        });
+        assert!(binder_thread_waiting(&st, 101));
+        assert!(binder_thread_waiting(&st, 102));
+        assert!(binder_thread_waiting(&st, 103));
+        assert!(!binder_thread_waiting(&st, 104));
+        // The first-occurrence join reads seat 1 back
+        // with its target arena and code.
+        assert_eq!(
+            binder_wait_desc(&st, 101),
+            Some(("ss".to_string(), 7))
+        );
     }
 }
