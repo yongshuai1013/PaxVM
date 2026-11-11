@@ -913,6 +913,18 @@ fn write_mem(pid: i32, addr: u64, data: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
+/// Bytes -> path string, byte-identical to
+/// `String::from_utf8_lossy(b).into_owned()`: valid UTF-8 is
+/// adopted without a second copy (0.9.149, S10 F2); the lossy
+/// replacement path runs only on invalid input, exactly as
+/// before.
+fn path_bytes_to_string(all: Vec<u8>) -> String {
+    match String::from_utf8(all) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
 /// Read a NUL-terminated path string out of the guest (PATH_MAX cap).
 fn read_path(pid: i32, addr: u64) -> Option<String> {
     let mut all: Vec<u8> = Vec::new();
@@ -932,7 +944,7 @@ fn read_path(pid: i32, addr: u64) -> Option<String> {
             _ => return None,
         }
     }
-    Some(String::from_utf8_lossy(&all).into_owned())
+    Some(path_bytes_to_string(all))
 }
 
 // ---- path translation (M0 spec 2.5, vcwd-anchored per M1 spec 3) ----
@@ -993,6 +1005,121 @@ fn translate(rootfs: &str, vcwd: &str, dirfd: i64, path: &str) -> Option<String>
     }
 }
 
+// ---- stat-family fast path (0.9.149, S10 F2) ----
+//
+// The stat family is the supervisor's hottest path-class by an
+// order of magnitude (0.9.148 field: stat64 alone 125,263 logged
+// calls, 81.8% of the syscall stream, massed in process-birth
+// windows), and the generic translation above pays for generality
+// it does not need there: the guest-absolute form is normalized
+// TWICE per device-probe call (once inside translate, once again
+// for device_map), and every stage assembles fresh strings
+// (component Vec, join, format). The functions below return
+// byte-identical results to guest_abs / translate -- the
+// equivalence is structural, argued per branch, and pinned by the
+// cfg(test) corpus at the end of this file -- while skipping the
+// redundant work:
+//
+//   * an already-canonical absolute path (the overwhelmingly
+//     common library-stat shape) is adopted as-is: no component
+//     Vec, no join;
+//   * a canonical relative path under a canonical non-root vcwd
+//     composes by a single concatenation;
+//   * anything else falls back to the literal legacy expressions,
+//     so dot components, clamping and trailing-slash errno
+//     semantics can never drift;
+//   * the host path is assembled in one allocation, and the
+//     guest-absolute form is computed exactly once per call.
+//
+// NO result caching anywhere: freshness semantics are the legacy
+// ones, every call re-reads the guest path and re-stats through
+// the real kernel syscall, exactly as before.
+
+/// True iff `path` (absolute) survives normalize_path_str
+/// unchanged: "/" itself, or a leading '/', no trailing '/',
+/// and every component non-empty and neither "." nor "..".
+/// A trailing slash is disqualifying, not cosmetic: stat on
+/// "/a/b/" must answer ENOTDIR where "/a/b" succeeds, and the
+/// legacy normalizer strips it -- that case stays legacy.
+fn components_canonical_abs(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if !path.starts_with('/') || path.ends_with('/') {
+        return false;
+    }
+    path[1..]
+        .split('/')
+        .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// True iff `path` (relative) can be appended to a canonical
+/// vcwd without normalization changing the result: non-empty,
+/// no leading or trailing '/', every component non-empty and
+/// neither "." nor "..".
+fn components_canonical_rel(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
+        return false;
+    }
+    path.split('/')
+        .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// guest_abs with fast branches; byte-identical output.
+fn guest_abs_fast(vcwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        if components_canonical_abs(path) {
+            path.to_string()
+        } else {
+            normalize_path_str(path)
+        }
+    } else if vcwd != "/"
+        && components_canonical_abs(vcwd)
+        && components_canonical_rel(path)
+    {
+        // vcwd is canonical and not the root (whose concatenation
+        // would double the leading slash and normalize back --
+        // the one case where concat != normalized concat), and
+        // path contributes only plain components: the normalized
+        // form of the concatenation IS the concatenation.
+        let mut out = String::with_capacity(vcwd.len() + 1 + path.len());
+        out.push_str(vcwd);
+        out.push('/');
+        out.push_str(path);
+        out
+    } else {
+        normalize_path_str(&format!("{vcwd}/{path}"))
+    }
+}
+
+/// translate with fast branches; byte-identical output. The
+/// guest-absolute form comes back alongside the host path so a
+/// caller that also needs it (the device_map probe check) does
+/// not compute it a second time.
+fn translate_fast_parts(
+    rootfs: &str,
+    vcwd: &str,
+    dirfd: i64,
+    path: &str,
+) -> Option<(String, String)> {
+    if path.is_empty() {
+        return None;
+    }
+    if !path.starts_with('/') && dirfd != AT_FDCWD {
+        // As legacy: relative to a real fd, kernel resolution is
+        // already inside the rootfs.
+        return None;
+    }
+    let abs = guest_abs_fast(vcwd, path);
+    // Legacy: abs == "/" yields "{rootfs}/", anything else
+    // "{rootfs}{abs}" -- rootfs + abs reproduces both, since abs
+    // itself starts with '/'.
+    let mut host = String::with_capacity(rootfs.len() + abs.len());
+    host.push_str(rootfs);
+    host.push_str(&abs);
+    Some((abs, host))
+}
+
 fn roundup16(n: u64) -> u64 {
     (n + 15) & !15
 }
@@ -1005,6 +1132,26 @@ fn scratch_write(pid: i32, cursor: &mut u64, s: &str) -> Option<u64> {
     *cursor = cursor.saturating_sub(roundup16(len));
     let addr = *cursor;
     let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    match write_mem(pid, addr, &bytes) {
+        Ok(()) => Some(addr),
+        Err(e) => {
+            sup!("scratch write failed at {addr:#x}: errno={e}");
+            None
+        }
+    }
+}
+
+/// scratch_write with the NUL-terminated buffer built in a
+/// single allocation (0.9.149, S10 F2). Same cursor arithmetic,
+/// same bytes written, same failure log: only the buffer
+/// assembly differs (to_vec + push could reallocate).
+fn scratch_write_fast(pid: i32, cursor: &mut u64, s: &str) -> Option<u64> {
+    let len = s.len() as u64 + 1;
+    *cursor = cursor.saturating_sub(roundup16(len));
+    let addr = *cursor;
+    let mut bytes = Vec::with_capacity(s.len() + 1);
+    bytes.extend_from_slice(s.as_bytes());
     bytes.push(0);
     match write_mem(pid, addr, &bytes) {
         Ok(()) => Some(addr),
@@ -1678,6 +1825,77 @@ fn entry_translate(
         desc.push_str(" [note: readlink result may carry the rootfs prefix]");
     }
     desc
+}
+
+/// The path-carrying stat family on the current interception
+/// surface (0.9.149, S10 F2): compat stat64/lstat64 ride the
+/// path0 seat and fstatat64 the dirfd seat; AArch64 keeps only
+/// newfstatat. The fd-only members (fstat64/fstat) carry no
+/// path and never reach translation, so there is nothing to
+/// slim for them; statx stays on the generic seat (GB never
+/// issues it, and its wider argument frame is the generic
+/// path's business).
+fn is_stat_family(compat: bool, nr: u64) -> bool {
+    if compat {
+        matches!(nr, 195 | 196 | 327) // stat64, lstat64, fstatat64
+    } else {
+        nr == 79 // newfstatat
+    }
+}
+
+/// entry_translate specialized to the stat family, with the
+/// F2 fast translation. Behaviour is the generic seat's,
+/// point for point: the open-family binder/ashmem intercept
+/// can never fire here (no stat call is in is_open_family);
+/// the path sits at a0 with cwd semantics for stat64/lstat64
+/// and at a1 with dirfd a0 for the *at forms -- the same two
+/// shapes entry_translate's pair selection produces for these
+/// numbers; device_map applies to exactly the is_device_probe
+/// subset (compat stat64/lstat64), fed with the one
+/// guest-absolute computation translate_fast_parts already
+/// made (the generic seat computes it twice); and the desc
+/// text is byte-identical (single pair, joined trivially; the
+/// readlinkat note can never apply to a stat number). The
+/// syscall itself still runs on the host kernel and writes
+/// the result struct in the tracee's context, as before --
+/// there is no supervisor-side struct handling on this path,
+/// on either seat.
+fn entry_translate_stat(
+    pid: i32,
+    rootfs: &str,
+    vcwd: &str,
+    compat: bool,
+    nr: u64,
+    regs: &mut Regs,
+) -> String {
+    let (argi, dirfd) = if is_t_dirfd_path(compat, nr) {
+        (1, regs.arg(0) as i64)
+    } else {
+        (0, AT_FDCWD)
+    };
+    let addr = regs.arg(argi);
+    let mut cursor = regs.sp().saturating_sub(256);
+    let part = match read_path(pid, addr) {
+        Some(old) => match translate_fast_parts(rootfs, vcwd, dirfd, &old) {
+            Some((abs, host)) => {
+                let new = if is_device_probe(compat, nr) {
+                    device_map(rootfs, &abs).unwrap_or(host)
+                } else {
+                    host
+                };
+                match scratch_write_fast(pid, &mut cursor, &new) {
+                    Some(scratch) => {
+                        regs.set_arg(argi, scratch);
+                        format!("'{old}' -> '{new}'")
+                    }
+                    None => format!("'{old}' (scratch write failed, untranslated)"),
+                }
+            }
+            None => format!("'{old}' (untranslated)"),
+        },
+        None => format!("path@{addr:#x} (unreadable)"),
+    };
+    format!("{}({}) pid={} {}", nr_name(compat, nr), nr, pid, part)
 }
 
 /// set*id family: emulated at the entry stop, always returning 0.
@@ -16008,6 +16226,21 @@ fn tracer_loop(ctx: TracerCtx) {
                         "mprotect EXEC addr=0x{addr:x} len={len} prot={prot:#x}{}",
                         if handled { " (ashmem conversion attempted)" } else { "" }
                     ));
+                } else if is_stat_family(proc.compat, nr) {
+                    // 0.9.149 (S10 F2): the stat family
+                    // takes its fast translation seat (see
+                    // entry_translate_stat); every other
+                    // T-class call keeps the generic seat
+                    // below, byte for byte.
+                    pend.desc = Some(entry_translate_stat(
+                        pid,
+                        &rootfs,
+                        &proc.vcwd,
+                        proc.compat,
+                        nr,
+                        &mut regs,
+                    ));
+                    dirty = true;
                 } else if is_t_dirfd_path(proc.compat, nr)
                     || is_t_two_paths(proc.compat, nr)
                     || is_t_symlinkat(proc.compat, nr)
@@ -18638,5 +18871,153 @@ mod tests {
             .expect("own stat must parse");
         assert!(ppid > 0);
         assert!(ticks > 0 || ppid > 0);
+    }
+
+    // S10 F2 (0.9.149): the stat fast seat covers
+    // exactly the path-carrying stat family.
+    #[test]
+    fn stat_family_seat_membership() {
+        assert!(is_stat_family(true, 195)); // stat64
+        assert!(is_stat_family(true, 196)); // lstat64
+        assert!(is_stat_family(true, 327)); // fstatat64
+        assert!(!is_stat_family(true, 197)); // fstat64: fd-only
+        assert!(!is_stat_family(true, 322)); // openat stays generic
+        assert!(!is_stat_family(true, 33)); // access stays generic
+        assert!(is_stat_family(false, 79)); // newfstatat
+        assert!(!is_stat_family(false, 80)); // fstat: fd-only
+        assert!(!is_stat_family(false, 56)); // openat stays generic
+    }
+
+    // S10 F2 (0.9.149): fast translation must be
+    // byte-identical to the legacy translation over
+    // every path shape either can meet -- canonical
+    // and non-canonical, absolute and relative, root
+    // and clamping dot components, trailing slashes
+    // (an errno-visible shape), empty paths, real
+    // dirfds, and even non-canonical vcwds (which the
+    // fast branches must refuse and hand to legacy).
+    #[test]
+    fn stat_fast_translation_equivalence_corpus() {
+        const ROOTFS: &str =
+            "/data/user/0/com.yongshuai.paxvm/files/vm0/rootfsGB";
+        let vcwds = [
+            "/",
+            "/system",
+            "/data/data/com.example",
+            "/a/b/c",
+            "/a//b",
+            "/x/../y",
+            "/a/b/",
+        ];
+        let paths = [
+            "/system/lib/libc.so",
+            "/system/framework/framework.jar",
+            "/a",
+            "/",
+            "/system//lib/libc.so",
+            "/system/./lib/libc.so",
+            "/system/lib/../lib/libc.so",
+            "/../system/lib/libc.so",
+            "/system/lib/",
+            "/system/lib/.",
+            "/system/lib/..",
+            "//system/lib/libc.so",
+            "/.",
+            "/..",
+            "lib/libc.so",
+            "./lib/libc.so",
+            "../fonts/DroidSans.ttf",
+            "../../x",
+            "a//b",
+            "a/b/",
+            ".",
+            "..",
+            "",
+        ];
+        for vcwd in vcwds {
+            for path in paths {
+                assert_eq!(
+                    guest_abs_fast(vcwd, path),
+                    guest_abs(vcwd, path),
+                    "guest_abs mismatch vcwd={vcwd} path={path}"
+                );
+                for dirfd in [AT_FDCWD, 7] {
+                    assert_eq!(
+                        translate_fast_parts(ROOTFS, vcwd, dirfd, path)
+                            .map(|(_, h)| h),
+                        translate(ROOTFS, vcwd, dirfd, path),
+                        "translate mismatch vcwd={vcwd} dirfd={dirfd} path={path}"
+                    );
+                }
+            }
+        }
+    }
+
+    // S10 F2 (0.9.149): the four filesystem shapes --
+    // regular file, directory, missing (ENOENT) and
+    // vcwd-relative -- must stat identically through
+    // the legacy and fast translations.
+    #[test]
+    fn stat_fast_translation_fs_shapes() {
+        let base = std::env::temp_dir().join(format!(
+            "paxvm-f2-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let rootfs = base.join("rootfsGB");
+        std::fs::create_dir_all(rootfs.join("system/lib")).unwrap();
+        std::fs::write(rootfs.join("system/lib/libc.so"), b"12345").unwrap();
+        let rootfs_s = rootfs.to_string_lossy().into_owned();
+        // (vcwd, path): file, directory, ENOENT, relative.
+        let shapes = [
+            ("/", "/system/lib/libc.so"),
+            ("/", "/system/lib"),
+            ("/", "/system/lib/nope.so"),
+            ("/system", "lib/libc.so"),
+        ];
+        for (vcwd, p) in shapes {
+            let old = translate(&rootfs_s, vcwd, AT_FDCWD, p).unwrap();
+            let new = translate_fast_parts(&rootfs_s, vcwd, AT_FDCWD, p)
+                .map(|(_, h)| h)
+                .unwrap();
+            assert_eq!(old, new, "shape {p}");
+            match (std::fs::metadata(&old), std::fs::metadata(&new)) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.is_file(), b.is_file(), "shape {p}");
+                    assert_eq!(a.is_dir(), b.is_dir(), "shape {p}");
+                    assert_eq!(a.len(), b.len(), "shape {p}");
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(
+                        a.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "shape {p}"
+                    );
+                    assert_eq!(a.kind(), b.kind(), "shape {p}");
+                }
+                _ => panic!("metadata disagreement on shape {p}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // S10 F2 (0.9.149): the read_path byte conversion
+    // keeps lossy semantics exactly, valid input
+    // included.
+    #[test]
+    fn path_bytes_string_parity() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"/system/lib/libc.so".to_vec(),
+            "/data/字節".as_bytes().to_vec(),
+            vec![b'/', 0xff, b'a'],
+            vec![0xc3, 0x28],
+            Vec::new(),
+        ];
+        for c in cases {
+            assert_eq!(
+                path_bytes_to_string(c.clone()),
+                String::from_utf8_lossy(&c).into_owned()
+            );
+        }
     }
 }
