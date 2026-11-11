@@ -2416,6 +2416,39 @@ struct WriteAuditRec {
 /// red line: read by the wedge trigger and the
 /// reverse lookup, never by pairing, claim, settle,
 /// delivery or the verdict.
+/// 0.9.143 (s9-143-desk section 2.1): the stamp no
+/// longer settles at the reply pop. The pop only
+/// marks it answered (see the field below); the
+/// stamp settles when the answer is filled into
+/// the waiter's read (settle_fill_answers), which
+/// is where the waiter's wait actually ends -- a
+/// reply can sit queued behind a nested inbound
+/// transaction the waiter serves first, and the
+/// .142 field's five trigger misses were stamps
+/// settled at the pop while their waiters were
+/// still frozen on the same call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnswerKind {
+    /// Delivered BR_REPLY.
+    Reply,
+    /// FAILED_REPLY (shield3 / shield4 intercept or
+    /// a failed delivery).
+    FailedReply,
+    /// DEAD_REPLY (serving thread exit or target
+    /// arena death).
+    DeadReply,
+}
+
+impl AnswerKind {
+    fn tag(self) -> &'static str {
+        match self {
+            AnswerKind::Reply => "reply",
+            AnswerKind::FailedReply => "failed-reply",
+            AnswerKind::DeadReply => "dead-reply",
+        }
+    }
+}
+
 struct SyncStamp {
     sender_arena: String,
     /// Target arena as resolved through the handle /
@@ -2433,6 +2466,18 @@ struct SyncStamp {
     /// Backfilled by binder_claim_fills when a
     /// serving thread claims this call's wait.
     claim_seq: Option<u64>,
+    /// 0.9.143 (s9-143-desk section 2.1): set at
+    /// the reply pop (or at a death answer) with
+    /// the answering pop's claim sequence, the
+    /// answer parcel's size (0 for a death answer,
+    /// which carries no parcel) and its kind. An
+    /// answered stamp stays live until the answer
+    /// is filled into the waiter's read; if the
+    /// waiter sends a newer call first (nested
+    /// serving), the answered stamp moves to the
+    /// per-pid answered reserve instead of the
+    /// orphan list.
+    answered: Option<(u64, u32, AnswerKind)>,
 }
 
 /// 0.9.142 (s9-142-desk section 3.2): one entry of
@@ -2691,6 +2736,21 @@ struct BinderState {
     sync_stamps: HashMap<i32, SyncStamp>,
     sync_orphans: HashMap<String, VecDeque<SyncStamp>>,
     sync_orphan_total: HashMap<String, u64>,
+    /// 0.9.143 (s9-143-desk sections 2.1 / 3.3):
+    /// answered stamps overwritten by a newer send
+    /// before their answer was filled, kept per
+    /// sender pid (cap 4, oldest dropped and counted
+    /// in sync_stamp_reserve_dropped). Every entry
+    /// here is answered by construction; fill
+    /// settlement drains this queue before the live
+    /// stamp (one FIFO across both). stamp_fill_
+    /// unmatched counts fill answer commands (and
+    /// whole unparseable fill segments) that found
+    /// no answered stamp to settle. Telemetry only,
+    /// like the stamp ledger itself.
+    sync_stamp_reserve: HashMap<i32, VecDeque<SyncStamp>>,
+    sync_stamp_reserve_dropped: u64,
+    stamp_fill_unmatched: u64,
     deliver_seq: u64,
     /// 0.9.142 (s9-142-desk section 3.2): per-thread
     /// binder profile rings for the SIGSEGV cell
@@ -2719,6 +2779,17 @@ struct BinderState {
     /// untouched, and nothing reads this back.
     fat_templates: HashMap<(u32, u32, u32, u32), u64>,
     fat_template_samples: u64,
+    /// 0.9.143 (s9-143-desk section 4.3): census of
+    /// shield3 request-side drops, keyed by (code,
+    /// data size, offsets size) at the drop point --
+    /// the request-side mirror of the fat template
+    /// account, so the recurring same-shape OOB
+    /// family (the .142 field's five code=13 /
+    /// 2020B / 12B drops) is one settlement line
+    /// instead of a per-run grep. Counting only;
+    /// the drop itself is unchanged.
+    shield3_census: HashMap<(u32, u32, u32), u64>,
+    shield3_census_total: u64,
 }
 
 /// One transaction held for the context manager (see
@@ -2775,33 +2846,149 @@ impl BinderState {
     /// the sender arena's orphan list (cap 16, oldest
     /// dropped) and the cumulative orphan total,
     /// never silently overwritten.
+    /// 0.9.143 (s9-143-desk section 2.1 item 5): an
+    /// overwritten stamp that was already answered
+    /// goes to the per-pid answered reserve instead
+    /// (cap 4, oldest dropped and counted) -- its
+    /// answer is queued for a fill that has not
+    /// happened yet, so the wait is still real and
+    /// the wedge trigger must still see it. The
+    /// orphan path now only ever holds un-answered
+    /// stamps, which keeps the orphan total's old
+    /// meaning: a live un-answered stamp overwritten
+    /// is a pairing-ledger leak.
     fn record_sync_stamp(&mut self, sender_pid: i32, stamp: SyncStamp) {
         if let Some(old) = self.sync_stamps.remove(&sender_pid) {
-            let arena = old.sender_arena.clone();
-            *self.sync_orphan_total.entry(arena.clone()).or_default() += 1;
-            let q = self.sync_orphans.entry(arena).or_default();
-            if q.len() >= 16 {
-                q.pop_front();
+            if old.answered.is_some() {
+                let q = self.sync_stamp_reserve.entry(sender_pid).or_default();
+                if q.len() >= 4 {
+                    q.pop_front();
+                    self.sync_stamp_reserve_dropped += 1;
+                }
+                q.push_back(old);
+            } else {
+                let arena = old.sender_arena.clone();
+                *self.sync_orphan_total.entry(arena.clone()).or_default() += 1;
+                let q = self.sync_orphans.entry(arena).or_default();
+                if q.len() >= 16 {
+                    q.pop_front();
+                }
+                q.push_back(old);
             }
-            q.push_back(old);
         }
         self.sync_stamps.insert(sender_pid, stamp);
     }
-    /// 0.9.142: settle one sender's stamp when its
-    /// wait is answered in any form (reply pop,
-    /// DEAD_REPLY at a serving thread's exit or at
-    /// the target arena's death). Guarded by the
-    /// wait's code: the stamp under a sender belongs
-    /// to its current outstanding call, and a pop
-    /// for an older call (its stamp already orphaned)
-    /// must not clear the newer call's stamp.
-    fn clear_sync_stamp(&mut self, sender_pid: i32, code: u32) {
+    /// 0.9.143 (s9-143-desk section 2.1 items 2/3):
+    /// mark one sender's stamp answered -- at the
+    /// reply pop that paired its wait, or at a death
+    /// answer (DEAD_REPLY at a serving thread's exit
+    /// or the target arena's death). The stamp is
+    /// NOT settled here: the waiter's wait ends at
+    /// the fill, not at the answer (see SyncStamp).
+    /// Guarded by the wait's code, exactly as the
+    /// 0.9.142 clear was: the stamp under a sender
+    /// belongs to its current outstanding call, and
+    /// an answer for an older call (its stamp
+    /// already orphaned) must not touch the newer
+    /// call's stamp. An already-answered stamp keeps
+    /// its first answer.
+    fn mark_sync_stamp_answered(
+        &mut self,
+        sender_pid: i32,
+        code: u32,
+        claim_seq: u64,
+        size: u32,
+        kind: AnswerKind,
+    ) {
+        if let Some(s) = self.sync_stamps.get_mut(&sender_pid) {
+            if s.code == code && s.answered.is_none() {
+                s.answered = Some((claim_seq, size, kind));
+            }
+        }
+    }
+    /// 0.9.143: refine the kind of an answer marked
+    /// at the reply pop once the pop's downstream
+    /// disposal is known (a shield intercept or a
+    /// failed delivery turns the provisional Reply
+    /// into FailedReply). Matched by the pop's claim
+    /// sequence, in the live stamp or the answered
+    /// reserve -- the mark and the refinement run
+    /// inside the same coordinator call, so the
+    /// stamp cannot have been fill-settled between
+    /// them; the reserve leg is belt and braces.
+    fn refine_sync_stamp_kind(&mut self, sender_pid: i32, claim_seq: u64, kind: AnswerKind) {
+        if let Some(s) = self.sync_stamps.get_mut(&sender_pid) {
+            if let Some(a) = &mut s.answered {
+                if a.0 == claim_seq {
+                    a.2 = kind;
+                    return;
+                }
+            }
+        }
+        if let Some(q) = self.sync_stamp_reserve.get_mut(&sender_pid) {
+            for s in q.iter_mut() {
+                if let Some(a) = &mut s.answered {
+                    if a.0 == claim_seq {
+                        a.2 = kind;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    /// 0.9.143 (s9-143-desk section 2.1 item 4):
+    /// settle one answered stamp of this sender at
+    /// a fill, oldest first across the answered
+    /// reserve and the live stamp (one FIFO: the
+    /// reserve holds the older calls). Returns
+    /// false when no answered stamp was waiting --
+    /// the caller counts the unmatched answer.
+    fn settle_one_answered_stamp(&mut self, sender_pid: i32) -> bool {
+        let mut settled_from_reserve = false;
+        let mut reserve_now_empty = false;
+        if let Some(q) = self.sync_stamp_reserve.get_mut(&sender_pid) {
+            if !q.is_empty() {
+                q.pop_front();
+                settled_from_reserve = true;
+                reserve_now_empty = q.is_empty();
+            }
+        }
+        if reserve_now_empty {
+            self.sync_stamp_reserve.remove(&sender_pid);
+        }
+        if settled_from_reserve {
+            return true;
+        }
         if self
             .sync_stamps
             .get(&sender_pid)
-            .is_some_and(|s| s.code == code)
+            .is_some_and(|s| s.answered.is_some())
         {
             self.sync_stamps.remove(&sender_pid);
+            return true;
+        }
+        false
+    }
+    /// 0.9.143 (s9-143-desk section 2.1 item 4):
+    /// the fill hinge. Scan the drained bytes for
+    /// answer commands (scan_fill_answers); each
+    /// one settles the reader's oldest answered
+    /// stamp. An unparseable segment settles
+    /// nothing and counts once as unmatched -- the
+    /// scan is read-only and the fill's bytes,
+    /// order, cutting and timing are untouched.
+    fn settle_fill_answers(&mut self, pid: i32, bytes: &[u8]) {
+        match scan_fill_answers(bytes) {
+            None => {
+                self.stamp_fill_unmatched += 1;
+            }
+            Some(answers) => {
+                for _ in answers {
+                    if !self.settle_one_answered_stamp(pid) {
+                        self.stamp_fill_unmatched += 1;
+                    }
+                }
+            }
         }
     }
     /// 0.9.142 (s9-142-desk section 3.2): file one
@@ -4146,14 +4333,22 @@ fn binder_thread_exit(pid: i32, st: &mut BinderState) -> Option<Vec<i32>> {
         // every claimed wait is still failed exactly
         // once, in the order it was claimed.
         for fr in stack.groups.into_iter().flat_map(|g| g.frames) {
-            if let ServingFrame::Reply(w, _) = fr {
+            if let ServingFrame::Reply(w, seq) = fr {
                 if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                     bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
                 }
-                // 0.9.142 (s9-142-desk section 2.2):
-                // the DEAD_REPLY settles the caller's
-                // sync-send stamp with the wait.
-                st.clear_sync_stamp(w.sender_pid, w.code);
+                // 0.9.143 (s9-143-desk section 2.1
+                // item 3): the DEAD_REPLY marks the
+                // caller's stamp answered, like a pop
+                // -- the caller's wait ends at the
+                // fill of this answer, not at the push.
+                st.mark_sync_stamp_answered(
+                    w.sender_pid,
+                    w.code,
+                    seq,
+                    0,
+                    AnswerKind::DeadReply,
+                );
                 // 0.9.131: the DEAD_REPLY is an event in
                 // the waiter's evidence ring.
                 evidence_tag(
@@ -4464,6 +4659,12 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     };
     let bytes = shield_ref_pairs(st, &arena, pid, bytes);
     binder_claim_fills(st, &arena, pid, &bytes);
+    // 0.9.143 (s9-143-desk section 2.1 item 4): the
+    // fill hinge -- answer commands in this drained
+    // fill settle the reader's answered stamps (see
+    // settle_fill_answers). Same seat and same bytes
+    // as the claim scan above; read-only.
+    st.settle_fill_answers(pid, &bytes);
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -6998,14 +7199,35 @@ fn wedge_servicer2<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     face_out: &mut Vec<(String, i32)>,
 ) {
     let s_arena = stamp.target_arena.as_str();
-    let claim_s = match stamp.claim_seq {
-        Some(n) => n.to_string(),
-        None => "none".to_string(),
+    // 0.9.143 (s9-143-desk section 2.2): an
+    // answered stamp's own claim sequence is the
+    // newer of the two the head can name (the pop
+    // that answered it is at least as recent as
+    // the claim backfill).
+    let claim_s = match stamp.answered {
+        Some((seq, _, _)) => seq.to_string(),
+        None => match stamp.claim_seq {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        },
     };
     bsup!(
         "binder: wedge-servicer2-head arena={arena} servicer_arena={s_arena} pid={p} code={} data_size={} send_seq={} claim_seq={claim_s}",
         stamp.code, stamp.data_size, stamp.send_seq
     );
+    // 0.9.143 (s9-143-desk section 2.2): the first
+    // check. An answered-but-unfilled stamp closes
+    // the lookup here: the servicer did answer --
+    // the reply is stuck on the fill side, in
+    // nobody's serving tables -- so the four-state
+    // search below would only mislead.
+    if let Some((seq, size, kind)) = stamp.answered {
+        bsup!(
+            "binder: wedge-servicer2-state arena={arena} servicer_arena={s_arena} pid={p} state=answered-unfilled claim_seq={seq} size={size} kind={}",
+            kind.tag()
+        );
+        return;
+    }
     let queued = st.waiters.get(s_arena).is_some_and(|q| {
         q.iter()
             .any(|w| w.sender_pid == p && w.code == stamp.code)
@@ -7326,7 +7548,19 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // the reply to a call the model never
         // registered, and the stamp is the key the
         // reverse lookup reads it back from.
-        let stamp = st.sync_stamps.get(ppid);
+        // 0.9.143 (s9-143-desk section 2.1 item 5):
+        // the stamp may have been overwritten into
+        // the answered reserve by a nested call the
+        // thread sent while serving -- the live
+        // stamp rules when present, else the newest
+        // reserved one stands for the wait (any
+        // reserved entry is an answered, unfilled
+        // call of this thread).
+        let stamp = st.sync_stamps.get(ppid).or_else(|| {
+            st.sync_stamp_reserve
+                .get(ppid)
+                .and_then(|q| q.back())
+        });
         let (kind, t_arena_s, code_s) = match find_wait_for_sender(st, *ppid) {
             Some((t, c)) => ("wait-reply", t, c.to_string()),
             None => match inferred.first() {
@@ -7367,6 +7601,35 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 wedge_servicer2(st, &arena, *ppid, s, rd, &mut v2_servicers);
             }
         }
+    }
+    // 0.9.143 (s9-143-desk section 3.3): the stamp
+    // audit -- this arena's parked threads against
+    // the stamp ledger (live stamps plus the
+    // answered reserve), so a parked thread the
+    // stamp model still cannot see is a number on
+    // the snapshot itself, not something forensics
+    // has to reconstruct. unstamped is that gap,
+    // counted live.
+    {
+        let (mut stamped, mut answered) = (0usize, 0usize);
+        for ppid in &park_pids {
+            let live = st.sync_stamps.get(ppid);
+            let reserved = st
+                .sync_stamp_reserve
+                .get(ppid)
+                .is_some_and(|q| !q.is_empty());
+            if live.is_some() || reserved {
+                stamped += 1;
+            }
+            if live.is_some_and(|s| s.answered.is_some()) || reserved {
+                answered += 1;
+            }
+        }
+        bsup!(
+            "binder: wedge-stamp-audit arena={arena} parked={} stamped={stamped} answered={answered} unstamped={}",
+            park_pids.len(),
+            park_pids.len() - stamped
+        );
     }
     // (S6) The servicer view (0.9.141): for each
     // distinct servicer behind a frozen claimed
@@ -7998,6 +8261,15 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             data.len(),
             offs.len()
         );
+        // 0.9.143 (s9-143-desk section 4.3): the
+        // request-side census, counted here at the
+        // drop point (see BinderState::
+        // shield3_census). Counting only; the drop
+        // is unchanged.
+        *st.shield3_census
+            .entry((code, data.len() as u32, offs.len() as u32))
+            .or_default() += 1;
+        st.shield3_census_total += 1;
         notes.push("TRANSACTION with OOB object offset -> dropped (shield3)".to_string());
         return;
     }
@@ -8093,13 +8365,24 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             );
             return;
         };
-        // 0.9.142 (s9-142-desk section 2.2): the pop
-        // settles the wait in every form downstream
-        // of here (delivery, or FAILED_REPLY via
-        // shield3 / shield4 / a failed delivery), so
-        // the waiter's sync-send stamp settles with
-        // it, here at the pairing hinge.
-        st.clear_sync_stamp(w.sender_pid, w.code);
+        // 0.9.143 (s9-143-desk section 2.1 item 2):
+        // the pop no longer settles the waiter's
+        // sync-send stamp -- it marks it answered.
+        // The wait ends when the answer is filled
+        // into the waiter's read (settle_fill_
+        // answers), which can lag the pop by a whole
+        // nested serving round; settling here was
+        // the .142 trigger's hole. The kind starts
+        // as Reply and is refined at the shield3 /
+        // shield4 / failed-delivery exits below if
+        // the answer turns into a FAILED_REPLY.
+        st.mark_sync_stamp_answered(
+            w.sender_pid,
+            w.code,
+            claim_seq,
+            data.len() as u32,
+            AnswerKind::Reply,
+        );
         // 0.9.142 (s9-142-desk section 3.2): the
         // reply joins the replier's SIGSEGV-cell
         // profile ring, filed at the pop -- what the
@@ -8295,6 +8578,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
             binder_maybe_wake(st, &w.sender_arena, actions);
+            // 0.9.143: the pop's provisional Reply
+            // kind becomes the FAILED_REPLY it was.
+            st.refine_sync_stamp_kind(w.sender_pid, claim_seq, AnswerKind::FailedReply);
             notes.push("REPLY with OOB object offset -> FAILED_REPLY (shield3)".to_string());
             return;
         }
@@ -8463,6 +8749,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
             binder_maybe_wake(st, &w.sender_arena, actions);
+            // 0.9.143: provisional kind refinement,
+            // as at the shield3 exit above.
+            st.refine_sync_stamp_kind(w.sender_pid, claim_seq, AnswerKind::FailedReply);
             notes.push("POISONED REPLY -> FAILED_REPLY (shield4)".to_string());
             return;
         }
@@ -8494,6 +8783,9 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         let delivered_ok = delivered.is_ok();
         if let Err(why) = delivered {
             notes.push(format!("REPLY delivery failed: {why}"));
+            // 0.9.143: provisional kind refinement,
+            // as at the shield exits above.
+            st.refine_sync_stamp_kind(w.sender_pid, claim_seq, AnswerKind::FailedReply);
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_FAILED_REPLY.to_le_bytes());
             }
@@ -8835,6 +9127,7 @@ fn binder_send_txn(
                 data_size: data.len() as u32,
                 send_seq,
                 claim_seq: None,
+                answered: None,
             },
         );
     }
@@ -8962,6 +9255,10 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             .unwrap_or_default();
         let bytes = shield_ref_pairs(st, &arena, pid, bytes);
         binder_claim_fills(st, &arena, pid, &bytes);
+        // 0.9.143 (s9-143-desk section 2.1 item 4):
+        // the fill hinge, same seat and bytes as the
+        // claim scan (see settle_fill_answers).
+        st.settle_fill_answers(pid, &bytes);
         dump_mgr_read(st, &arena, pid, &bytes);
         // 0.9.136: this fill's delivery VAs, taken before
         // the bytes move into the action list; the fd
@@ -9040,6 +9337,41 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
 /// manager's clean exit(0) after serving flushed work
 /// (0.9.26/0.9.29 device runs). Deliveries must be
 /// cut only between commands.
+/// 0.9.143 (s9-143-desk section 2.1 item 4): the
+/// answer commands in one drained fill, in stream
+/// order -- BR_REPLY, BR_FAILED_REPLY and
+/// BR_DEAD_REPLY are one class here (each ends
+/// one synchronous wait). Walks the same command
+/// boundaries as br_prefix_len; a truncated tail
+/// or a command overrunning the segment makes
+/// the whole segment unparseable (None) -- the
+/// caller settles nothing from it and counts it
+/// unmatched, rather than guessing from a partial
+/// walk. Pure and read-only: the fill's bytes are
+/// never written back.
+fn scan_fill_answers(bytes: &[u8]) -> Option<Vec<AnswerKind>> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        match cmd {
+            BR_REPLY => out.push(AnswerKind::Reply),
+            BR_FAILED_REPLY => out.push(AnswerKind::FailedReply),
+            BR_DEAD_REPLY => out.push(AnswerKind::DeadReply),
+            _ => {}
+        }
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            return None;
+        }
+        off += len;
+    }
+    if off != bytes.len() {
+        return None;
+    }
+    Some(out)
+}
+
 fn br_one_len(cmd: u32) -> usize {
     match cmd {
         BR_TRANSACTION | BR_REPLY => 44,
@@ -10959,13 +11291,41 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // sweeps them); a count that grows tenure over
     // tenure instead of falling back names a
     // clearing path the stamps leak through.
+    // 0.9.143 (s9-143-desk section 3.3): open is
+    // read under the new settlement semantics --
+    // open counts every unsettled stamp of this
+    // arena (live plus answered reserve), and
+    // sync_stamp_answered beside it counts how
+    // many of them were answered but never filled
+    // (a frozen tenure's settlement should show
+    // answered >= 1). stamp_fill_unmatched and
+    // reserve_dropped are global-style counters
+    // like the fd ride one below.
     bsup!(
-        "binder: arena {arena} sync stamp account: sync_stamp_open={} sync_stamp_orphan={}",
+        "binder: arena {arena} sync stamp account: sync_stamp_open={} sync_stamp_orphan={} sync_stamp_answered={} stamp_fill_unmatched={} sync_stamp_reserve_dropped={}",
         st.sync_stamps
             .values()
             .filter(|s| s.sender_arena == arena)
-            .count(),
-        st.sync_orphan_total.get(arena).copied().unwrap_or(0)
+            .count()
+            + st
+                .sync_stamp_reserve
+                .values()
+                .flat_map(|q| q.iter())
+                .filter(|s| s.sender_arena == arena)
+                .count(),
+        st.sync_orphan_total.get(arena).copied().unwrap_or(0),
+        st.sync_stamps
+            .values()
+            .filter(|s| s.sender_arena == arena && s.answered.is_some())
+            .count()
+            + st
+                .sync_stamp_reserve
+                .values()
+                .flat_map(|q| q.iter())
+                .filter(|s| s.sender_arena == arena)
+                .count(),
+        st.stamp_fill_unmatched,
+        st.sync_stamp_reserve_dropped
     );
     bsup!(
         "binder: arena {arena} fd ride account: fd_fixup_ride_failed={}",
@@ -10986,6 +11346,26 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             "binder: arena {arena} fat template account: samples={} distinct={} top=[{}]",
             st.fat_template_samples,
             st.fat_templates.len(),
+            parts.join(" ")
+        );
+    }
+    // 0.9.143 (s9-143-desk section 4.3): the
+    // shield3 request-side census, settled in the
+    // fat template account's shape (a global-style
+    // account on the arena line, like the ones
+    // above).
+    {
+        let mut tops: Vec<(&(u32, u32, u32), &u64)> =
+            st.shield3_census.iter().collect();
+        tops.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let parts: Vec<String> = tops
+            .iter()
+            .take(6)
+            .map(|(k, n)| format!("(c{},d{},o{})x{}", k.0, k.1, k.2, n))
+            .collect();
+        bsup!(
+            "binder: arena {arena} shield3 account: total={} top=[{}]",
+            st.shield3_census_total,
             parts.join(" ")
         );
     }
@@ -11172,9 +11552,26 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             if let Some(bp) = st.procs.get_mut(&w.sender_arena) {
                 bp.push_to(w.sender_pid, &BR_DEAD_REPLY.to_le_bytes());
             }
-            // 0.9.142 (s9-142-desk section 2.2): the
-            // DEAD_REPLY settles the waiter's stamp.
-            st.clear_sync_stamp(w.sender_pid, w.code);
+            // 0.9.143 (s9-143-desk section 2.1
+            // item 3): the DEAD_REPLY marks the
+            // waiter's stamp answered (it settles at
+            // the answer's fill, not here). A queued
+            // wait was never claimed, so the answer
+            // carries the stamp's own claim sequence
+            // (None if never backfilled) rather than
+            // a frame's.
+            let aseq = st
+                .sync_stamps
+                .get(&w.sender_pid)
+                .and_then(|s| s.claim_seq)
+                .unwrap_or(0);
+            st.mark_sync_stamp_answered(
+                w.sender_pid,
+                w.code,
+                aseq,
+                0,
+                AnswerKind::DeadReply,
+            );
             binder_maybe_wake_pids(st, &w.sender_arena, wakes);
         }
     }
@@ -11190,6 +11587,13 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // The SIGSEGV profile rings need no sweep here:
     // binder_thread_exit removed each thread's.
     st.sync_stamps.retain(|_, s| s.sender_arena != arena);
+    // 0.9.143: the answered reserve goes with the
+    // live stamps (its entries are this arena's
+    // senders' answered-but-unfilled calls).
+    st.sync_stamp_reserve.retain(|_, q| {
+        q.retain(|s| s.sender_arena != arena);
+        !q.is_empty()
+    });
     st.sync_orphans.remove(arena);
     // 0.9.125: claimed waits sent BY the dead arena are
     // scrubbed from the surviving serving stacks too
@@ -15886,5 +16290,110 @@ mod tests {
             "why=ride_fail tag=wait-exhausted errno=na errno_src=none"
         );
         assert_eq!(errno_of_ride(&RideR0::Failed("anchor-bad")), "na");
+    }
+
+    // 0.9.143 (s9-143-desk sections 2.1 / 5.1):
+    // the fill-scan settlement, three cases plus
+    // the overwrite guard. Pure state machine --
+    // no tracer, no guest.
+    fn test_stamp(code: u32, send_seq: u64) -> SyncStamp {
+        SyncStamp {
+            sender_arena: "app".to_string(),
+            target_arena: "ss".to_string(),
+            code,
+            data_size: 64,
+            send_seq,
+            claim_seq: None,
+            answered: None,
+        }
+    }
+
+    fn reply_fill() -> Vec<u8> {
+        let mut fill = Vec::new();
+        fill.extend_from_slice(&BR_REPLY.to_le_bytes());
+        fill.resize(44, 0);
+        fill
+    }
+
+    #[test]
+    fn fill_settles_answered_fifo_across_reserve_and_live() {
+        let mut st = BinderState::default();
+        let pid = 4242;
+        // A answered, overwritten by B (A to the
+        // answered reserve); B answered, overwritten
+        // by C (B to the reserve); C answered, live.
+        st.record_sync_stamp(pid, test_stamp(2, 1));
+        st.mark_sync_stamp_answered(pid, 2, 101, 16, AnswerKind::Reply);
+        st.record_sync_stamp(pid, test_stamp(5, 2));
+        st.mark_sync_stamp_answered(pid, 5, 102, 8, AnswerKind::Reply);
+        st.record_sync_stamp(pid, test_stamp(7, 3));
+        st.mark_sync_stamp_answered(pid, 7, 103, 4, AnswerKind::Reply);
+        assert_eq!(st.sync_stamp_reserve.get(&pid).map(|q| q.len()), Some(2));
+        st.settle_fill_answers(pid, &reply_fill());
+        // Oldest first: A settled, B remains at the
+        // reserve front, C still live.
+        assert_eq!(
+            st.sync_stamp_reserve
+                .get(&pid)
+                .and_then(|q| q.front().map(|s| s.send_seq)),
+            Some(2)
+        );
+        assert!(st.sync_stamps.contains_key(&pid));
+        st.settle_fill_answers(pid, &reply_fill());
+        assert!(!st.sync_stamp_reserve.contains_key(&pid));
+        assert!(st.sync_stamps.contains_key(&pid));
+        st.settle_fill_answers(pid, &reply_fill());
+        assert!(!st.sync_stamps.contains_key(&pid));
+        // A fourth answer has nothing to settle.
+        st.settle_fill_answers(pid, &reply_fill());
+        assert_eq!(st.stamp_fill_unmatched, 1);
+    }
+
+    #[test]
+    fn unanswered_overwrite_still_orphans_not_reserves() {
+        let mut st = BinderState::default();
+        let pid = 3131;
+        st.record_sync_stamp(pid, test_stamp(2, 1));
+        st.record_sync_stamp(pid, test_stamp(2, 2));
+        assert_eq!(st.sync_orphan_total.get("app"), Some(&1));
+        assert!(!st.sync_stamp_reserve.contains_key(&pid));
+    }
+
+    #[test]
+    fn failed_and_dead_reply_fills_settle_like_replies() {
+        assert_eq!(
+            scan_fill_answers(&BR_FAILED_REPLY.to_le_bytes()),
+            Some(vec![AnswerKind::FailedReply])
+        );
+        assert_eq!(
+            scan_fill_answers(&BR_DEAD_REPLY.to_le_bytes()),
+            Some(vec![AnswerKind::DeadReply])
+        );
+        let mut st = BinderState::default();
+        let pid = 777;
+        st.record_sync_stamp(pid, test_stamp(2, 1));
+        st.mark_sync_stamp_answered(pid, 2, 55, 0, AnswerKind::DeadReply);
+        st.settle_fill_answers(pid, &BR_DEAD_REPLY.to_le_bytes());
+        assert!(!st.sync_stamps.contains_key(&pid));
+        assert_eq!(st.stamp_fill_unmatched, 0);
+    }
+
+    #[test]
+    fn unparseable_fill_settles_nothing_and_counts_once() {
+        let mut st = BinderState::default();
+        let pid = 999;
+        st.record_sync_stamp(pid, test_stamp(2, 1));
+        st.mark_sync_stamp_answered(pid, 2, 55, 16, AnswerKind::Reply);
+        // A whole valid BR_REPLY followed by a
+        // truncated BR_TRANSACTION (10 of its 44
+        // bytes): the segment is unparseable, so
+        // even its valid prefix settles nothing.
+        let mut fill = reply_fill();
+        fill.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
+        fill.extend_from_slice(&[0u8; 6]);
+        assert_eq!(scan_fill_answers(&fill), None);
+        st.settle_fill_answers(pid, &fill);
+        assert!(st.sync_stamps.contains_key(&pid));
+        assert_eq!(st.stamp_fill_unmatched, 1);
     }
 }
