@@ -1479,10 +1479,46 @@ class MainActivity : Activity() {
         // them with the rest of the guest evidence.
         // This flow is shared by live and fallback
         // launches, so both modes pick them up.
+        //
+        // 0.9.146 (s9-146-desk section 4.2): the
+        // traces file is the one piece of guest
+        // evidence that names Java locks and their
+        // holders ("waiting to lock ... held by"),
+        // and the 0.9.145 field's export carried
+        // none even though the guest Watchdog had
+        // opened /data/anr/traces.txt: the export
+        // ran while the wedged process's dump was
+        // still unwritten, and the copy helper
+        // silently skips zero-length files, so the
+        // miss left no trace of its own. Collect
+        // traces.txt by name ahead of the glob and
+        // record the outcome in the session log, so
+        // the next field can tell "not yet written"
+        // from "never produced". The file may hold
+        // an earlier tenure's dump (the guest only
+        // ever keeps the latest); telling tenures
+        // apart is the reader's job, not the
+        // collector's.
         val anrDir = File(rootfsGBDir, "data/anr")
+        val tracesFile = File(anrDir, "traces.txt")
+        if (tracesFile.exists() && tracesFile.length() > 0) {
+            val before = count
+            copyFile("traces.txt", tracesFile)
+            if (count > before) {
+                appendLog(
+                    "[shell] 已附帶 guest ANR traces" +
+                        "（${tracesFile.length()} 位元組）",
+                )
+            }
+        } else {
+            appendLog(
+                "[shell] guest ANR traces 尚不存在或為空，未附帶",
+            )
+        }
         val anrFiles = anrDir.listFiles()
             ?.filter {
-                it.isFile && it.name.startsWith("traces") &&
+                it.isFile && it.name != "traces.txt" &&
+                    it.name.startsWith("traces") &&
                     it.name.endsWith(".txt")
             }
             ?.sortedBy { it.name }

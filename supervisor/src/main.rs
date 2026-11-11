@@ -1179,6 +1179,15 @@ struct ProcState {
     /// later stops, read only by the wedge
     /// snapshot's fill-face line. Telemetry only.
     fill_release: Option<FillRelease>,
+    /// 0.9.146 (s9-146-desk section 4.1): the leader
+    /// of this thread's process (its arena root for
+    /// the futex settlement account): 0 when this
+    /// thread is its own leader or the leader is
+    /// unknown. Set at birth -- a FORK/VFORK child
+    /// leads itself, a CLONE child inherits its
+    /// parent's leader -- the same inheritance seat
+    /// as ss_family. Telemetry only.
+    proc_leader: i32,
 }
 
 /// 0.9.141 (s9-141-desk P3): per-thread counters over
@@ -1202,6 +1211,66 @@ struct WinProfile {
     sends: u32,
     depth: i32,
     maxdepth: u32,
+}
+
+/// 0.9.146 (s9-146-desk section 4.1): one futex
+/// address's settlement account within one arena,
+/// kept tracer-side keyed by (process leader,
+/// uaddr). The capture seat reads futex arguments
+/// on every entry stop but keeps no wake history:
+/// a WAKE lives only inside its own call's Pending
+/// and dies with it, so before this account the
+/// wedge snapshot could census the waiters of an
+/// address but never say whether anyone had ever
+/// tried to wake it. waits counts WAIT-family
+/// entries, wakes counts WAKE-family entries (one
+/// per call, whatever its nr_wake: the question
+/// the account answers is whether a wake was ever
+/// issued to the address, not how many it roused),
+/// and last_wake_* names the most recent waker.
+/// Pure counting beside the existing capture --
+/// nothing is printed on the hot path and no count
+/// feeds the futex path itself, which passes
+/// through this engine untouched. Capped per
+/// leader (FUTEX_ACCT_CAP addresses) so a guest
+/// that touches unbounded addresses cannot grow
+/// the table without bound; an address past the
+/// cap is simply never entered.
+#[derive(Default, Clone, Copy)]
+struct FutexAcct {
+    waits: u64,
+    wakes: u64,
+    last_wake_pid: i32,
+    last_wake_seq: u64,
+}
+
+const FUTEX_ACCT_CAP: usize = 512;
+
+fn futex_acct_add(
+    map: &mut HashMap<(i32, u32), FutexAcct>,
+    addrs: &mut HashMap<i32, usize>,
+    leader: i32,
+    uaddr: u32,
+    is_wait: bool,
+    pid: i32,
+) {
+    let key = (leader, uaddr);
+    if !map.contains_key(&key) {
+        let n = addrs.entry(leader).or_insert(0);
+        if *n >= FUTEX_ACCT_CAP {
+            return;
+        }
+        *n += 1;
+        map.insert(key, FutexAcct::default());
+    }
+    let a = map.get_mut(&key).expect("futex account entry");
+    if is_wait {
+        a.waits += 1;
+    } else {
+        a.wakes += 1;
+        a.last_wake_pid = pid;
+        a.last_wake_seq = emit_seq_now();
+    }
 }
 
 /// 0.9.144 (s9-144-desk section 2.1): where in
@@ -1410,6 +1479,7 @@ impl ProcState {
             last_stop_seq: 0,
             ss_family: false,
             fill_release: None,
+            proc_leader: 0,
         }
     }
 }
@@ -8137,6 +8207,30 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             "-".to_string()
         }
     );
+    // 0.9.146 (s9-146-desk section 5): the
+    // reply-complete ledger also settles here, at
+    // snapshot time, for every live arena -- same
+    // line, same fields as the proc-exit settlement
+    // in binder_on_proc_exit, which stays as it
+    // was. In 0.9.145 the ledger only settled at
+    // arena death, which is exactly the arenas the
+    // token fix exists to keep alive: a serving
+    // arena that survives the whole field never
+    // settled, and every token of the field landed
+    // in arenas with no account at all. Pure reads
+    // of the two counters, like everything in this
+    // dump.
+    {
+        let mut acct_arenas: Vec<&String> = st.procs.keys().collect();
+        acct_arenas.sort();
+        for a in acct_arenas {
+            bsup!(
+                "binder: arena {a} reply-complete account: reply_pops={} reply_completes={}",
+                st.reply_pops.get(a).copied().unwrap_or(0),
+                st.reply_completes.get(a).copied().unwrap_or(0)
+            );
+        }
+    }
     // 0.9.142 (section 2.4): servicers the v2
     // reverse lookups found claimed join the face
     // broadcast beside the v1 set.
@@ -13893,6 +13987,7 @@ fn wedge_snapshot(
     procs: &HashMap<i32, ProcState>,
     leader: i32,
     solo_out: &mut Option<i32>,
+    futex_acct: &HashMap<(i32, u32), FutexAcct>,
 ) -> bool {
     // Family membership: the tracer-side parent chain
     // (ProcState.parent, recorded at each birth event)
@@ -14060,12 +14155,30 @@ fn wedge_snapshot(
         let mut solo_groups = 0usize;
         let mut solo_pid = 0i32;
         for (u, ws) in &futex_groups {
+            // 0.9.146 (s9-146-desk section 4.1):
+            // the address's settlement account rides
+            // its group line -- waits/wakes over the
+            // arena's whole tenure and the most
+            // recent waker, from the entry-stop
+            // ledger (see FutexAcct). A group address
+            // always holds an entry (its waiters'
+            // own entries opened it); a missing one
+            // reads as zeros rather than silence.
+            let (waits, wakes, waker) = match futex_acct.get(&(leader, *u)) {
+                Some(a) => (a.waits, a.wakes, a.last_wake_pid),
+                None => (0, 0, 0),
+            };
             sup!(
-                "binder: wedge-futex arena={leader} uaddr=0x{u:x} waiters=[{}]{}",
+                "binder: wedge-futex arena={leader} uaddr=0x{u:x} waiters=[{}] waits={waits} wakes={wakes} last_waker={}{}",
                 ws.iter()
                     .map(|p| p.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
+                if waker > 0 {
+                    waker.to_string()
+                } else {
+                    "-".to_string()
+                },
                 if ws.len() == 1 { " solo" } else { "" }
             );
             if ws.len() == 1 {
@@ -14421,6 +14534,15 @@ fn tracer_loop(ctx: TracerCtx) {
     let mut ss_apk_count: u32 = 0;
     let mut ss_apk_last: String = String::new();
     let mut ss_alloc: HashMap<i32, VecDeque<(u32, bool)>> = HashMap::new();
+    // 0.9.146 (s9-146-desk section 4.1): the futex
+    // settlement accounts of every arena this
+    // worker traces, keyed by (process leader,
+    // uaddr) with a per-leader count of entered
+    // addresses for the cap (see FutexAcct).
+    // Settled into the wedge-futex lines by
+    // wedge_snapshot; nothing else reads them.
+    let mut futex_acct: HashMap<(i32, u32), FutexAcct> = HashMap::new();
+    let mut futex_acct_addrs: HashMap<i32, usize> = HashMap::new();
 
     // ---- main tracing loop over the whole guest tree ----
     // (S2: one loop body for every tracer process. The
@@ -14655,6 +14777,41 @@ fn tracer_loop(ctx: TracerCtx) {
                                 Some((regs.arg(0) as u32, regs.arg(2) as u32));
                         }
                         _ => {}
+                    }
+                }
+                // 0.9.146 (s9-146-desk section 4.1):
+                // settle this entry into the futex
+                // account at the same seat -- the
+                // Pending above is fresh at every
+                // entry stop, so its two fields name
+                // exactly this call. Pure counting on
+                // values already read; the call itself
+                // proceeds untouched, as it always has.
+                if pend.last_futex.is_some() || pend.last_wake.is_some() {
+                    let leader = if proc.proc_leader != 0 {
+                        proc.proc_leader
+                    } else {
+                        pid
+                    };
+                    if let Some((u, _, _)) = pend.last_futex {
+                        futex_acct_add(
+                            &mut futex_acct,
+                            &mut futex_acct_addrs,
+                            leader,
+                            u,
+                            true,
+                            pid,
+                        );
+                    }
+                    if let Some((u, _)) = pend.last_wake {
+                        futex_acct_add(
+                            &mut futex_acct,
+                            &mut futex_acct_addrs,
+                            leader,
+                            u,
+                            false,
+                            pid,
+                        );
                     }
                 }
                 // 0.9.141 (P3): assembly-window
@@ -15957,7 +16114,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 if !wedge_snapped {
                     if let Some(leader) = dump_candidate {
                         let mut solo: Option<i32> = None;
-                        if wedge_snapshot(tp, &procs, leader, &mut solo) {
+                        if wedge_snapshot(tp, &procs, leader, &mut solo, &futex_acct) {
                             wedge_snapped = true;
                             fire_wedge_chain(
                                 &mut coord,
@@ -16022,6 +16179,30 @@ fn tracer_loop(ctx: TracerCtx) {
                     .get(&pid)
                     .map(|p| p.ss_family)
                     .unwrap_or(false);
+                // 0.9.146 (section 4.1): the futex
+                // account's arena key is inherited at
+                // the same seat: a FORK/VFORK child is
+                // a new process and leads itself (0);
+                // a CLONE child joins its parent's
+                // process and inherits the parent's
+                // leader (the parent itself when the
+                // parent leads).
+                let parent_leader = procs
+                    .get(&pid)
+                    .map(|p| {
+                        if p.proc_leader != 0 {
+                            p.proc_leader
+                        } else {
+                            pid
+                        }
+                    })
+                    .unwrap_or(0);
+                let child_leader =
+                    if event == PTRACE_EVENT_CLONE {
+                        parent_leader
+                    } else {
+                        0
+                    };
                 match procs.get_mut(&child) {
                     Some(cp) => {
                         // Registered early by its own initial stop.
@@ -16031,6 +16212,7 @@ fn tracer_loop(ctx: TracerCtx) {
                         // vcwd is still exact.
                         cp.parent = pid;
                         cp.ss_family = cp.ss_family || parent_ssf;
+                        cp.proc_leader = child_leader;
                         if !cp.syscall_seen {
                             cp.vcwd = parent_vcwd;
                             cp.compat = parent_compat;
@@ -16040,6 +16222,7 @@ fn tracer_loop(ctx: TracerCtx) {
                         let mut nps = ProcState::new(&parent_vcwd, false, parent_compat);
                         nps.parent = pid;
                         nps.ss_family = parent_ssf;
+                        nps.proc_leader = child_leader;
                         procs.insert(child, nps);
                     }
                 }
@@ -16145,7 +16328,7 @@ fn tracer_loop(ctx: TracerCtx) {
             if sig == 3 && !wedge_snapped {
                 if let Some(leader) = dump_candidate {
                     let mut solo: Option<i32> = None;
-                    if wedge_snapshot(pid, &procs, leader, &mut solo) {
+                    if wedge_snapshot(pid, &procs, leader, &mut solo, &futex_acct) {
                         wedge_snapped = true;
                         fire_wedge_chain(
                             &mut coord,
@@ -17281,5 +17464,39 @@ mod tests {
         binder_reply_complete(&mut st, &mut actions, "gone", 4242);
         assert_eq!(st.reply_pops.get("gone"), Some(&1));
         assert_eq!(st.reply_completes.get("gone"), None);
+    }
+
+    #[test]
+    fn futex_account_counts_and_names_last_waker() {
+        let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
+        let mut addrs: HashMap<i32, usize> = HashMap::new();
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 102);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, false, 103);
+        let a = map[&(100, 0x2000)];
+        assert_eq!(a.waits, 2);
+        assert_eq!(a.wakes, 1);
+        assert_eq!(a.last_wake_pid, 103);
+        // Another arena's account at the same uaddr
+        // is a separate entry (the cross-arena seat).
+        futex_acct_add(&mut map, &mut addrs, 200, 0x2000, false, 201);
+        assert_eq!(map[&(200, 0x2000)].wakes, 1);
+        assert_eq!(map[&(100, 0x2000)].wakes, 1);
+    }
+
+    #[test]
+    fn futex_account_cap_stops_new_addresses_only() {
+        let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
+        let mut addrs: HashMap<i32, usize> = HashMap::new();
+        for i in 0..FUTEX_ACCT_CAP as u32 {
+            futex_acct_add(&mut map, &mut addrs, 100, 0x1000 + i * 4, true, 101);
+        }
+        assert_eq!(map.len(), FUTEX_ACCT_CAP);
+        // Past the cap a new address is never
+        // entered, but an entered one keeps counting.
+        futex_acct_add(&mut map, &mut addrs, 100, 0x9999, false, 101);
+        assert!(!map.contains_key(&(100, 0x9999)));
+        futex_acct_add(&mut map, &mut addrs, 100, 0x1000, false, 101);
+        assert_eq!(map[&(100, 0x1000)].wakes, 1);
     }
 }
