@@ -3109,6 +3109,95 @@ struct SyncStamp {
     answered: Option<(u64, u32, AnswerKind)>,
 }
 
+/// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+/// one crash leg -- a code-2 wait claimed in some
+/// arena, from its claim (in binder_claim_fills)
+/// to the reply pop that answers it (in
+/// binder_handle_txn), or still open. Code 2 on
+/// the IActivityManager interface is
+/// handleApplicationCrash: the leg is the serving
+/// thread's crashApplication call, whose
+/// completion leg (SHOW_ERROR_MSG -> dialog ->
+/// dismiss timer -> AppErrorResult.set) decides
+/// whether the tenure wedges (see the desk's
+/// section 3 ruling). Identity rests on code +
+/// serving arena, the same basis the evidence
+/// rings' "serve code=2" tags already use.
+/// depth is the claimer's serving-stack depth
+/// right after the claim push: 1 is a pool-root
+/// (front-door) claim, >= 2 a claim nested inside
+/// an outer serving frame -- the stack-shape
+/// signature the settlement's classification
+/// reads. Settled exactly once, by the tracer
+/// that owns the arena leader, at that leader's
+/// death (see MSG_REQ_CRASH_LEGS); legs of an
+/// arena nobody settles stay until the cap trims
+/// them. Telemetry only: no field is read by any
+/// pairing, delivery, shield or discipline path.
+struct CrashLeg {
+    arena: String,
+    claim_seq: u64,
+    claimer: i32,
+    sender_pid: i32,
+    sender_arena: String,
+    depth: u32,
+    t_claim: u64,
+    t_resolved: Option<u64>,
+}
+
+/// 0.9.152 (s10-frontdoor-desk section 6 M-d):
+/// one outstanding transaction into a servicer
+/// arena at wedge-snapshot time -- queued in the
+/// arena's shared queue or claimed onto one of
+/// its threads' serving stacks -- with its age in
+/// coordinator deliveries (the sender's sync
+/// stamp's send_seq against the current
+/// deliver_seq; None when the sender holds no
+/// live unanswered stamp for it, so no honest age
+/// exists). surface marks the wedged arena's own
+/// sends (the SS -> servicer surface path).
+struct SurfCand {
+    sender: i32,
+    sender_arena: String,
+    code: u32,
+    claimed: bool,
+    claim_seq: u64,
+    age_seq: Option<u64>,
+}
+
+/// The sender-stamp age of one outstanding call
+/// (see SurfCand). A stamp that was already
+/// answered, or names another target or code,
+/// belongs to a different call and ages nothing.
+fn surf_age(
+    st: &BinderState,
+    sender: i32,
+    target_arena: &str,
+    code: u32,
+) -> Option<u64> {
+    let s = st.sync_stamps.get(&sender)?;
+    if s.target_arena == target_arena && s.code == code && s.answered.is_none() {
+        Some(st.deliver_seq.saturating_sub(s.send_seq))
+    } else {
+        None
+    }
+}
+
+/// The longest-unreplied few of a servicer
+/// arena's outstanding transactions: known ages
+/// first, oldest first; ageless candidates keep
+/// their collection order behind them.
+fn surface_top(cands: &[SurfCand], n: usize) -> Vec<&SurfCand> {
+    let mut idx: Vec<usize> = (0..cands.len()).collect();
+    idx.sort_by(|a, b| {
+        let ka = cands[*a].age_seq.map(|v| (1u8, v)).unwrap_or((0, 0));
+        let kb = cands[*b].age_seq.map(|v| (1u8, v)).unwrap_or((0, 0));
+        kb.cmp(&ka).then(a.cmp(b))
+    });
+    idx.truncate(n);
+    idx.iter().map(|i| &cands[*i]).collect()
+}
+
 /// 0.9.142 (s9-142-desk section 3.2): one entry of
 /// the per-thread binder profile ring the SS native
 /// SIGSEGV cell reads at a FATAL: a transaction this
@@ -3307,6 +3396,12 @@ struct BinderState {
     /// shield_drops; reported at arena death beside
     /// the free counters.
     crash_token_miss: u64,
+    /// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+    /// the crash-leg ledger (see CrashLeg). Global
+    /// across arenas -- legs carry their arena and
+    /// are settled per arena at its leader's death;
+    /// capped in binder_claim_fills.
+    crash_legs: Vec<CrashLeg>,
     /// 0.9.141 (s9-141-desk P1): global issuance
     /// double-read account (see MSG_ONEWAY_ISSUANCE_
     /// STATS): snapshots of BC_REPLY buffers taken at
@@ -4042,6 +4137,16 @@ const MSG_REQ_WEDGE_CHAIN: u8 = 10;
 // lines for in-order replay beside the FATAL
 // line, exactly like the ignition dump.
 const MSG_REQ_FATAL_DUMP: u8 = 11;
+// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+// at a system_server tenure's death the tracer
+// asks the coordinator for that arena's crash-leg
+// ledger (the coordinator owns the claim / pop
+// records) and prints the joined settlement
+// beside the traces harvest; the reply carries
+// the legs as structured records, not log lines,
+// because the tracer joins them against its own
+// futex tables before printing.
+const MSG_REQ_CRASH_LEGS: u8 = 12;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -4090,6 +4195,7 @@ const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
 const MSG_RESP_FATAL_DUMP: u8 = 111;
+const MSG_RESP_CRASH_LEGS: u8 = 112;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -4855,6 +4961,45 @@ impl CoordClient {
             coord_parked.push(d.i32());
         }
         (logs, holder, servicers, snap_arena, coord_parked)
+    }
+
+    /// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+    /// ask the coordinator for one dead leader's
+    /// crash legs (see CrashLeg) and hand them back
+    /// as records; the caller joins them against
+    /// its own futex tables and prints the
+    /// settlement itself. The coordinator drains
+    /// the legs it hands over, so each leg settles
+    /// exactly once. t_resolved 0 reads as open.
+    fn crash_legs(
+        &mut self,
+        leader: i32,
+    ) -> Vec<(u64, i32, i32, String, u32, u64, u64)> {
+        let mut e = Enc::new();
+        e.i32(leader);
+        let p = self.rpc(MSG_REQ_CRASH_LEGS, &e.0, MSG_RESP_CRASH_LEGS);
+        let mut d = Dec::new(&p);
+        let n = d.u32();
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let seq = d.u64();
+            let claimer = d.i32();
+            let sender = d.i32();
+            let sender_arena = d.string();
+            let depth = d.u32();
+            let t_claim = d.u64();
+            let t_resolved = d.u64();
+            out.push((
+                seq,
+                claimer,
+                sender,
+                sender_arena,
+                depth,
+                t_claim,
+                t_resolved,
+            ));
+        }
+        out
     }
 
     /// 0.9.142 (s9-142-desk section 3.2): ask the
@@ -6516,6 +6661,43 @@ impl CoordServer {
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 self.send_to(ci, MSG_RESP_FATAL_DUMP, &e.0);
+            }
+            MSG_REQ_CRASH_LEGS => {
+                // 0.9.152 (s10-frontdoor-desk section
+                // 6 M-c): hand one dead leader's
+                // crash legs to the tracer that owned
+                // it, drained on handover so each leg
+                // settles once. The leader's arena is
+                // matched by its path suffix: arena
+                // names are the arena directory paths,
+                // whose last component is the leader
+                // pid (the leader's own thread_arena
+                // entry is already gone at its death,
+                // so the name cannot be looked up).
+                let leader = d.i32();
+                let suffix = format!("/{leader}");
+                let mut legs = Vec::new();
+                let mut keep = Vec::new();
+                for leg in std::mem::take(&mut self.st.crash_legs) {
+                    if leg.arena.ends_with(&suffix) {
+                        legs.push(leg);
+                    } else {
+                        keep.push(leg);
+                    }
+                }
+                self.st.crash_legs = keep;
+                let mut e = Enc::new();
+                e.u32(legs.len() as u32);
+                for leg in &legs {
+                    e.u64(leg.claim_seq);
+                    e.i32(leg.claimer);
+                    e.i32(leg.sender_pid);
+                    e.string(&leg.sender_arena);
+                    e.u32(leg.depth);
+                    e.u64(leg.t_claim);
+                    e.u64(leg.t_resolved.unwrap_or(0));
+                }
+                self.send_to(ci, MSG_RESP_CRASH_LEGS, &e.0);
             }
             MSG_ONEWAY_PARK => {
                 let pid = d.i32();
@@ -8941,6 +9123,47 @@ fn print_inferred(arena: &str, pid: i32, inf: &[InferredWait]) {
     }
 }
 
+/// One parked thread's wedge-servicer-park line
+/// plus its inferred-waits lines, in the shape the
+/// chain dump has printed since 0.9.141 (S6).
+/// Factored out in 0.9.152 (s10-frontdoor-desk
+/// section 6 M-b) so the servicer-arena census in
+/// binder_wedge_chain prints the whole arena in
+/// exactly the per-thread shape the single named
+/// servicer always got. Pure reads, like every
+/// caller.
+fn print_servicer_park<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
+    st: &BinderState,
+    arena: &str,
+    s_arena: &str,
+    x: i32,
+    rd: &mut R,
+) {
+    let Some(park) = st.parked.get(&x) else {
+        return;
+    };
+    let fs = decode_frozen_stream(rd, x, park);
+    let inferred = frozen_inferred(st, s_arena, x, &fs);
+    let (kind, t_s, c_s) = match find_wait_for_sender(st, x) {
+        Some((t, c)) => ("wait-reply", t, c.to_string()),
+        None => match inferred.first() {
+            Some(f) => (
+                "wait-reply-inferred",
+                f.target_arena
+                    .clone()
+                    .unwrap_or_else(|| "unresolved".to_string()),
+                f.code.to_string(),
+            ),
+            None => ("idle", "-".to_string(), "-".to_string()),
+        },
+    };
+    let skel = frozen_skeleton(&fs);
+    bsup!(
+        "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
+    );
+    print_inferred(s_arena, x, &inferred);
+}
+
 /// 0.9.142 (s9-142-desk section 2.4): the reverse
 /// lookup for one unregistered reply wait. The
 /// frozen thread P waits for the reply to a call
@@ -9095,28 +9318,7 @@ fn wedge_servicer2<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={x} depth={depth} frames=[{frames}]"
         );
-        if let Some(park) = st.parked.get(&x) {
-            let fs = decode_frozen_stream(rd, x, park);
-            let inferred = frozen_inferred(st, s_arena, x, &fs);
-            let (kind, t_s, c_s) = match find_wait_for_sender(st, x) {
-                Some((t, c)) => ("wait-reply", t, c.to_string()),
-                None => match inferred.first() {
-                    Some(f) => (
-                        "wait-reply-inferred",
-                        f.target_arena
-                            .clone()
-                            .unwrap_or_else(|| "unresolved".to_string()),
-                        f.code.to_string(),
-                    ),
-                    None => ("idle", "-".to_string(), "-".to_string()),
-                },
-            };
-            let skel = frozen_skeleton(&fs);
-            bsup!(
-                "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
-            );
-            print_inferred(s_arena, x, &inferred);
-        }
+        print_servicer_park(st, arena, s_arena, x, rd);
         face_out.push((s_arena.to_string(), x));
         return;
     }
@@ -9515,27 +9717,112 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={x} depth={depth} frames=[{frames}]"
         );
-        if let Some(park) = st.parked.get(&x) {
-            let fs = decode_frozen_stream(rd, x, park);
-            let inferred = frozen_inferred(st, s_arena, x, &fs);
-            let (kind, t_s, c_s) = match find_wait_for_sender(st, x) {
-                Some((t, c)) => ("wait-reply", t, c.to_string()),
-                None => match inferred.first() {
-                    Some(f) => (
-                        "wait-reply-inferred",
-                        f.target_arena
-                            .clone()
-                            .unwrap_or_else(|| "unresolved".to_string()),
-                        f.code.to_string(),
-                    ),
-                    None => ("idle", "-".to_string(), "-".to_string()),
-                },
-            };
-            let skel = frozen_skeleton(&fs);
+        print_servicer_park(st, arena.as_str(), s_arena, x, rd);
+        // 0.9.152 (s10-frontdoor-desk section 6
+        // M-b): the servicer arena's whole parked
+        // face, in the same per-thread shape --
+        // the desk's missing photograph is the SF
+        // side at the stuck instant (which of its
+        // binder threads are parked, on what), and
+        // the .148-.151 chains only ever named the
+        // one thread a frozen wait happened to
+        // claim. The named thread's own line above
+        // is not repeated. Cap 16 lines per arena:
+        // past that the census count line still
+        // names the total.
+        {
+            let mut arena_parked: Vec<i32> = st
+                .parked
+                .keys()
+                .copied()
+                .filter(|q| st.thread_arena.get(q) == Some(s_arena))
+                .collect();
+            arena_parked.sort_unstable();
+            let serving_n = st
+                .serving
+                .values()
+                .filter(|s| s.arena == *s_arena)
+                .count();
             bsup!(
-                "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
+                "binder: wedge-servicer-arena arena={arena} servicer_arena={s_arena} parked={} serving={serving_n}",
+                arena_parked.len()
             );
-            print_inferred(s_arena, x, &inferred);
+            for q in arena_parked.iter().take(16) {
+                if *q != x {
+                    print_servicer_park(st, arena.as_str(), s_arena, *q, rd);
+                }
+            }
+        }
+    }
+    // 0.9.152 (s10-frontdoor-desk section 6 M-d):
+    // the surface unreplied account, parasitic on
+    // the servicer view above: for each servicer
+    // arena the chain named, the transactions
+    // still outstanding into it at this instant --
+    // queued waits plus the Reply frames on its
+    // threads' serving stacks -- counted, with the
+    // longest-unreplied few printed by stamp age.
+    // This is the account the M-b photograph is
+    // timed against: a surface transaction that
+    // went in long before the snapshot and never
+    // came back is the gate-2 shape in numbers.
+    // Pure reads of the same tables.
+    for (s_arena, _) in &servicer_hits {
+        let mut cands: Vec<SurfCand> = Vec::new();
+        if let Some(q) = st.waiters.get(s_arena) {
+            for w in q {
+                cands.push(SurfCand {
+                    sender: w.sender_pid,
+                    sender_arena: w.sender_arena.clone(),
+                    code: w.code,
+                    claimed: false,
+                    claim_seq: 0,
+                    age_seq: surf_age(st, w.sender_pid, s_arena, w.code),
+                });
+            }
+        }
+        for stack in st.serving.values() {
+            if stack.arena != *s_arena {
+                continue;
+            }
+            for g in &stack.groups {
+                for fr in &g.frames {
+                    if let ServingFrame::Reply(w, seq) = fr {
+                        cands.push(SurfCand {
+                            sender: w.sender_pid,
+                            sender_arena: w.sender_arena.clone(),
+                            code: w.code,
+                            claimed: true,
+                            claim_seq: *seq,
+                            age_seq: surf_age(
+                                st,
+                                w.sender_pid,
+                                s_arena,
+                                w.code,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        bsup!(
+            "binder: wedge-surface account arena={arena} servicer_arena={s_arena} unreplied={} t={}",
+            cands.len(),
+            field_t_ms()
+        );
+        for c in surface_top(&cands, 4) {
+            bsup!(
+                "binder: wedge-surface-unreplied arena={arena} servicer_arena={s_arena} sender={} sender_arena={} code={} state={} claim_seq={} age_seq={} surface={}",
+                c.sender,
+                c.sender_arena,
+                c.code,
+                if c.claimed { "claimed" } else { "queued" },
+                c.claim_seq,
+                c.age_seq
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                if c.sender_arena == arena { 1 } else { 0 }
+            );
         }
     }
     // (M6) The provisional verdict. Field forensics
@@ -9656,6 +9943,46 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         if !all_servicers.contains(&s) {
             all_servicers.push(s);
         }
+    }
+    // 0.9.152 (s10-frontdoor-desk section 6 M-b):
+    // the broadcast widens from the named servicer
+    // threads to every binder thread of each named
+    // servicer arena (parked, or holding a serving
+    // stack): the SF-side photograph the desk
+    // needs is the arena's whole thread set at the
+    // stuck instant -- reverse-blocked, slow, or
+    // out of stations reads off the set, not off
+    // the one thread a frozen wait claimed. The
+    // list is capped; the named threads ride
+    // first, so the cap can only trim widened
+    // members.
+    {
+        let mut arenas: Vec<String> =
+            all_servicers.iter().map(|(a, _)| a.clone()).collect();
+        arenas.sort();
+        arenas.dedup();
+        for a in &arenas {
+            let mut members: Vec<i32> = st
+                .parked
+                .keys()
+                .copied()
+                .filter(|q| st.thread_arena.get(q) == Some(a))
+                .collect();
+            for (p, s) in &st.serving {
+                if s.arena == *a {
+                    members.push(*p);
+                }
+            }
+            members.sort_unstable();
+            members.dedup();
+            for q in members {
+                let e = (a.clone(), q);
+                if !all_servicers.contains(&e) {
+                    all_servicers.push(e);
+                }
+            }
+        }
+        all_servicers.truncate(48);
     }
     (holder, all_servicers)
 }
@@ -10343,6 +10670,30 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 "binder: reply-pop dump replier={pid} claim_seq={claim_seq} fill_id={claimed_fill} popped={pop_count} depth={pop_depth} first=0x{first:x} size={}",
                 data.len()
             );
+        }
+        // 0.9.152 (s10-frontdoor-desk section 6
+        // M-c): a pop answering a code-2 wait closes
+        // its crash leg. The pop is the leg's end no
+        // matter what the answer later becomes
+        // (shield drop / failed delivery refine the
+        // waiter's stamp, not the fact that the
+        // serving thread's get() returned and it
+        // replied). A leg whose frame dies with its
+        // thread instead (binder_thread_exit) is
+        // never closed here; it settles open.
+        if w.code == 2 {
+            if let Some(leg) =
+                st.crash_legs.iter_mut().find(|l| l.claim_seq == claim_seq)
+            {
+                if leg.t_resolved.is_none() {
+                    let now = field_t_ms();
+                    leg.t_resolved = Some(now);
+                    bsup!(
+                        "binder: crash-leg resolved claim_seq={claim_seq} arena={arena} claimer={pid} span_ms={}",
+                        now.saturating_sub(leg.t_claim)
+                    );
+                }
+            }
         }
         // 0.9.131: the pop is an event in the replier's
         // own evidence ring.
@@ -11658,6 +12009,47 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                     "binder: claim dump claim_seq={seq} fill_id={fid} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
                     stack.depth()
                 );
+                // 0.9.152 (s10-frontdoor-desk section
+                // 6 M-c): a claimed code-2 wait opens
+                // a crash leg (see CrashLeg). The
+                // depth the claim dump just printed is
+                // the leg's stack-shape signature.
+                // Cap: settled legs are drained by
+                // the leader-death settlement; if the
+                // table ever reaches 1024 the oldest
+                // resolved legs go first (an open leg
+                // is never trimmed silently -- if all
+                // are open the oldest opens are
+                // dropped, and the settlement of that
+                // arena will simply not name them).
+                if wcode == 2 {
+                    if st.crash_legs.len() >= 1024 {
+                        let drop_seq = st
+                            .crash_legs
+                            .iter()
+                            .find(|l| l.t_resolved.is_some())
+                            .or_else(|| st.crash_legs.first())
+                            .map(|l| l.claim_seq);
+                        if let Some(ds) = drop_seq {
+                            st.crash_legs.retain(|l| l.claim_seq != ds);
+                        }
+                    }
+                    st.crash_legs.push(CrashLeg {
+                        arena: arena.to_string(),
+                        claim_seq: seq,
+                        claimer: pid,
+                        sender_pid: wsender,
+                        sender_arena: wsarena.clone(),
+                        depth: stack.depth() as u32,
+                        t_claim: field_t_ms(),
+                        t_resolved: None,
+                    });
+                    bsup!(
+                        "binder: crash-leg claim claim_seq={seq} arena={arena} claimer={pid} sender={wsender} depth={} t={}",
+                        stack.depth(),
+                        field_t_ms()
+                    );
+                }
                 // 0.9.131: the claim is an event in both
                 // parties' evidence rings -- the waiter's
                 // (its call is now being served) and the
@@ -15598,6 +15990,7 @@ fn wedge_snapshot(
     leader: i32,
     solo_out: &mut Option<i32>,
     futex_acct: &HashMap<(i32, u32), FutexAcct>,
+    groups_out: &mut Vec<(u32, Vec<i32>)>,
 ) -> bool {
     // Family membership: the tracer-side parent chain
     // (ProcState.parent, recorded at each birth event)
@@ -15763,6 +16156,12 @@ fn wedge_snapshot(
     // two private waits would leave it ambiguous.
     {
         futex_groups.sort_unstable();
+        // 0.9.152 (s10-frontdoor-desk section 6
+        // M-c): the caller retains the groups for
+        // the crash-leg settlement at this tenure's
+        // death (the monitor-queue test there reads
+        // exactly this grouping).
+        *groups_out = futex_groups.clone();
         let mut solo_groups = 0usize;
         let mut solo_pid = 0i32;
         for (u, ws) in &futex_groups {
@@ -15947,6 +16346,144 @@ fn fire_wedge_chain(
     *wedge_holder = if holder > 0 { Some(holder) } else { None };
 }
 
+/// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+/// classify one crash leg at its tenure's death,
+/// from supervisor-visible evidence only. Returns
+/// (class, basis). Resolved legs need no class.
+/// An open leg claimed nested (depth >= 2) is
+/// gate1: the claimer's outer serving frame is
+/// the monitor-holding chain of the .146 shape.
+/// An open pool-root leg splits on the AMS
+/// monitor's futex queue as the wedge snapshot
+/// grouped it: a queue on some other address --
+/// two or more waiters, or the leader itself
+/// among them -- means a third party holds the
+/// monitor and is blocked downstream (gate1v,
+/// the AThread variant); no such queue leaves
+/// the completion leg's WMS / SF path as the
+/// blocker (gate2). No snapshot groups at all
+/// reads gate2 on a no-snapshot basis, named as
+/// such so forensics can re-judge.
+fn leg_class(
+    depth: u32,
+    resolved: bool,
+    queue: Option<bool>,
+) -> (&'static str, &'static str) {
+    if resolved {
+        return ("resolved", "pop");
+    }
+    if depth >= 2 {
+        return ("gate1", "depth");
+    }
+    match queue {
+        Some(true) => ("gate1v", "depth+queue"),
+        Some(false) => ("gate2", "depth+noqueue"),
+        None => ("gate2", "no-snapshot"),
+    }
+}
+
+/// 0.9.152 (M-c): pick the futex wait that was a
+/// crash claimer's get() sleep, from the worker's
+/// per-thread wait book (open wait first, else
+/// the last completed one). A record that started
+/// more than 5 s before the claim cannot be this
+/// leg's sleep -- it is a leftover of an earlier
+/// wait under a recycled record -- and is
+/// rejected whole rather than misjoined. Returns
+/// (uaddr, start_t, end_t), end None while the
+/// wait is still open.
+fn leg_sleep_pick(
+    open: Option<(u32, u64)>,
+    last: Option<(u32, u64, u64)>,
+    t_claim: u64,
+) -> Option<(u32, u64, Option<u64>)> {
+    let fresh = |start: u64| start + 5_000 >= t_claim;
+    if let Some((u, t0)) = open {
+        if fresh(t0) {
+            return Some((u, t0, None));
+        }
+    }
+    if let Some((u, t0, t1)) = last {
+        if fresh(t0) {
+            return Some((u, t0, Some(t1)));
+        }
+    }
+    None
+}
+
+/// 0.9.152 (s10-frontdoor-desk section 6 M-c):
+/// settle one dead system_server tenure's crash
+/// legs, printed at the leader's reap beside the
+/// traces harvest. The legs ride in from the
+/// coordinator (it owns the claim / pop records);
+/// the sleep face is this worker's own futex book
+/// and the monitor-queue test reads the futex
+/// groups the tenure's wedge snapshot retained.
+/// A claimer traced by another worker has no
+/// local sleep record and prints sleep=- rather
+/// than a borrowed one. Nothing here feeds back
+/// into any live path: the tenure is dead.
+#[allow(clippy::too_many_arguments)]
+fn settle_crash_legs(
+    coord: &mut CoordClient,
+    leader: i32,
+    wait_open: &HashMap<i32, (u32, u64)>,
+    wait_last: &HashMap<i32, (u32, u64, u64)>,
+    wedge_groups: &[(u32, Vec<i32>)],
+) {
+    let legs = coord.crash_legs(leader);
+    if legs.is_empty() {
+        return;
+    }
+    let now = field_t_ms();
+    let queue_known = !wedge_groups.is_empty();
+    for (seq, claimer, sender, _s_arena, depth, t_claim, t_resolved) in &legs {
+        let resolved = *t_resolved > 0;
+        let sleep = leg_sleep_pick(
+            wait_open.get(claimer).copied(),
+            wait_last.get(claimer).copied(),
+            *t_claim,
+        );
+        let sleep_uaddr = sleep.map(|s| s.0);
+        let queue = if !queue_known {
+            None
+        } else {
+            Some(wedge_groups.iter().any(|(u, ws)| {
+                Some(*u) != sleep_uaddr
+                    && (ws.len() >= 2 || ws.contains(&leader))
+            }))
+        };
+        let (class, basis) = leg_class(*depth, resolved, queue);
+        let (u_s, start_s, ms_s, vs_s) = match sleep {
+            Some((u, t0, t1)) => {
+                let end = t1.unwrap_or(now);
+                let ms = end.saturating_sub(t0);
+                (
+                    format!("0x{u:x}"),
+                    t0.to_string(),
+                    ms.to_string(),
+                    if ms >= 300_000 { "over" } else { "under" },
+                )
+            }
+            None => (
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-",
+            ),
+        };
+        sup!(
+            "binder: crash-leg settle arena={leader} claim_seq={seq} claimer={claimer} sender={sender} depth={depth} class={class} basis={basis} claim_t={t_claim} sleep_uaddr={u_s} sleep_start_t={start_s} sleep_ms={ms_s} vs300={vs_s} resolved={} span_ms={}",
+            if resolved { "yes" } else { "no" },
+            if resolved {
+                t_resolved.saturating_sub(*t_claim).to_string()
+            } else {
+                "-".to_string()
+            }
+        );
+    }
+}
+
 /// 0.9.140 (s9-140-desk-ignition M5): per-tenure
 /// traces preservation. The guest's /data/anr/
 /// traces.txt only ever holds the LAST tenure's
@@ -15980,6 +16517,43 @@ fn fire_wedge_chain(
 /// instead: main first, then the monitor-graph
 /// blocks, then file order, 30 lines per block,
 /// 400 lines in total.
+/// 0.9.152 (s10-frontdoor-desk section 6 M-a):
+/// the selection grows a priority pass. The main
+/// block, the holder's block, the AThread block
+/// (thread name "ActivityManager" -- the
+/// completion leg's executor) and the
+/// WindowManager block print whole, first, and
+/// never share the keyword pass's 200-line cap:
+/// in the .150 / .151 fields the blocks that
+/// decided a tenure's gate sat past the cap or
+/// were never selected (the leg classification
+/// had to be read off a later tenure's leftovers
+/// or not at all). The keyword pass and the
+/// whole-section fallback are unchanged.
+/// One kept block's header line in the traces
+/// harvest (the format is field tooling; the
+/// fallback excerpt below prints the same shape
+/// inline and is unchanged).
+fn wedge_block_header(
+    leader: i32,
+    tid: i32,
+    name: &str,
+    systid: &Option<i32>,
+    nlines: usize,
+) {
+    match systid {
+        Some(s) => sup!(
+            "binder: wedge-traces arena={leader} tid={tid} systid={s} name={name} lines={nlines}"
+        ),
+        None => sup!(
+            "binder: wedge-traces arena={leader} tid={tid} name={name} lines={nlines}"
+        ),
+    }
+}
+
+/// The harvest itself (per-tenure traces
+/// preservation, 0.9.140 M5; the full note rides
+/// above wedge_block_header).
 fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     let path = format!("{rootfs}/data/anr/traces.txt");
     let text = match std::fs::read_to_string(&path) {
@@ -16052,29 +16626,46 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
         }
     }
     let is_main = |tid: i32, name: &str| tid == 1 || name == "main";
+    // 0.9.152 (M-a): the priority set (see the
+    // note above wedge_block_header).
+    let is_prio = |tid: i32, name: &str, systid: &Option<i32>| {
+        is_main(tid, name)
+            || (holder > 0 && *systid == Some(holder))
+            || name == "ActivityManager"
+            || name == "WindowManager"
+    };
     let mut printed = 0usize;
     let mut kept = 0usize;
-    for (tid, name, blines, systid) in &blocks {
+    let mut done: Vec<bool> = vec![false; blocks.len()];
+    // Priority pass: whole blocks, in file order,
+    // outside the keyword pass's cap.
+    for (i, (tid, name, blines, systid)) in blocks.iter().enumerate() {
+        if !is_prio(*tid, name, systid) {
+            continue;
+        }
+        done[i] = true;
+        kept += 1;
+        wedge_block_header(leader, *tid, name, systid, blines.len());
+        for ln in blines {
+            sup!("binder: wedge-traces arena={leader} tid={tid} | {ln}");
+        }
+    }
+    // Keyword pass: the pre-.152 selection and cap,
+    // over the blocks the priority pass did not
+    // already print.
+    for (i, (tid, name, blines, systid)) in blocks.iter().enumerate() {
+        if done[i] {
+            continue;
+        }
         let body = blines.join("\n");
-        let keep = is_main(*tid, name)
-            || (holder > 0 && *systid == Some(holder))
-            || body.contains("AppErrorResult")
+        let keep = body.contains("AppErrorResult")
             || body.contains("Surface")
             || body.contains("createSurfaceLocked");
         if !keep {
             continue;
         }
         kept += 1;
-        match systid {
-            Some(s) => sup!(
-                "binder: wedge-traces arena={leader} tid={tid} systid={s} name={name} lines={}",
-                blines.len()
-            ),
-            None => sup!(
-                "binder: wedge-traces arena={leader} tid={tid} name={name} lines={}",
-                blines.len()
-            ),
-        }
+        wedge_block_header(leader, *tid, name, systid, blines.len());
         for ln in blines {
             if printed >= 200 {
                 break;
@@ -16280,6 +16871,13 @@ fn tracer_loop(ctx: TracerCtx) {
     // tenure's leader dies (see wedge_traces_harvest).
     let mut wedge_leader: Option<i32> = None;
     let mut wedge_holder: Option<i32> = None;
+    // 0.9.152 (s10-frontdoor-desk section 6 M-c):
+    // the futex waiter groups the current tenure's
+    // wedge snapshot computed, retained for the
+    // crash-leg settlement's monitor-queue test at
+    // the tenure's death (see settle_crash_legs);
+    // reset with the rest of the wedge state.
+    let mut wedge_groups: Vec<(u32, Vec<i32>)> = Vec::new();
     // 0.9.142 (s9-142-desk section 3.2): the
     // SIGSEGV cell's tracer-side tenure state --
     // this worker's emit sequence when the current
@@ -16302,6 +16900,22 @@ fn tracer_loop(ctx: TracerCtx) {
     // wedge_snapshot; nothing else reads them.
     let mut futex_acct: HashMap<(i32, u32), FutexAcct> = HashMap::new();
     let mut futex_acct_addrs: HashMap<i32, usize> = HashMap::new();
+    // 0.9.152 (s10-frontdoor-desk section 6 M-c):
+    // this worker's per-thread futex wait book --
+    // the wait a thread is inside now (pid ->
+    // (uaddr, start t)) and its most recent
+    // completed one (pid -> (uaddr, start t, end
+    // t)), fed at the futex entry / exit seats
+    // beside the settlement account above. Read
+    // only by the crash-leg settlement, which
+    // joins a leg's claimer to the wait that was
+    // its get() sleep. Entries are never removed
+    // on thread death (a thread killed mid-wait
+    // leaves its wait open, which is exactly the
+    // wedge shape); the settlement's freshness
+    // window keeps stale records from misjoining.
+    let mut futex_wait_open: HashMap<i32, (u32, u64)> = HashMap::new();
+    let mut futex_wait_last: HashMap<i32, (u32, u64, u64)> = HashMap::new();
     // S10 I3: this worker's stop-time account and
     // the stop currently being handled (bucket +
     // reap instant), closed out when the next stop
@@ -16389,8 +17003,22 @@ fn tracer_loop(ctx: TracerCtx) {
                         wedge_holder.unwrap_or(0),
                     );
                 }
+                // 0.9.152 (s10-frontdoor-desk section
+                // 6 M-c): the tenure's crash legs
+                // settle at the same seat, wedged or
+                // not -- a benign tenure's resolved
+                // legs are the completion-leg model's
+                // control sample, not waste.
+                settle_crash_legs(
+                    &mut coord,
+                    pid,
+                    &futex_wait_open,
+                    &futex_wait_last,
+                    &wedge_groups,
+                );
                 wedge_leader = None;
                 wedge_holder = None;
+                wedge_groups.clear();
                 dump_candidate = None;
                 wedge_snapped = false;
             }
@@ -16578,6 +17206,11 @@ fn tracer_loop(ctx: TracerCtx) {
                         pid
                     };
                     if let Some((u, _, _)) = pend.last_futex {
+                        // 0.9.152 (M-c): the wait book
+                        // opens this thread's wait at
+                        // the same seat (see
+                        // futex_wait_open).
+                        futex_wait_open.insert(pid, (u, field_t_ms()));
                         futex_acct_add(
                             &mut futex_acct,
                             &mut futex_acct_addrs,
@@ -17624,6 +18257,18 @@ fn tracer_loop(ctx: TracerCtx) {
                 proc.win.stops += 1;
                 proc.last_stop_seq = emit_seq_now();
                 if let Some(mut pend) = proc.pending.take() {
+                    // 0.9.152 (M-c): a completing futex
+                    // WAIT closes the thread's wait-book
+                    // record into its last-completed
+                    // slot (see futex_wait_open).
+                    if let Some((u, _, _)) = pend.last_futex {
+                        if let Some((ou, t0)) = futex_wait_open.remove(&pid) {
+                            if ou == u {
+                                futex_wait_last
+                                    .insert(pid, (u, t0, field_t_ms()));
+                            }
+                        }
+                    }
                     // 0.9.144 (s9-144-desk sections
                     // 2.1 item 3 / 2.3): when this exit
                     // stop settles the WRITE_READ pend
@@ -17913,7 +18558,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 if !wedge_snapped {
                     if let Some(leader) = dump_candidate {
                         let mut solo: Option<i32> = None;
-                        if wedge_snapshot(tp, &procs, leader, &mut solo, &futex_acct) {
+                        if wedge_snapshot(tp, &procs, leader, &mut solo, &futex_acct, &mut wedge_groups) {
                             wedge_snapped = true;
                             fire_wedge_chain(
                                 &mut coord,
@@ -18132,7 +18777,7 @@ fn tracer_loop(ctx: TracerCtx) {
             if sig == 3 && !wedge_snapped {
                 if let Some(leader) = dump_candidate {
                     let mut solo: Option<i32> = None;
-                    if wedge_snapshot(pid, &procs, leader, &mut solo, &futex_acct) {
+                    if wedge_snapshot(pid, &procs, leader, &mut solo, &futex_acct, &mut wedge_groups) {
                         wedge_snapped = true;
                         fire_wedge_chain(
                             &mut coord,
@@ -19968,5 +20613,122 @@ mod tests {
             line.contains("loopers=0 seen=1 reg=1 unreg=1"),
             "{line}"
         );
+    }
+
+    // 0.9.152 (s10-frontdoor-desk section 6 M-c):
+    // the crash-leg settlement's classification,
+    // over synthetic legs: resolved beats depth,
+    // nested beats the queue test, and the queue
+    // test splits gate1v from gate2 (with the
+    // no-snapshot case named, not hidden).
+    #[test]
+    fn leg_class_decision_tree() {
+        assert_eq!(leg_class(1, true, None), ("resolved", "pop"));
+        assert_eq!(leg_class(3, true, Some(true)), ("resolved", "pop"));
+        assert_eq!(leg_class(2, false, None), ("gate1", "depth"));
+        assert_eq!(leg_class(2, false, Some(false)), ("gate1", "depth"));
+        assert_eq!(leg_class(1, false, Some(true)), ("gate1v", "depth+queue"));
+        assert_eq!(leg_class(1, false, Some(false)), ("gate2", "depth+noqueue"));
+        assert_eq!(leg_class(1, false, None), ("gate2", "no-snapshot"));
+    }
+
+    // 0.9.152 (M-c): the sleep join -- an open
+    // wait wins over a completed one, a completed
+    // one is used when nothing is open, and a
+    // record that started long before the claim
+    // is rejected whole (the 5 s freshness
+    // window), never misjoined.
+    #[test]
+    fn leg_sleep_pick_window() {
+        // Open wait, fresh: open face, no end.
+        assert_eq!(
+            leg_sleep_pick(Some((0x100, 10_000)), None, 9_500),
+            Some((0x100, 10_000, None))
+        );
+        // Open beats last when both are fresh.
+        assert_eq!(
+            leg_sleep_pick(
+                Some((0x100, 10_000)),
+                Some((0x200, 9_000, 9_500)),
+                9_800
+            ),
+            Some((0x100, 10_000, None))
+        );
+        // Stale open falls through to a fresh last.
+        assert_eq!(
+            leg_sleep_pick(
+                Some((0x100, 1_000)),
+                Some((0x200, 9_000, 9_500)),
+                9_800
+            ),
+            Some((0x200, 9_000, Some(9_500)))
+        );
+        // Everything stale: no join.
+        assert_eq!(
+            leg_sleep_pick(Some((0x100, 1_000)), Some((0x200, 2_000, 2_500)), 60_000),
+            None
+        );
+        // Nothing recorded: no join.
+        assert_eq!(leg_sleep_pick(None, None, 1_000), None);
+    }
+
+    // 0.9.152 (M-d): the surface account's top-N
+    // -- known ages oldest first, ageless last in
+    // collection order, truncated at N.
+    #[test]
+    fn surface_top_orders_by_age() {
+        let mk = |sender: i32, age: Option<u64>| SurfCand {
+            sender,
+            sender_arena: "ss".to_string(),
+            code: 1,
+            claimed: false,
+            claim_seq: 0,
+            age_seq: age,
+        };
+        let cands = vec![
+            mk(1, Some(50)),
+            mk(2, None),
+            mk(3, Some(900)),
+            mk(4, Some(900)),
+            mk(5, None),
+            mk(6, Some(10)),
+        ];
+        let top: Vec<i32> = surface_top(&cands, 4)
+            .iter()
+            .map(|c| c.sender)
+            .collect();
+        assert_eq!(top, vec![3, 4, 1, 6]);
+        let all: Vec<i32> = surface_top(&cands, 99)
+            .iter()
+            .map(|c| c.sender)
+            .collect();
+        assert_eq!(all, vec![3, 4, 1, 6, 2, 5]);
+    }
+
+    // 0.9.152 (M-c): the leg ledger's wire form
+    // -- a pushed leg survives the claim fields
+    // intact and an unresolved leg reads
+    // t_resolved None (the RPC's 0-for-open
+    // encoding is exercised by construction here:
+    // the handler unwrap_or(0) / the client reads
+    // 0 back as open in settle_crash_legs).
+    #[test]
+    fn crash_leg_fields_round_trip() {
+        let mut st = BinderState::default();
+        st.crash_legs.push(CrashLeg {
+            arena: "/x/.binder/777".to_string(),
+            claim_seq: 42,
+            claimer: 780,
+            sender_pid: 555,
+            sender_arena: "/x/.binder/555".to_string(),
+            depth: 1,
+            t_claim: 123_000,
+            t_resolved: None,
+        });
+        let leg = &st.crash_legs[0];
+        assert_eq!(leg.claim_seq, 42);
+        assert_eq!(leg.depth, 1);
+        assert!(leg.t_resolved.is_none());
+        assert!(leg.arena.ends_with("/777"));
     }
 }
