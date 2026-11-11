@@ -409,6 +409,18 @@ jobs:
           # driver -- so ship it under both names. SF died
           # in strlen(NULL) on this gap in 0.8.1's field run.
           cp gbsys/lib/egl/libGLES_android.so gbsys/lib/egl/libEGL_android.so
+          # S10 F7 v1 (0.9.151): the guest's ro.hardware is
+          # "paxvm" (the shell's own proc/cmdline), so GB's
+          # hw_get_module variant search probes gralloc.paxvm.so
+          # first and pays two failed accesses per lookup before
+          # falling back to gralloc.default.so. Real GB boards
+          # ship this same driver under the board's variant name,
+          # so ship the default driver under ours too -- a byte
+          # copy, like libEGL_android.so above (s10-f7-desk
+          # section 2.2-G).
+          cp gbsys/lib/hw/gralloc.default.so gbsys/lib/hw/gralloc.paxvm.so
+          test -s gbsys/lib/hw/gralloc.paxvm.so || { echo "missing gralloc.paxvm.so" >&2; exit 1; }
+          [ "$(sha256sum < gbsys/lib/hw/gralloc.paxvm.so)" = "$(sha256sum < gbsys/lib/hw/gralloc.default.so)" ] || { echo "gralloc.paxvm.so differs from gralloc.default.so" >&2; exit 1; }
           # S7 gun 2: the data directories the runtime
           # stack reads at startup -- ICU data
           # (usr/icu/icudt44l.dat), fonts, keylayouts and

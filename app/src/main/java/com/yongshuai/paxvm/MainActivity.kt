@@ -1271,6 +1271,138 @@ class MainActivity : Activity() {
             File(rootfs, "proc/cmdline"),
             "androidboot.hardware=paxvm androidboot.console=tty0\n",
         )
+        // Static guest-environment faces (S10 F7 v1,
+        // s10-f7-desk section 2.1): the global /proc files
+        // the skeleton rootfs never had, plus the coldboot
+        // marker. On hardware these come from the kernel and
+        // from ueventd's coldboot pass; here /dev is already
+        // populated by the shell and supervisor at t=0, so
+        // the marker declares an existing fact -- without it
+        // init polls for it ~1.5s a probe all field. Values
+        // are one era-consistent frozen snapshot (single
+        // core, 256MB, 2.6.35 generation); the desk admits
+        // only advisory/reporting consumers for frozen
+        // faces, meminfo first among them: GB's
+        // MemInfoReader could only ever read zeros from a
+        // file that did not exist. proc/net is the one
+        // subdirectory the opening mkdirs does not make.
+        writeFresh(
+                File(rootfs, "proc/meminfo"),
+                    "MemTotal:         262144 kB
+" +
+                    "MemFree:          104880 kB
+" +
+                    "Buffers:            8192 kB
+" +
+                    "Cached:            40960 kB
+" +
+                    "SwapCached:            0 kB
+" +
+                    "Active:            90112 kB
+" +
+                    "Inactive:          32768 kB
+" +
+                    "Active(anon):      61440 kB
+" +
+                    "Inactive(anon):    16384 kB
+" +
+                    "Active(file):      28672 kB
+" +
+                    "Inactive(file):    16384 kB
+" +
+                    "Unevictable:           0 kB
+" +
+                    "Mlocked:               0 kB
+" +
+                    "SwapTotal:             0 kB
+" +
+                    "SwapFree:              0 kB
+" +
+                    "Dirty:                 0 kB
+" +
+                    "Writeback:             0 kB
+" +
+                    "AnonPages:         57344 kB
+" +
+                    "Mapped:            24576 kB
+" +
+                    "Shmem:              1024 kB
+" +
+                    "Slab:              16384 kB
+" +
+                    "SReclaimable:       8192 kB
+" +
+                    "SUnreclaim:         8192 kB
+" +
+                    "KernelStack:        2048 kB
+" +
+                    "PageTables:         4096 kB
+" +
+                    "NFS_Unstable:          0 kB
+" +
+                    "Bounce:                0 kB
+" +
+                    "WritebackTmp:          0 kB
+" +
+                    "CommitLimit:      131072 kB
+" +
+                    "Committed_AS:     196608 kB
+" +
+                    "VmallocTotal:     876544 kB
+" +
+                    "VmallocUsed:       24576 kB
+" +
+                    "VmallocChunk:     798916 kB
+" +
+                    "HugePages_Total:       0
+" +
+                    "HugePages_Free:        0
+" +
+                    "HugePages_Rsvd:        0
+" +
+                    "HugePages_Surp:        0
+" +
+                    "Hugepagesize:       4096 kB
+" +
+                    "DirectMap4k:       16384 kB
+" +
+                    "DirectMap4M:      245760 kB
+",
+        )
+        writeFresh(
+                File(rootfs, "proc/stat"),
+                    "cpu  120 5 95 6850 18 0 12 0 0 0
+" +
+                    "cpu0 120 5 95 6850 18 0 12 0 0 0
+" +
+                    "intr 12500 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+" +
+                    "ctxt 18300
+" +
+                    "btime 1325376000
+" +
+                    "processes 342
+" +
+                    "procs_running 1
+" +
+                    "procs_blocked 0
+",
+        )
+        writeFresh(File(rootfs, "proc/loadavg"), "0.00 0.00 0.00 1/87 342
+")
+        File(rootfs, "proc/net").mkdirs()
+        writeFresh(
+                File(rootfs, "proc/net/dev"),
+                    "Inter-|   Receive                                                |  Transmit
+" +
+                    " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+" +
+                    "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+",
+        )
+        writeFresh(File(rootfs, "proc/version"), "Linux version 2.6.35.7-gebx0001 (android-build@build) (gcc version 4.4.0 (GCC) ) #1 PREEMPT Tue Nov 1 00:00:00 UTC 2011
+")
+        writeFresh(File(rootfs, "dev/.coldboot_done"), "")
         writeFresh(File(rootfs, ".kmsg"), "")
         writeFresh(File(rootfs, ".gbloader-err"), "")
         installGBSystem(rootfs)
@@ -1288,7 +1420,11 @@ class MainActivity : Activity() {
         // changes: with the old name present, extraction is
         // skipped and new payload files (paxsvc in 0.6.2) never
         // reach the rootfs -- that cost a whole device run.
-        val marker = File(sysDir, ".gbsystem-v19")
+        // v20 (0.9.151, S10 F7): the zip gains lib/hw/
+        // gralloc.paxvm.so (a byte copy of gralloc.default.so
+        // under the ro.hardware variant name); nothing else in
+        // the payload changed.
+        val marker = File(sysDir, ".gbsystem-v20")
         if (!marker.exists()) {
             // The payload is authoritative: wipe the old tree
             // before extracting. Overlay extraction never
