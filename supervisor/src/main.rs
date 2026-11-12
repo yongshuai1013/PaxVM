@@ -2077,6 +2077,17 @@ const BR_TRANSACTION: u32 = 0x8028_7202;
 const BR_REPLY: u32 = 0x8028_7203;
 const BR_DEAD_REPLY: u32 = 0x7205;
 const BR_TRANSACTION_COMPLETE: u32 = 0x7206;
+/// 0.9.153 (s10-152-verify section 5 / s10-frontdoor-
+/// desk L6): the real driver's pool-growth request,
+/// a bare word with no payload. Never synthesized
+/// before this build: our pools could only shrink,
+/// so a process whose stations were all busy or
+/// frozen had no way to grow a new one. Emitted by
+/// maybe_append_spawn under the kernel's own gate
+/// (queued work, no ready station, no request
+/// already outstanding, pool below the process's
+/// BINDER_SET_MAX_THREADS).
+const BR_SPAWN_LOOPER: u32 = 0x720d;
 const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = 0x8004_7210;
 const BR_FAILED_REPLY: u32 = 0x7211;
 const BR_DEAD_BINDER: u32 = 0x8004_720f;
@@ -2087,6 +2098,14 @@ const BR_RELEASE: u32 = 0x8008_720a;
 const BINDER_WRITE_READ: u32 = 0xC018_6201;
 const BINDER_SET_IDLE_TIMEOUT: u32 = 0x4008_6203;
 const BINDER_SET_MAX_THREADS: u32 = 0x4004_6205;
+/// 0.9.153: GB's ProcessState sends this value from
+/// open_driver (DEFAULT_MAX_BINDER_THREADS) before
+/// anything else touches the driver; it is the
+/// fallback spawn cap for an arena whose own
+/// BINDER_SET_MAX_THREADS the supervisor somehow
+/// never saw. The guest's own recorded value wins
+/// wherever one exists (see BinderState::max_threads).
+const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const BINDER_SET_IDLE_PRIORITY: u32 = 0x4004_6206;
 const BINDER_SET_CONTEXT_MGR: u32 = 0x4004_6207;
 const BINDER_THREAD_EXIT: u32 = 0x4004_6208;
@@ -2756,6 +2775,17 @@ struct ReplyWait {
     /// claims this wait by when the fill hands it the
     /// transaction parcel (binder_claim_fills).
     code: u32,
+    /// 0.9.153 (s10-152-verify sections 2.7 / 4):
+    /// stamped at send time in binder_send_txn --
+    /// this call is a crash report, i.e. code 2
+    /// carrying the IActivityManager interface
+    /// token, the same identity trigger A stands
+    /// on. Only a stamped wait opens a crash leg
+    /// when claimed; code 2 on any other interface
+    /// (the manager's checkService family, SF's
+    /// own code 2) is interface noise and is only
+    /// counted (BinderState::crash_leg_noise).
+    crash: bool,
 }
 
 /// One frame of a serving thread's transaction stack
@@ -3120,9 +3150,12 @@ struct SyncStamp {
 /// completion leg (SHOW_ERROR_MSG -> dialog ->
 /// dismiss timer -> AppErrorResult.set) decides
 /// whether the tenure wedges (see the desk's
-/// section 3 ruling). Identity rests on code +
-/// serving arena, the same basis the evidence
-/// rings' "serve code=2" tags already use.
+/// section 3 ruling). Identity rests on the
+/// send-side interface-token stamp on the wait
+/// (0.9.153: code + IActivityManager token, the
+/// trigger-A basis -- the .152 ledger opened on
+/// code alone and took in 174 manager / SF
+/// same-code claims against 7 real legs).
 /// depth is the claimer's serving-stack depth
 /// right after the claim push: 1 is a pool-root
 /// (front-door) claim, >= 2 a claim nested inside
@@ -3143,6 +3176,53 @@ struct CrashLeg {
     depth: u32,
     t_claim: u64,
     t_resolved: Option<u64>,
+}
+
+/// 0.9.153 (s10-152-verify section 5): one arena's
+/// BR_SPAWN_LOOPER parity account. sent counts
+/// requests appended to a looper's read fill;
+/// outstanding is 0 or 1 by construction (the
+/// kernel gate: a second request is never emitted
+/// while one is unanswered); sat_reg / sat_new
+/// count how an outstanding request was answered
+/// -- by a BC_REGISTER_LOOPER, or by a looper
+/// registration (BC_ENTER_LOOPER) from a thread
+/// the pool did not already hold, the two being
+/// told apart so the field can name which command
+/// GB's libbinder actually answers with. capped
+/// counts ripe moments the pool-depth cap refused;
+/// held_outst counts ripe moments the outstanding
+/// request refused; no_room counts fills with no
+/// room left for the word. carrier is the last
+/// thread a request rode out on.
+#[derive(Clone, Copy, Default)]
+struct SpawnAcct {
+    sent: u64,
+    sat_reg: u64,
+    sat_new: u64,
+    capped: u64,
+    held_outst: u64,
+    no_room: u64,
+    outstanding: u32,
+    carrier: i32,
+}
+
+/// 0.9.153 (s10-152-verify section 2.7): the
+/// downstream evidence a tenure's wedge snapshot
+/// recorded for its arena -- the surface account's
+/// own sends (the arena's transactions into a
+/// servicer still unreplied at snapshot time):
+/// how many, and the longest-unreplied one's
+/// sender and code. Recorded by the coordinator
+/// at chain-dump time and consumed by the crash-
+/// leg settlement, where it keys the gate2 class
+/// on completion-leg-side evidence instead of
+/// claim-side geometry alone.
+#[derive(Clone, Copy)]
+struct SurfEv {
+    n: u32,
+    sender: i32,
+    code: u32,
 }
 
 /// 0.9.152 (s10-frontdoor-desk section 6 M-d):
@@ -3402,6 +3482,26 @@ struct BinderState {
     /// are settled per arena at its leader's death;
     /// capped in binder_claim_fills.
     crash_legs: Vec<CrashLeg>,
+    /// 0.9.153 (s10-152-verify section 4): code-2
+    /// claims that opened no crash leg because the
+    /// wait carried no IActivityManager stamp (the
+    /// manager / SF same-code noise the .152 ledger
+    /// took in as legs: 174 of its 181 claims).
+    /// Cumulative; reported at each crash-leg
+    /// settlement.
+    crash_leg_noise: u64,
+    /// 0.9.153: per-arena BR_SPAWN_LOOPER parity
+    /// accounts (see SpawnAcct), and each arena's
+    /// own BINDER_SET_MAX_THREADS as the guest
+    /// declared it (absent = never seen; the gate
+    /// falls back to DEFAULT_MAX_BINDER_THREADS).
+    spawn_acct: HashMap<String, SpawnAcct>,
+    max_threads: HashMap<String, u32>,
+    /// 0.9.153: per-arena downstream surface
+    /// evidence from the latest wedge snapshot
+    /// (see SurfEv), keyed by arena name and taken
+    /// by that arena's crash-leg settlement.
+    surf_ev: HashMap<String, SurfEv>,
     /// 0.9.141 (s9-141-desk P1): global issuance
     /// double-read account (see MSG_ONEWAY_ISSUANCE_
     /// STATS): snapshots of BC_REPLY buffers taken at
@@ -4182,6 +4282,11 @@ const MSG_ONEWAY_FD_STATS: u8 = 35;
 // exit-side re-read), counted coordinator-side for
 // the arena-death settlement lines.
 const MSG_ONEWAY_ISSUANCE_STATS: u8 = 36;
+/// 0.9.153: a guest process's BINDER_SET_MAX_THREADS
+/// value, forwarded at the ioctl stop so the
+/// coordinator's spawn-looper gate can cap pool
+/// growth at the process's own declared limit.
+const MSG_ONEWAY_SET_MAX_THREADS: u8 = 37;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
@@ -4971,10 +5076,18 @@ impl CoordClient {
     /// settlement itself. The coordinator drains
     /// the legs it hands over, so each leg settles
     /// exactly once. t_resolved 0 reads as open.
+    /// 0.9.153: the response also carries the
+    /// arena's downstream surface evidence (see
+    /// SurfEv) and the cumulative crash-leg noise
+    /// total, returned beside the legs.
     fn crash_legs(
         &mut self,
         leader: i32,
-    ) -> Vec<(u64, i32, i32, String, u32, u64, u64)> {
+    ) -> (
+        Vec<(u64, i32, i32, String, u32, u64, u64)>,
+        Option<SurfEv>,
+        u64,
+    ) {
         let mut e = Enc::new();
         e.i32(leader);
         let p = self.rpc(MSG_REQ_CRASH_LEGS, &e.0, MSG_RESP_CRASH_LEGS);
@@ -4999,7 +5112,20 @@ impl CoordClient {
                 t_resolved,
             ));
         }
-        out
+        let surf = if d.u32() == 1 {
+            let n = d.u32();
+            let sender = d.i32();
+            let code = d.u32();
+            Some(SurfEv {
+                n,
+                sender,
+                code,
+            })
+        } else {
+            None
+        };
+        let noise = d.u64();
+        (out, surf, noise)
     }
 
     /// 0.9.142 (s9-142-desk section 3.2): ask the
@@ -5171,6 +5297,17 @@ impl CoordClient {
         e.i32(pid);
         e.string(arena);
         self.send(MSG_ONEWAY_THREAD_ARENA, &e.0);
+    }
+
+    /// 0.9.153: forward one process's declared
+    /// BINDER_SET_MAX_THREADS (see MSG_ONEWAY_SET_
+    /// MAX_THREADS).
+    fn oneway_set_max_threads(&mut self, pid: i32, arena: &str, value: u32) {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.string(arena);
+        e.u32(value);
+        self.send(MSG_ONEWAY_SET_MAX_THREADS, &e.0);
     }
 
     fn oneway_arena_register(&mut self, pid: i32, arena: &str, base: u32, maplen: u32) {
@@ -5796,7 +5933,7 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         let n = br_prefix_len(&peek, park.read_size as usize);
         bp.drain_for(pid, n)
     };
-    let bytes = shield_ref_pairs(st, &arena, pid, bytes);
+    let mut bytes = shield_ref_pairs(st, &arena, pid, bytes);
     binder_claim_fills(st, &arena, pid, &bytes);
     // 0.9.143 (s9-143-desk section 2.1 item 4): the
     // fill hinge -- answer commands in this drained
@@ -5812,6 +5949,13 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     // waitForResponse windows (tc_out). After the
     // predicate evaluation above by construction.
     st.tc_settle_fill(pid, &bytes);
+    // 0.9.153: a non-empty completion is a looper
+    // returning from a read -- the kernel's spawn
+    // seat. An empty fill re-parks below and never
+    // reaches userspace, so it cannot carry.
+    if !bytes.is_empty() {
+        maybe_append_spawn(st, &arena, pid, &mut bytes, park.read_size as usize);
+    }
     if !bytes.is_empty() {
         bsup!(
             "binder: waking pid={pid} with {}B of queued work ({}B from inbound)",
@@ -6588,7 +6732,16 @@ impl CoordServer {
                 // settle in the same captured reply,
                 // behind the chain dump's lines.
                 self.settle_perf_accounts();
-                let (holder, servicers) = holder;
+                let (holder, servicers, surf_ev) = holder;
+                // 0.9.153: file the snapshot's surface
+                // evidence under the wedged arena's
+                // name; its crash-leg settlement
+                // takes it from there.
+                if let Some(ev) = surf_ev {
+                    if let Some(a) = self.st.thread_arena.get(&leader).cloned() {
+                        self.st.surf_ev.insert(a, ev);
+                    }
+                }
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 e.i32(holder);
@@ -6697,6 +6850,25 @@ impl CoordServer {
                     e.u64(leg.t_claim);
                     e.u64(leg.t_resolved.unwrap_or(0));
                 }
+                // 0.9.153: the settlement's downstream
+                // evidence (the arena's latest wedge-
+                // snapshot surface record, taken here
+                // so it settles exactly once) and the
+                // cumulative crash-leg noise total
+                // ride the same response.
+                let surf = legs
+                    .first()
+                    .and_then(|l| self.st.surf_ev.remove(&l.arena));
+                match surf {
+                    Some(ev) => {
+                        e.u32(1);
+                        e.u32(ev.n);
+                        e.i32(ev.sender);
+                        e.u32(ev.code);
+                    }
+                    None => e.u32(0),
+                }
+                e.u64(self.st.crash_leg_noise);
                 self.send_to(ci, MSG_RESP_CRASH_LEGS, &e.0);
             }
             MSG_ONEWAY_PARK => {
@@ -6889,6 +7061,19 @@ impl CoordServer {
                 let pid = d.i32();
                 let arena = d.string();
                 self.st.thread_arena.insert(pid, arena);
+            }
+            MSG_ONEWAY_SET_MAX_THREADS => {
+                // 0.9.153: the arena's own declared
+                // pool cap, recorded verbatim; the
+                // spawn gate reads it back per arena
+                // (see BinderState::max_threads). A
+                // repeat send overwrites with the
+                // same value in practice (ProcessState
+                // sends it once, from open_driver).
+                let _pid = d.i32();
+                let arena = d.string();
+                let value = d.u32();
+                self.st.max_threads.insert(arena, value);
             }
             MSG_ONEWAY_ARENA_REGISTER => {
                 let pid = d.i32();
@@ -8242,6 +8427,213 @@ fn thread_acct_mut<'x>(st: &'x mut BinderState, arena: &str) -> &'x mut ThreadAc
 /// seats compute membership differently: the
 /// snapshot by thread_arena, the death settlement
 /// by the arena's surviving pid records).
+/// 0.9.153 (s10-152-verify section 5, s10-frontdoor-
+/// desk L6, s10-circle-desk C-A): why a read fill
+/// about to return to a looper may or may not carry
+/// a BR_SPAWN_LOOPER word. Pure decision, unit-
+/// tested: the kernel's gate in our vocabulary --
+/// the arena has a transaction queued unclaimed
+/// (its stations are all serving or frozen in
+/// waits of their own), no station stands ready to
+/// take it, no earlier request is still
+/// outstanding, and the pool is below the
+/// process's own thread cap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpawnGate {
+    Send,
+    NoTxn,
+    Ready,
+    Outstanding,
+    Capped,
+    NoRoom,
+}
+
+fn spawn_gate(
+    has_txn: bool,
+    ready: bool,
+    outstanding: u32,
+    pool: u32,
+    cap: u32,
+    fill_len: usize,
+    read_cap: usize,
+) -> SpawnGate {
+    if !has_txn {
+        return SpawnGate::NoTxn;
+    }
+    if ready {
+        return SpawnGate::Ready;
+    }
+    if outstanding > 0 {
+        return SpawnGate::Outstanding;
+    }
+    if pool + outstanding >= cap {
+        return SpawnGate::Capped;
+    }
+    if fill_len + 4 > read_cap {
+        return SpawnGate::NoRoom;
+    }
+    SpawnGate::Send
+}
+
+/// Whether the arena's shared inbound stream holds
+/// at least one whole BR_TRANSACTION unit -- the
+/// queued, unclaimed work a new station would
+/// exist to take. A trailing partial unit ends
+/// the walk, as at every other stream consumer.
+fn inbound_has_txn(bp: &BinderProc) -> bool {
+    let mut off = 0usize;
+    while off + 4 <= bp.inbound.len() {
+        let cmd = u32_at(&bp.inbound, off);
+        let len = br_one_len(cmd);
+        if off + len > bp.inbound.len() {
+            break;
+        }
+        if cmd == BR_TRANSACTION {
+            return true;
+        }
+        off += len;
+    }
+    false
+}
+
+/// 0.9.153: answer one outstanding spawn request,
+/// if any, from a looper registration event. A
+/// BC_REGISTER_LOOPER is the answer the protocol
+/// names; a BC_ENTER_LOOPER from a thread the
+/// pool did not already hold is the same event in
+/// the other command -- the two are counted apart
+/// (see SpawnAcct) so the field can convict which
+/// one GB's libbinder actually sends, but either
+/// discharges the request. A registration from a
+/// thread already in the pool answers nothing.
+fn spawn_satisfy(acct: &mut SpawnAcct, is_register: bool, was_looper: bool) -> bool {
+    if acct.outstanding == 0 || (!is_register && was_looper) {
+        return false;
+    }
+    acct.outstanding -= 1;
+    if is_register {
+        acct.sat_reg += 1;
+    } else {
+        acct.sat_new += 1;
+    }
+    true
+}
+
+/// 0.9.153: the BR_SPAWN_LOOPER emission seat,
+/// shared by both fill paths (binder_write_read's
+/// inline fill and binder_complete_decision's
+/// parked completion). Runs on the fill's final
+/// bytes after every claim / settle / discharge
+/// hinge has consumed them -- the word carries no
+/// parcel, claims nothing and settles nothing, so
+/// no hinge needs to see it -- and appends it when
+/// the gate is ripe. The carrier must itself be a
+/// looper of the arena: the kernel hands the
+/// request only to a looper returning from a read.
+/// Nothing already claimed is touched; the word
+/// asks the process to grow a station for the work
+/// still queued, exactly the reverse-call geometry
+/// s10-152-verify section 2.5 convicted.
+fn maybe_append_spawn(
+    st: &mut BinderState,
+    arena: &str,
+    carrier: i32,
+    bytes: &mut Vec<u8>,
+    read_cap: usize,
+) {
+    let (has_txn, pool, cap) = {
+        let Some(bp) = st.procs.get(arena) else {
+            return;
+        };
+        if !bp.loopers.contains(&carrier) {
+            return;
+        }
+        (
+            inbound_has_txn(bp),
+            bp.loopers.len() as u32,
+            st.max_threads
+                .get(arena)
+                .copied()
+                .unwrap_or(DEFAULT_MAX_BINDER_THREADS),
+        )
+    };
+    if !has_txn {
+        return;
+    }
+    // A station standing ready makes the request
+    // pointless: parked, a looper of this arena,
+    // and not itself frozen inside a wait of its
+    // own (the discipline predicate's waiting set).
+    let ready = st.parked.keys().any(|q| {
+        *q != carrier
+            && st
+                .thread_arena
+                .get(q)
+                .map(|a| a == arena)
+                .unwrap_or(false)
+            && st
+                .procs
+                .get(arena)
+                .map(|bp| bp.loopers.contains(q))
+                .unwrap_or(false)
+            && !binder_thread_waiting(st, *q)
+    });
+    let outstanding = st.spawn_acct.get(arena).map_or(0, |a| a.outstanding);
+    match spawn_gate(has_txn, ready, outstanding, pool, cap, bytes.len(), read_cap) {
+        SpawnGate::Send => {
+            bytes.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
+            let acct = st.spawn_acct.entry(arena.to_string()).or_default();
+            acct.sent += 1;
+            acct.outstanding = 1;
+            acct.carrier = carrier;
+            bsup!(
+                "binder: spawn-looper sent arena={arena} carrier={carrier} pool={pool} cap={cap} t={}",
+                field_t_ms()
+            );
+        }
+        SpawnGate::Capped => {
+            st.spawn_acct.entry(arena.to_string()).or_default().capped += 1;
+        }
+        SpawnGate::Outstanding => {
+            st.spawn_acct
+                .entry(arena.to_string())
+                .or_default()
+                .held_outst += 1;
+        }
+        SpawnGate::NoRoom => {
+            st.spawn_acct.entry(arena.to_string()).or_default().no_room += 1;
+        }
+        SpawnGate::NoTxn | SpawnGate::Ready => {}
+    }
+}
+
+/// The spawn-looper settlement line for one arena
+/// (0.9.153): the parity account plus the pool's
+/// current depth and the cap in force, printed at
+/// the seats the park / thread registry accounts
+/// settle at.
+fn spawn_looper_account(st: &BinderState, arena: &str) -> String {
+    let z = SpawnAcct::default();
+    let a = st.spawn_acct.get(arena).unwrap_or(&z);
+    let pool = st.procs.get(arena).map_or(0, |bp| bp.loopers.len());
+    let (cap, cap_src) = match st.max_threads.get(arena) {
+        Some(v) => (*v, "guest"),
+        None => (DEFAULT_MAX_BINDER_THREADS, "default"),
+    };
+    format!(
+        "binder: arena {arena} spawn-looper account: sent={} sat_reg={} sat_new={} capped={} held_outst={} no_room={} outstanding={} carrier={} pool={pool} cap={cap} cap_src={cap_src} t={}",
+        a.sent,
+        a.sat_reg,
+        a.sat_new,
+        a.capped,
+        a.held_outst,
+        a.no_room,
+        a.outstanding,
+        a.carrier,
+        field_t_ms()
+    )
+}
+
 fn park_registry_account(st: &BinderState, arena: &str, cur: usize) -> String {
     let z = ParkAcct::default();
     let a = st.park_acct.get(arena).unwrap_or(&z);
@@ -8423,8 +8815,22 @@ fn binder_process_stream<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         cur += 4;
         match cmd {
             BC_ENTER_LOOPER | BC_REGISTER_LOOPER => {
+                // 0.9.153: whether the pool already
+                // held this thread decides if the
+                // registration can answer an
+                // outstanding spawn request (see
+                // spawn_satisfy); capture it before
+                // the insert.
+                let was_looper = st
+                    .procs
+                    .get(arena)
+                    .map(|bp| bp.loopers.contains(&pid))
+                    .unwrap_or(false);
                 if let Some(bp) = st.procs.get_mut(arena) {
                     bp.loopers.insert(pid);
+                }
+                if let Some(acct) = st.spawn_acct.get_mut(arena) {
+                    spawn_satisfy(acct, cmd == BC_REGISTER_LOOPER, was_looper);
                 }
                 // 0.9.150 (M4-lite): the thread life
                 // ledger charges the registration and
@@ -9351,7 +9757,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     leader: i32,
     solo: i32,
     rd: &mut R,
-) -> (i32, Vec<(String, i32)>) {
+) -> (i32, Vec<(String, i32)>, Option<SurfEv>) {
     let Some(arena) = st.thread_arena.get(&leader).cloned() else {
         bsup!(
             "binder: wedge-chain leader={leader} arena=- (leader holds no binder arena)"
@@ -9359,7 +9765,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-verdict arena=- class=unknown holder=- basis=none (provisional)"
         );
-        return (0, Vec::new());
+        return (0, Vec::new(), None);
     };
     // (a) Serving stacks of this arena: every frame
     // the arena's threads are serving, in stack
@@ -9754,6 +10160,12 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             }
         }
     }
+    // 0.9.153: the wedged arena's own sends among
+    // the surface candidates below, across every
+    // servicer the chain named (see SurfEv);
+    // returned with the dump for the crash-leg
+    // settlement's gate2 key.
+    let mut surf_all: Vec<SurfCand> = Vec::new();
     // 0.9.152 (s10-frontdoor-desk section 6 M-d):
     // the surface unreplied account, parasitic on
     // the servicer view above: for each servicer
@@ -9803,6 +10215,18 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                         });
                     }
                 }
+            }
+        }
+        for c in &cands {
+            if c.sender_arena == arena {
+                surf_all.push(SurfCand {
+                    sender: c.sender,
+                    sender_arena: c.sender_arena.clone(),
+                    code: c.code,
+                    claimed: c.claimed,
+                    claim_seq: c.claim_seq,
+                    age_seq: c.age_seq,
+                });
             }
         }
         bsup!(
@@ -9933,6 +10357,9 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
                 .count();
             bsup!("{}", park_registry_account(st, a, cur));
             bsup!("{}", thread_registry_account(st, a));
+            // 0.9.153: the spawn-looper account
+            // settles at the same seat.
+            bsup!("{}", spawn_looper_account(st, a));
         }
     }
     // 0.9.142 (section 2.4): servicers the v2
@@ -9984,7 +10411,19 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         }
         all_servicers.truncate(48);
     }
-    (holder, all_servicers)
+    // 0.9.153: the tenure's downstream evidence,
+    // named by its longest-unreplied own send.
+    let surf_ev = if surf_all.is_empty() {
+        None
+    } else {
+        let top = surface_top(&surf_all, 1)[0];
+        Some(SurfEv {
+            n: surf_all.len() as u32,
+            sender: top.sender,
+            code: top.code,
+        })
+    };
+    (holder, all_servicers, surf_ev)
 }
 
 /// Cap on the write-overlap audit table (0.9.132):
@@ -11261,6 +11700,12 @@ fn binder_send_txn(
     data: &[u8],
     offs: &[u8],
 ) {
+    // 0.9.153: the token decode below also decides
+    // whether this call is a crash report for the
+    // wait's stamp (see ReplyWait::crash); the flag
+    // is hoisted out of the telemetry block for the
+    // wait recorded at the bottom of this function.
+    let mut crash_iface = false;
     // Telemetry: decode the interface token so the log states
     // who this transaction speaks to and whether it is one-way.
     {
@@ -11303,6 +11748,7 @@ fn binder_send_txn(
             // annotation on the trigger -- it is the
             // caller's own declaration, quoted, not the
             // identity the dump stands on.
+            crash_iface = true;
             binder_ignition_dump(st, pid, &format!("crash-report token={tok}"));
         } else if code == 2 && tok.is_empty() {
             // 0.9.140 (M4): a code-2 transaction whose
@@ -11400,6 +11846,7 @@ fn binder_send_txn(
             cookie,
             target_handle: target,
             code,
+            crash: crash_iface,
         });
         // 0.9.142 (s9-142-desk section 2.2): stamp
         // the call at the same instant its wait is
@@ -11612,7 +12059,7 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         Vec::new()
     };
     if !bytes.is_empty() {
-        let bytes = shield_ref_pairs(st, &arena, pid, bytes);
+        let mut bytes = shield_ref_pairs(st, &arena, pid, bytes);
         binder_claim_fills(st, &arena, pid, &bytes);
         // 0.9.143 (s9-143-desk section 2.1 item 4):
         // the fill hinge, same seat and bytes as the
@@ -11627,6 +12074,11 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         // the predicate evaluation above gated (or
         // did not gate) this very fill by them.
         st.tc_settle_fill(pid, &bytes);
+        // 0.9.153: the inline twin of the parked
+        // seat's spawn append (see binder_complete_
+        // decision); the read buffer's own size is
+        // the cap here.
+        maybe_append_spawn(st, &arena, pid, &mut bytes, rs as usize);
         dump_mgr_read(st, &arena, pid, &bytes);
         // 0.9.136: this fill's delivery VAs, taken before
         // the bytes move into the action list; the fd
@@ -11868,7 +12320,7 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // scalars and its frame's claim sequence
             // number, copied out before the wait moves
             // into the frame (claim dump after the push).
-            let mut claimed_key: Option<(u64, i32, String, u32, u32, u32, u32)> = None;
+            let mut claimed_key: Option<(u64, i32, String, u32, u32, u32, u32, bool)> = None;
             if flags & TF_ONE_WAY == 0 {
                 let sender_arena = st.thread_arena.get(&sender_pid).cloned();
                 let node_idx = st.nodes.iter().position(|n| {
@@ -11961,6 +12413,7 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                             kcookie,
                             w.code,
                             w.target_handle,
+                            w.crash,
                         ));
                         frame = ServingFrame::Reply(w, st.claim_seq);
                     }
@@ -12004,7 +12457,9 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // took, copied before the dump below moves
             // the key (for the collision ring record).
             let claimed_seq = claimed_key.as_ref().map(|k| k.0);
-            if let Some((seq, wsender, wsarena, kptr, kcookie, wcode, whandle)) = claimed_key {
+            if let Some((seq, wsender, wsarena, kptr, kcookie, wcode, whandle, wcrash)) =
+                claimed_key
+            {
                 bsup!(
                     "binder: claim dump claim_seq={seq} fill_id={fid} reader={pid} arena={arena} fill_sender={sender_pid} fill_target=0x{tptr:x}/0x{tcookie:x} fill_code={code} wait_sender={wsender} wait_node=0x{kptr:x}/0x{kcookie:x} wait_code={wcode} wait_handle={whandle} depth={}",
                     stack.depth()
@@ -12022,7 +12477,17 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                 // are open the oldest opens are
                 // dropped, and the settlement of that
                 // arena will simply not name them).
-                if wcode == 2 {
+                // 0.9.153 (s10-152-verify section 4):
+                // only a wait the send side stamped
+                // as a crash report (code 2 on the
+                // IActivityManager interface) opens
+                // a leg; the manager's and SF's own
+                // code-2 claims are interface noise
+                // and are only counted.
+                if wcode == 2 && !wcrash {
+                    st.crash_leg_noise += 1;
+                }
+                if wcode == 2 && wcrash {
                     if st.crash_legs.len() >= 1024 {
                         let drop_seq = st
                             .crash_legs
@@ -13912,6 +14377,9 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
             .count();
         bsup!("{}", park_registry_account(st, arena, cur));
         bsup!("{}", thread_registry_account(st, arena));
+        // 0.9.153: the spawn-looper account settles
+        // at the same seat.
+        bsup!("{}", spawn_looper_account(st, arena));
     }
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
@@ -16364,10 +16832,24 @@ fn fire_wedge_chain(
 /// blocker (gate2). No snapshot groups at all
 /// reads gate2 on a no-snapshot basis, named as
 /// such so forensics can re-judge.
+/// 0.9.153 (s10-152-verify section 2.7): the
+/// gate2 branch additionally takes the tenure's
+/// downstream surface evidence (surf: the wedge
+/// snapshot's surface account found this arena's
+/// own sends into a servicer still unreplied).
+/// When a record exists its verdict stands in
+/// the basis (depth+surf / surf when present,
+/// depth+nosurf / nosurf when the account ran
+/// and found none), keying gate2 on completion-
+/// leg-side evidence; with no record the claim-
+/// side bases above stand unchanged. The
+/// resolved / gate1 / gate1v keys do not consult
+/// surf at all and are byte-identical to .152.
 fn leg_class(
     depth: u32,
     resolved: bool,
     queue: Option<bool>,
+    surf: Option<bool>,
 ) -> (&'static str, &'static str) {
     if resolved {
         return ("resolved", "pop");
@@ -16375,10 +16857,26 @@ fn leg_class(
     if depth >= 2 {
         return ("gate1", "depth");
     }
-    match queue {
-        Some(true) => ("gate1v", "depth+queue"),
-        Some(false) => ("gate2", "depth+noqueue"),
-        None => ("gate2", "no-snapshot"),
+    if queue == Some(true) {
+        return ("gate1v", "depth+queue");
+    }
+    match surf {
+        Some(true) => (
+            "gate2",
+            if queue.is_some() { "depth+surf" } else { "surf" },
+        ),
+        Some(false) => (
+            "gate2",
+            if queue.is_some() {
+                "depth+nosurf"
+            } else {
+                "nosurf"
+            },
+        ),
+        None => match queue {
+            Some(false) => ("gate2", "depth+noqueue"),
+            _ => ("gate2", "no-snapshot"),
+        },
     }
 }
 
@@ -16431,10 +16929,27 @@ fn settle_crash_legs(
     wait_last: &HashMap<i32, (u32, u64, u64)>,
     wedge_groups: &[(u32, Vec<i32>)],
 ) {
-    let legs = coord.crash_legs(leader);
+    let (legs, surf_ev, noise) = coord.crash_legs(leader);
+    // 0.9.153: the noise account settles on the
+    // same line family -- code-2 claims the token
+    // filter refused, cumulative across the field.
+    if noise > 0 {
+        sup!(
+            "binder: crash-leg noise total={noise} (code-2 claims without the IActivityManager stamp open no leg; cumulative)"
+        );
+    }
     if legs.is_empty() {
         return;
     }
+    // 0.9.153: the tenure's downstream surface
+    // evidence keys every leg's gate2 verdict
+    // (see leg_class); the record's own fields
+    // ride the settle lines below.
+    let surf = surf_ev.map(|e| e.n > 0);
+    let surf_s = match &surf_ev {
+        Some(e) => format!("n={} sender={} code={}", e.n, e.sender, e.code),
+        None => "-".to_string(),
+    };
     let now = field_t_ms();
     let queue_known = !wedge_groups.is_empty();
     for (seq, claimer, sender, _s_arena, depth, t_claim, t_resolved) in &legs {
@@ -16453,7 +16968,7 @@ fn settle_crash_legs(
                     && (ws.len() >= 2 || ws.contains(&leader))
             }))
         };
-        let (class, basis) = leg_class(*depth, resolved, queue);
+        let (class, basis) = leg_class(*depth, resolved, queue, surf);
         let (u_s, start_s, ms_s, vs_s) = match sleep {
             Some((u, t0, t1)) => {
                 let end = t1.unwrap_or(now);
@@ -16473,7 +16988,7 @@ fn settle_crash_legs(
             ),
         };
         sup!(
-            "binder: crash-leg settle arena={leader} claim_seq={seq} claimer={claimer} sender={sender} depth={depth} class={class} basis={basis} claim_t={t_claim} sleep_uaddr={u_s} sleep_start_t={start_s} sleep_ms={ms_s} vs300={vs_s} resolved={} span_ms={}",
+            "binder: crash-leg settle arena={leader} claim_seq={seq} claimer={claimer} sender={sender} depth={depth} class={class} basis={basis} claim_t={t_claim} sleep_uaddr={u_s} sleep_start_t={start_s} sleep_ms={ms_s} vs300={vs_s} surf={surf_s} resolved={} span_ms={}",
             if resolved { "yes" } else { "no" },
             if resolved {
                 t_resolved.saturating_sub(*t_claim).to_string()
@@ -18124,6 +18639,32 @@ fn tracer_loop(ctx: TracerCtx) {
                                 proc.win.parks += 1;
                             }
                             pend.desc = Some(desc);
+                        }
+                        BINDER_SET_MAX_THREADS => {
+                            // 0.9.153: record the process's
+                            // own declared pool cap with
+                            // the coordinator (the spawn-
+                            // looper gate's ceiling). The
+                            // value is a u32 the guest
+                            // points the ioctl at. The
+                            // guest-visible behavior is
+                            // unchanged (the ioctl was
+                            // already a no-op success);
+                            // only the recording is new.
+                            let v =
+                                read_mem_vec(pid, regs.arg(2), 4).map(|b| u32_at(&b, 0));
+                            if let Some(v) = v {
+                                coord.oneway_set_max_threads(pid, &arena, v);
+                            }
+                            skip_syscall(pid, &mut regs, &mut pend, 0);
+                            pend.desc = Some(match v {
+                                Some(v) => {
+                                    format!("binder SET_MAX_THREADS -> {v} (recorded)")
+                                }
+                                None => {
+                                    "binder SET_MAX_THREADS (value unreadable)".to_string()
+                                }
+                            });
                         }
                         req => {
                             skip_syscall(pid, &mut regs, &mut pend, 0);
@@ -20059,6 +20600,7 @@ mod tests {
                 cookie: 0,
                 target_handle: 1,
                 code: 7,
+                crash: false,
             }
         }
         let mut st = BinderState::default();
@@ -20518,6 +21060,7 @@ mod tests {
                 cookie: 0,
                 target_handle: 1,
                 code: 5,
+                crash: false,
             });
         assert!(matches!(
             ds_drain_counter(&st, 4242),
@@ -20623,13 +21166,155 @@ mod tests {
     // no-snapshot case named, not hidden).
     #[test]
     fn leg_class_decision_tree() {
-        assert_eq!(leg_class(1, true, None), ("resolved", "pop"));
-        assert_eq!(leg_class(3, true, Some(true)), ("resolved", "pop"));
-        assert_eq!(leg_class(2, false, None), ("gate1", "depth"));
-        assert_eq!(leg_class(2, false, Some(false)), ("gate1", "depth"));
-        assert_eq!(leg_class(1, false, Some(true)), ("gate1v", "depth+queue"));
-        assert_eq!(leg_class(1, false, Some(false)), ("gate2", "depth+noqueue"));
-        assert_eq!(leg_class(1, false, None), ("gate2", "no-snapshot"));
+        // The .152 keys, carried with surf=None:
+        // byte-identical verdicts.
+        assert_eq!(leg_class(1, true, None, None), ("resolved", "pop"));
+        assert_eq!(
+            leg_class(3, true, Some(true), Some(true)),
+            ("resolved", "pop")
+        );
+        assert_eq!(leg_class(2, false, None, None), ("gate1", "depth"));
+        assert_eq!(
+            leg_class(2, false, Some(false), Some(true)),
+            ("gate1", "depth")
+        );
+        assert_eq!(
+            leg_class(1, false, Some(true), None),
+            ("gate1v", "depth+queue")
+        );
+        assert_eq!(
+            leg_class(1, false, Some(true), Some(true)),
+            ("gate1v", "depth+queue")
+        );
+        assert_eq!(
+            leg_class(1, false, Some(false), None),
+            ("gate2", "depth+noqueue")
+        );
+        assert_eq!(leg_class(1, false, None, None), ("gate2", "no-snapshot"));
+        // 0.9.153: with a surface record the gate2
+        // basis names the downstream evidence (or
+        // its recorded absence).
+        assert_eq!(
+            leg_class(1, false, Some(false), Some(true)),
+            ("gate2", "depth+surf")
+        );
+        assert_eq!(leg_class(1, false, None, Some(true)), ("gate2", "surf"));
+        assert_eq!(
+            leg_class(1, false, Some(false), Some(false)),
+            ("gate2", "depth+nosurf")
+        );
+        assert_eq!(leg_class(1, false, None, Some(false)), ("gate2", "nosurf"));
+    }
+
+    // 0.9.153: the spawn gate's decision tree --
+    // the .152 wedge geometry first (two stations,
+    // all frozen, a reverse call queued, guest cap
+    // 15), then each refusal in gate order.
+    #[test]
+    fn spawn_gate_decision_tree() {
+        assert_eq!(
+            spawn_gate(true, false, 0, 2, 15, 100, 4096),
+            SpawnGate::Send
+        );
+        // No queued work: the common case, silent.
+        assert_eq!(
+            spawn_gate(false, false, 0, 2, 15, 100, 4096),
+            SpawnGate::NoTxn
+        );
+        // A station standing ready takes the work
+        // itself; no request is spent.
+        assert_eq!(
+            spawn_gate(true, true, 0, 2, 15, 100, 4096),
+            SpawnGate::Ready
+        );
+        // One request in flight is the whole
+        // allowance, however ripe the moment.
+        assert_eq!(
+            spawn_gate(true, false, 1, 2, 15, 100, 4096),
+            SpawnGate::Outstanding
+        );
+        // Pool at the guest's cap: growth refused.
+        assert_eq!(
+            spawn_gate(true, false, 0, 15, 15, 100, 4096),
+            SpawnGate::Capped
+        );
+        // A fill with no room for the word defers
+        // to the next fill rather than splitting.
+        assert_eq!(
+            spawn_gate(true, false, 0, 2, 15, 4093, 4096),
+            SpawnGate::NoRoom
+        );
+        assert_eq!(
+            spawn_gate(true, false, 0, 2, 15, 4092, 4096),
+            SpawnGate::Send
+        );
+    }
+
+    // 0.9.153: a registration answers an
+    // outstanding spawn request exactly once, in
+    // either command; a repeat registration from a
+    // thread already pooled answers nothing.
+    #[test]
+    fn spawn_satisfy_answers_once() {
+        let mut a = SpawnAcct {
+            outstanding: 1,
+            ..Default::default()
+        };
+        assert!(spawn_satisfy(&mut a, true, false));
+        assert_eq!(a.outstanding, 0);
+        assert_eq!(a.sat_reg, 1);
+        assert!(!spawn_satisfy(&mut a, true, false));
+        a.outstanding = 1;
+        assert!(spawn_satisfy(&mut a, false, false));
+        assert_eq!(a.sat_new, 1);
+        a.outstanding = 1;
+        assert!(!spawn_satisfy(&mut a, false, true));
+        assert_eq!(a.outstanding, 1);
+    }
+
+    // 0.9.153: the queued-work scan sees a whole
+    // transaction behind notice units, nothing in
+    // a notices-only stream, and stops honestly at
+    // a partial tail.
+    #[test]
+    fn inbound_has_txn_walks_units() {
+        let mut bp = BinderProc {
+            file: std::fs::File::open("/dev/null").unwrap(),
+            base: Default::default(),
+            maplen: Default::default(),
+            bump: 0,
+            free: Vec::new(),
+            used: Default::default(),
+            parcels: Default::default(),
+            free_hit: 0,
+            free_nobase: 0,
+            free_stale: 0,
+            free_parcel_hit: 0,
+            free_miss: 0,
+            free_rescued: 0,
+            handles: Default::default(),
+            next_handle: 1,
+            inbound: Vec::new(),
+            queues: Default::default(),
+            loopers: Default::default(),
+        };
+        assert!(!inbound_has_txn(&bp));
+        // BR_NOOP (4B) + BR_DEAD_BINDER (8B): no work.
+        let mut s = Vec::new();
+        s.extend_from_slice(&0x720cu32.to_le_bytes());
+        s.extend_from_slice(&0x8004_720fu32.to_le_bytes());
+        s.extend_from_slice(&0u32.to_le_bytes());
+        bp.inbound = s;
+        assert!(!inbound_has_txn(&bp));
+        // The same notices ahead of a transaction.
+        let mut s = bp.inbound.clone();
+        s.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
+        s.extend_from_slice(&[0u8; 40]);
+        bp.inbound = s;
+        assert!(inbound_has_txn(&bp));
+        // A truncated transaction is not whole work.
+        bp.inbound = BR_TRANSACTION.to_le_bytes().to_vec();
+        assert!(!inbound_has_txn(&bp));
     }
 
     // 0.9.152 (M-c): the sleep join -- an open
