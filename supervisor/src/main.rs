@@ -3195,6 +3195,36 @@ struct CrashLeg {
 /// request refused; no_room counts fills with no
 /// room left for the word. carrier is the last
 /// thread a request rode out on.
+/// 0.9.154 (s10-spawn-target-desk section 3):
+/// sent splits into sent_latched + sent_instant
+/// (sent stays their sum, kept for cross-version
+/// reading). latched counts ripe evaluations at
+/// the delivery seat that set the arena's latch;
+/// the latch IS the outstanding request in its
+/// unsent form -- outstanding is therefore set
+/// when the latch is set, not when the word is
+/// carried -- and latch records that unsent form
+/// itself (printed as latch_pending). The latch
+/// clears at exactly three seats: carriage on a
+/// looper fill, discharge by a registration
+/// (spawn_satisfy: an answer that lands before
+/// the word ever rode a fill answers the request
+/// whole), and the arena-death settlement.
+/// Nothing else clears it -- in particular a
+/// ready station appearing mid-flight does not:
+/// the request was justified by the saturation
+/// that set it, and its worst cost is one extra
+/// station, bounded by the cap and by
+/// outstanding <= 1. excl_mgr counts eligibility
+/// evaluations (at either seat) that stopped on
+/// the manager-slot exclusion. Version line for
+/// held_outst: through 0.9.153 it counted ripe
+/// moments refused at the fill seats by an
+/// outstanding request; from 0.9.154 it counts
+/// latch evaluations at the delivery seat that
+/// stopped on an existing latch, and the instant
+/// seat no longer counts it -- do not read the
+/// two eras' held_outst as one series.
 #[derive(Clone, Copy, Default)]
 struct SpawnAcct {
     sent: u64,
@@ -3205,6 +3235,11 @@ struct SpawnAcct {
     no_room: u64,
     outstanding: u32,
     carrier: i32,
+    latched: u64,
+    sent_latched: u64,
+    sent_instant: u64,
+    excl_mgr: u64,
+    latch: bool,
 }
 
 /// 0.9.153 (s10-152-verify section 2.7): the
@@ -8100,6 +8135,15 @@ fn binder_deliver(
                     );
                     bp.inbound.extend_from_slice(&br_cmd.to_le_bytes());
                     bp.inbound.extend_from_slice(&txn);
+                    // 0.9.154 (s10-spawn-target-desk
+                    // section 3.2): the latch seat --
+                    // ripe is evaluated on the append
+                    // itself, the moment the pooled
+                    // geometry exists, and recorded
+                    // as a latch for the next looper
+                    // fill to carry (see
+                    // maybe_latch_spawn).
+                    maybe_latch_spawn(st, target);
                 }
             }
         }
@@ -8511,12 +8555,180 @@ fn spawn_satisfy(acct: &mut SpawnAcct, is_register: bool, was_looper: bool) -> b
         return false;
     }
     acct.outstanding -= 1;
+    // 0.9.154 (s10-spawn-target-desk section 3.2):
+    // the latch is the outstanding request in its
+    // unsent form, so a registration that answers
+    // the request before the word ever rode a fill
+    // -- the process grew a thread on its own --
+    // discharges the latch with it; the need the
+    // latch recorded has been answered whole.
+    acct.latch = false;
     if is_register {
         acct.sat_reg += 1;
     } else {
         acct.sat_new += 1;
     }
     true
+}
+
+/// 0.9.154 (s10-spawn-target-desk section 2):
+/// the recipient-eligibility key -- an arena is
+/// eligible for BR_SPAWN_LOOPER unless it holds
+/// the context-manager slot. The slot record
+/// (BinderState::mgr_arena) is the protocol
+/// identity itself: written when the arena's
+/// BINDER_SET_CONTEXT_MGR lands, cleared when
+/// that arena dies, so eligibility follows the
+/// current holder and a dead holder's name
+/// excludes nobody. The manager is GB's one
+/// hand-written binder parser; the word is
+/// outside its command set and fatal to it
+/// (s10-153-verify section 1.3). No second key
+/// exists -- cap source, registration channel
+/// and looper registration all coincide across
+/// the manager and the libbinder pools (desk
+/// section 2.2) -- so the definition is a
+/// negative list of exactly this one identity,
+/// not a guess at who looks like libbinder.
+fn spawn_eligible(st: &BinderState, arena: &str) -> bool {
+    st.mgr_arena.as_deref() != Some(arena)
+}
+
+/// A station of `arena` standing ready to take
+/// queued work: parked, a looper of the arena,
+/// and not itself frozen inside a wait of its
+/// own (the discipline predicate's waiting
+/// set). `exclude` names the thread completing
+/// the fill at the emission seat -- it is by
+/// construction not parked, and the scan has
+/// always skipped it; the latch seat passes
+/// None. One definition for both seats (desk
+/// section 3.2: the ready definition carries
+/// over verbatim).
+fn spawn_ready_station(st: &BinderState, arena: &str, exclude: Option<i32>) -> bool {
+    st.parked.keys().any(|q| {
+        Some(*q) != exclude
+            && st
+                .thread_arena
+                .get(q)
+                .map(|a| a == arena)
+                .unwrap_or(false)
+            && st
+                .procs
+                .get(arena)
+                .map(|bp| bp.loopers.contains(q))
+                .unwrap_or(false)
+            && !binder_thread_waiting(st, *q)
+    })
+}
+
+/// 0.9.154 (s10-spawn-target-desk section 3.2):
+/// the latch decision at the delivery seat, in
+/// the same pure shape as spawn_gate: queued
+/// unclaimed work, no station ready, no latch
+/// already standing, and room under the cap for
+/// the station the latch asks for -- the latch
+/// itself is the outstanding request, so the
+/// cap test charges it (pool + 1 < cap: the
+/// spawn_gate invariant pool + outstanding <
+/// cap with the request counted from latch
+/// time, not from send time).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpawnLatch {
+    Set,
+    NoTxn,
+    Ready,
+    AlreadyLatched,
+    Capped,
+}
+
+fn spawn_latch_gate(
+    has_txn: bool,
+    ready: bool,
+    latched: bool,
+    pool: u32,
+    cap: u32,
+) -> SpawnLatch {
+    if !has_txn {
+        return SpawnLatch::NoTxn;
+    }
+    if ready {
+        return SpawnLatch::Ready;
+    }
+    if latched {
+        return SpawnLatch::AlreadyLatched;
+    }
+    if pool + 1 >= cap {
+        return SpawnLatch::Capped;
+    }
+    SpawnLatch::Set
+}
+
+/// 0.9.154 (s10-spawn-target-desk sections 1.8 /
+/// 3.2): the latch seat. Ripe is evaluated where
+/// it is born -- in binder_deliver's pooled arm,
+/// on the append that queues an unclaimed
+/// transaction -- because the 0.9.153 emission
+/// seat is parasitic on the recipient pool's own
+/// looper completing a fill, and a pool in the
+/// wedge geometry completes none: the gate was
+/// never even consulted for system_server (desk
+/// section 1.4). A ripe evaluation sets the
+/// arena's latch (the outstanding request, from
+/// this moment) and prints the latched event;
+/// the next looper fill carries the word (see
+/// maybe_append_spawn). Rejections print nothing
+/// and count nothing -- pooled appends are a
+/// storm-rate event -- except the two the
+/// account names: an evaluation stopped by an
+/// existing latch counts held_outst (its .154
+/// meaning, see SpawnAcct), and one stopped by
+/// the manager-slot exclusion counts excl_mgr.
+/// Read-only over the discipline registries:
+/// this seat writes nothing but its own latch
+/// and account.
+fn maybe_latch_spawn(st: &mut BinderState, arena: &str) {
+    if !spawn_eligible(st, arena) {
+        st.spawn_acct
+            .entry(arena.to_string())
+            .or_default()
+            .excl_mgr += 1;
+        return;
+    }
+    let (has_txn, pool, cap) = {
+        let Some(bp) = st.procs.get(arena) else {
+            return;
+        };
+        (
+            inbound_has_txn(bp),
+            bp.loopers.len() as u32,
+            st.max_threads
+                .get(arena)
+                .copied()
+                .unwrap_or(DEFAULT_MAX_BINDER_THREADS),
+        )
+    };
+    let ready = spawn_ready_station(st, arena, None);
+    let latched = st.spawn_acct.get(arena).map_or(false, |a| a.latch);
+    match spawn_latch_gate(has_txn, ready, latched, pool, cap) {
+        SpawnLatch::Set => {
+            let acct = st.spawn_acct.entry(arena.to_string()).or_default();
+            acct.latch = true;
+            acct.outstanding = 1;
+            acct.latched += 1;
+            bsup!(
+                "binder: spawn-looper latched arena={arena} pool={pool} cap={cap} t={}",
+                field_t_ms()
+            );
+        }
+        SpawnLatch::AlreadyLatched => {
+            st.spawn_acct
+                .entry(arena.to_string())
+                .or_default()
+                .held_outst += 1;
+        }
+        SpawnLatch::NoTxn | SpawnLatch::Ready | SpawnLatch::Capped => {}
+    }
 }
 
 /// 0.9.153: the BR_SPAWN_LOOPER emission seat,
@@ -8534,6 +8746,22 @@ fn spawn_satisfy(acct: &mut SpawnAcct, is_register: bool, was_looper: bool) -> b
 /// asks the process to grow a station for the work
 /// still queued, exactly the reverse-call geometry
 /// s10-152-verify section 2.5 convicted.
+/// 0.9.154 (s10-spawn-target-desk section 3.2):
+/// two roads out of this seat. A standing latch
+/// (set at the delivery seat when the pool was
+/// ripe but no carrier existed) is carried
+/// first, counted sent_latched; with no latch,
+/// the 0.9.153 instant evaluation below runs
+/// unchanged for live pools, counted
+/// sent_instant. The manager-slot eligibility
+/// check heads the seat (desk section 3.1): the
+/// slot holder is never evaluated further, and
+/// the stop counts excl_mgr. A latch with no
+/// room on this fill stays standing and counts
+/// no_room; the instant seat's Outstanding
+/// refusal is silent from this version (the
+/// held_outst column moved to the latch seat,
+/// see SpawnAcct).
 fn maybe_append_spawn(
     st: &mut BinderState,
     arena: &str,
@@ -8541,7 +8769,7 @@ fn maybe_append_spawn(
     bytes: &mut Vec<u8>,
     read_cap: usize,
 ) {
-    let (has_txn, pool, cap) = {
+    let (pool, cap) = {
         let Some(bp) = st.procs.get(arena) else {
             return;
         };
@@ -8549,7 +8777,6 @@ fn maybe_append_spawn(
             return;
         }
         (
-            inbound_has_txn(bp),
             bp.loopers.len() as u32,
             st.max_threads
                 .get(arena)
@@ -8557,53 +8784,77 @@ fn maybe_append_spawn(
                 .unwrap_or(DEFAULT_MAX_BINDER_THREADS),
         )
     };
+    // The eligibility gate heads the seat (desk
+    // section 3.1): the manager-slot holder is
+    // never evaluated further.
+    if !spawn_eligible(st, arena) {
+        st.spawn_acct
+            .entry(arena.to_string())
+            .or_default()
+            .excl_mgr += 1;
+        return;
+    }
+    // A standing latch rides this fill before
+    // any instant evaluation: it was justified
+    // by the saturation that set it, and nothing
+    // about this fill's own moment re-judges it.
+    if st.spawn_acct.get(arena).map_or(false, |a| a.latch) {
+        if bytes.len() + 4 <= read_cap {
+            bytes.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
+            let acct = st.spawn_acct.entry(arena.to_string()).or_default();
+            acct.latch = false;
+            acct.sent += 1;
+            acct.sent_latched += 1;
+            acct.carrier = carrier;
+            bsup!(
+                "binder: spawn-looper sent arena={arena} carrier={carrier} pool={pool} cap={cap} via=latch t={}",
+                field_t_ms()
+            );
+        } else {
+            st.spawn_acct
+                .entry(arena.to_string())
+                .or_default()
+                .no_room += 1;
+        }
+        return;
+    }
+    let has_txn = st
+        .procs
+        .get(arena)
+        .map_or(false, |bp| inbound_has_txn(bp));
     if !has_txn {
         return;
     }
     // A station standing ready makes the request
-    // pointless: parked, a looper of this arena,
-    // and not itself frozen inside a wait of its
-    // own (the discipline predicate's waiting set).
-    let ready = st.parked.keys().any(|q| {
-        *q != carrier
-            && st
-                .thread_arena
-                .get(q)
-                .map(|a| a == arena)
-                .unwrap_or(false)
-            && st
-                .procs
-                .get(arena)
-                .map(|bp| bp.loopers.contains(q))
-                .unwrap_or(false)
-            && !binder_thread_waiting(st, *q)
-    });
+    // pointless (see spawn_ready_station); the
+    // carrier itself is not parked and never
+    // counts as that station.
+    let ready = spawn_ready_station(st, arena, Some(carrier));
     let outstanding = st.spawn_acct.get(arena).map_or(0, |a| a.outstanding);
     match spawn_gate(has_txn, ready, outstanding, pool, cap, bytes.len(), read_cap) {
         SpawnGate::Send => {
             bytes.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
             let acct = st.spawn_acct.entry(arena.to_string()).or_default();
             acct.sent += 1;
+            acct.sent_instant += 1;
             acct.outstanding = 1;
             acct.carrier = carrier;
             bsup!(
-                "binder: spawn-looper sent arena={arena} carrier={carrier} pool={pool} cap={cap} t={}",
+                "binder: spawn-looper sent arena={arena} carrier={carrier} pool={pool} cap={cap} via=instant t={}",
                 field_t_ms()
             );
         }
         SpawnGate::Capped => {
             st.spawn_acct.entry(arena.to_string()).or_default().capped += 1;
         }
-        SpawnGate::Outstanding => {
-            st.spawn_acct
-                .entry(arena.to_string())
-                .or_default()
-                .held_outst += 1;
-        }
         SpawnGate::NoRoom => {
             st.spawn_acct.entry(arena.to_string()).or_default().no_room += 1;
         }
-        SpawnGate::NoTxn | SpawnGate::Ready => {}
+        // 0.9.154: the Outstanding refusal is
+        // silent at this seat -- held_outst is
+        // the latch seat's column now (see
+        // SpawnAcct's version line).
+        SpawnGate::Outstanding | SpawnGate::NoTxn | SpawnGate::Ready => {}
     }
 }
 
@@ -8611,7 +8862,14 @@ fn maybe_append_spawn(
 /// (0.9.153): the parity account plus the pool's
 /// current depth and the cap in force, printed at
 /// the seats the park / thread registry accounts
-/// settle at.
+/// settle at. 0.9.154 adds the latch columns
+/// (s10-spawn-target-desk section 3.5): sent
+/// splits into sent_latched / sent_instant,
+/// latched is the cumulative latch count,
+/// latch_pending is the latch state at this
+/// settlement instant (a tenure end that reads
+/// 1 had a request standing unsent), excl_mgr
+/// counts the eligibility stops.
 fn spawn_looper_account(st: &BinderState, arena: &str) -> String {
     let z = SpawnAcct::default();
     let a = st.spawn_acct.get(arena).unwrap_or(&z);
@@ -8621,14 +8879,19 @@ fn spawn_looper_account(st: &BinderState, arena: &str) -> String {
         None => (DEFAULT_MAX_BINDER_THREADS, "default"),
     };
     format!(
-        "binder: arena {arena} spawn-looper account: sent={} sat_reg={} sat_new={} capped={} held_outst={} no_room={} outstanding={} carrier={} pool={pool} cap={cap} cap_src={cap_src} t={}",
+        "binder: arena {arena} spawn-looper account: sent={} sent_latched={} sent_instant={} sat_reg={} sat_new={} capped={} held_outst={} no_room={} outstanding={} latch_pending={} latched={} excl_mgr={} carrier={} pool={pool} cap={cap} cap_src={cap_src} t={}",
         a.sent,
+        a.sent_latched,
+        a.sent_instant,
         a.sat_reg,
         a.sat_new,
         a.capped,
         a.held_outst,
         a.no_room,
         a.outstanding,
+        a.latch as u32,
+        a.latched,
+        a.excl_mgr,
         a.carrier,
         field_t_ms()
     )
@@ -14380,6 +14643,15 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         // 0.9.153: the spawn-looper account settles
         // at the same seat.
         bsup!("{}", spawn_looper_account(st, arena));
+        // 0.9.154 (s10-spawn-target-desk section
+        // 3.2): the latch dies with the arena --
+        // cleared here, after the settlement line
+        // above has read it into latch_pending, so
+        // a standing request can never outlive its
+        // pool into a recycled arena name.
+        if let Some(a) = st.spawn_acct.get_mut(arena) {
+            a.latch = false;
+        }
     }
     // 0.9.118 death inventory (telemetry only: reads
     // state, changes nothing; ported from 0.9.116). When
@@ -21270,6 +21542,256 @@ mod tests {
         a.outstanding = 1;
         assert!(!spawn_satisfy(&mut a, false, true));
         assert_eq!(a.outstanding, 1);
+    }
+
+    // 0.9.154 test fixtures: a proc record with
+    // the given looper set and inbound stream,
+    // and one whole pooled transaction unit.
+    fn spawn_test_proc(loopers: &[i32], inbound: Vec<u8>) -> BinderProc {
+        let mut bp = BinderProc {
+            file: std::fs::File::open("/dev/null").unwrap(),
+            base: Default::default(),
+            maplen: Default::default(),
+            bump: 0,
+            free: Vec::new(),
+            used: Default::default(),
+            parcels: Default::default(),
+            free_hit: 0,
+            free_nobase: 0,
+            free_stale: 0,
+            free_parcel_hit: 0,
+            free_miss: 0,
+            free_rescued: 0,
+            handles: Default::default(),
+            next_handle: 1,
+            inbound: Vec::new(),
+            queues: Default::default(),
+            loopers: Default::default(),
+        };
+        bp.loopers = loopers.iter().copied().collect();
+        bp.inbound = inbound;
+        bp
+    }
+
+    fn pooled_txn() -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
+        s.resize(44, 0);
+        s
+    }
+
+    // 0.9.154: the latch gate's decision tree --
+    // the .152 geometry first (two stations, none
+    // ready, a reverse call pooled, guest cap
+    // 15), then each refusal in gate order. The
+    // cap test charges the latch itself: pool 14
+    // at cap 15 leaves no room for the station
+    // the latch asks for, pool 13 does.
+    #[test]
+    fn spawn_latch_gate_decision_tree() {
+        assert_eq!(
+            spawn_latch_gate(true, false, false, 2, 15),
+            SpawnLatch::Set
+        );
+        assert_eq!(
+            spawn_latch_gate(false, false, false, 2, 15),
+            SpawnLatch::NoTxn
+        );
+        assert_eq!(
+            spawn_latch_gate(true, true, false, 2, 15),
+            SpawnLatch::Ready
+        );
+        assert_eq!(
+            spawn_latch_gate(true, false, true, 2, 15),
+            SpawnLatch::AlreadyLatched
+        );
+        assert_eq!(
+            spawn_latch_gate(true, false, false, 14, 15),
+            SpawnLatch::Capped
+        );
+        assert_eq!(
+            spawn_latch_gate(true, false, false, 13, 15),
+            SpawnLatch::Set
+        );
+    }
+
+    // 0.9.154: the manager-slot holder is
+    // excluded at both seats however ripe its
+    // moment, each stop counts excl_mgr, and the
+    // exclusion follows the slot record alone:
+    // cleared (the holder died), the same arena
+    // name is eligible again.
+    #[test]
+    fn spawn_exclusion_follows_manager_slot() {
+        let mut st = BinderState::default();
+        st.procs
+            .insert("mgr".to_string(), spawn_test_proc(&[111], pooled_txn()));
+        st.mgr_arena = Some("mgr".to_string());
+        maybe_latch_spawn(&mut st, "mgr");
+        let a = st.spawn_acct.get("mgr").unwrap();
+        assert_eq!(a.excl_mgr, 1);
+        assert!(!a.latch);
+        assert_eq!(a.latched, 0);
+        let mut bytes = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "mgr", 111, &mut bytes, 4096);
+        let a = st.spawn_acct.get("mgr").unwrap();
+        assert_eq!(a.excl_mgr, 2);
+        assert_eq!(a.sent, 0);
+        assert_eq!(bytes.len(), 8);
+        // The holder died; the slot cleared. The
+        // name excludes nobody now, and the same
+        // pooled geometry latches as any pool's.
+        st.mgr_arena = None;
+        maybe_latch_spawn(&mut st, "mgr");
+        let a = st.spawn_acct.get("mgr").unwrap();
+        assert!(a.latch);
+        assert_eq!(a.latched, 1);
+        assert_eq!(a.excl_mgr, 2);
+    }
+
+    // 0.9.154: a latch set at the delivery seat
+    // is carried by the arena's next looper fill
+    // (counted sent_latched); a second latch
+    // evaluation while it stands counts
+    // held_outst; the registration then answers
+    // the carried request as before.
+    #[test]
+    fn spawn_latch_carried_by_next_fill() {
+        let mut st = BinderState::default();
+        st.procs
+            .insert("ss".to_string(), spawn_test_proc(&[201, 202], pooled_txn()));
+        maybe_latch_spawn(&mut st, "ss");
+        let a = st.spawn_acct.get("ss").unwrap();
+        assert!(a.latch);
+        assert_eq!(a.outstanding, 1);
+        assert_eq!(a.latched, 1);
+        maybe_latch_spawn(&mut st, "ss");
+        assert_eq!(st.spawn_acct.get("ss").unwrap().held_outst, 1);
+        // A non-looper cannot carry.
+        let mut bytes = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "ss", 999, &mut bytes, 4096);
+        assert_eq!(bytes.len(), 8);
+        assert!(st.spawn_acct.get("ss").unwrap().latch);
+        // The next looper fill carries the word.
+        maybe_append_spawn(&mut st, "ss", 201, &mut bytes, 4096);
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(u32_at(&bytes, 8), BR_SPAWN_LOOPER);
+        let a = st.spawn_acct.get("ss").unwrap();
+        assert!(!a.latch);
+        assert_eq!(a.sent, 1);
+        assert_eq!(a.sent_latched, 1);
+        assert_eq!(a.sent_instant, 0);
+        assert_eq!(a.outstanding, 1);
+        assert_eq!(a.carrier, 201);
+        // The registration answers it.
+        let acct = st.spawn_acct.get_mut("ss").unwrap();
+        assert!(spawn_satisfy(acct, true, false));
+        assert_eq!(acct.outstanding, 0);
+        assert_eq!(acct.sat_reg, 1);
+    }
+
+    // 0.9.154: a ready station appearing while
+    // a latch stands does not clear it (desk
+    // section 3.2: the request was justified by
+    // the saturation that set it) -- the fresh
+    // evaluation is refused by the station, the
+    // standing latch is untouched, and it still
+    // rides the next fill.
+    #[test]
+    fn spawn_latch_survives_ready_station() {
+        let mut st = BinderState::default();
+        st.procs
+            .insert("ss".to_string(), spawn_test_proc(&[201, 202], pooled_txn()));
+        maybe_latch_spawn(&mut st, "ss");
+        assert!(st.spawn_acct.get("ss").unwrap().latch);
+        // Station 202 parks, ready.
+        st.thread_arena.insert(202, "ss".to_string());
+        st.parked.insert(
+            202,
+            ParkedIoctl {
+                bwr: 0,
+                read_buf: 0,
+                read_size: 128,
+                write_consumed: 0,
+            },
+        );
+        maybe_latch_spawn(&mut st, "ss");
+        let a = st.spawn_acct.get("ss").unwrap();
+        assert!(a.latch);
+        assert_eq!(a.latched, 1);
+        assert_eq!(a.held_outst, 0);
+        let mut bytes = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "ss", 201, &mut bytes, 4096);
+        let a = st.spawn_acct.get("ss").unwrap();
+        assert_eq!(a.sent_latched, 1);
+        assert_eq!(a.sent_instant, 0);
+    }
+
+    // 0.9.154: a latch whose fill has no room
+    // stays standing and counts no_room; the
+    // next roomy fill carries it.
+    #[test]
+    fn spawn_latch_waits_out_a_full_fill() {
+        let mut st = BinderState::default();
+        st.procs
+            .insert("ss".to_string(), spawn_test_proc(&[201], pooled_txn()));
+        maybe_latch_spawn(&mut st, "ss");
+        let mut full = vec![0u8; 4096];
+        maybe_append_spawn(&mut st, "ss", 201, &mut full, 4096);
+        let a = st.spawn_acct.get("ss").unwrap();
+        assert!(a.latch);
+        assert_eq!(a.no_room, 1);
+        assert_eq!(a.sent, 0);
+        let mut bytes = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "ss", 201, &mut bytes, 4096);
+        assert_eq!(st.spawn_acct.get("ss").unwrap().sent_latched, 1);
+    }
+
+    // 0.9.154: with no latch standing, the
+    // instant road still fires for a live pool
+    // (counted sent_instant), and an unanswered
+    // instant request makes the next ripe fill
+    // silent -- the .153 held_outst count at
+    // this seat is gone (the column belongs to
+    // the latch seat now).
+    #[test]
+    fn spawn_instant_road_unchanged_for_live_pool() {
+        let mut st = BinderState::default();
+        st.procs
+            .insert("sf".to_string(), spawn_test_proc(&[301], pooled_txn()));
+        let mut bytes = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "sf", 301, &mut bytes, 4096);
+        let a = st.spawn_acct.get("sf").unwrap();
+        assert_eq!(a.sent, 1);
+        assert_eq!(a.sent_instant, 1);
+        assert_eq!(a.sent_latched, 0);
+        assert_eq!(a.outstanding, 1);
+        let mut bytes2 = vec![0u8; 8];
+        maybe_append_spawn(&mut st, "sf", 301, &mut bytes2, 4096);
+        let a = st.spawn_acct.get("sf").unwrap();
+        assert_eq!(a.sent, 1);
+        assert_eq!(a.held_outst, 0);
+        assert_eq!(bytes2.len(), 8);
+    }
+
+    // 0.9.154: a registration answering a
+    // request whose latch never rode a fill
+    // discharges the latch with the request --
+    // the process grew a thread on its own, and
+    // the need the latch recorded is answered
+    // whole (desk section 3.2's discharge note).
+    #[test]
+    fn spawn_satisfy_discharges_standing_latch() {
+        let mut a = SpawnAcct {
+            outstanding: 1,
+            latch: true,
+            latched: 1,
+            ..Default::default()
+        };
+        assert!(spawn_satisfy(&mut a, false, false));
+        assert_eq!(a.outstanding, 0);
+        assert!(!a.latch);
+        assert_eq!(a.sat_new, 1);
     }
 
     // 0.9.153: the queued-work scan sees a whole
