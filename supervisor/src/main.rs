@@ -13316,6 +13316,46 @@ fn vma_range(pid: i32, addr: u64) -> Option<(u64, u64, String, String)> {
     None
 }
 
+/// The SetupCodeCache narrowing shape (0.9.156,
+/// s10-sigsegv-desk section 3.4 branch A, split by
+/// the errno evidence in s10-155-verify section
+/// 1.2: both field failures of this shape returned
+/// EACCES, ENOMEM none): a compat mprotect whose
+/// target VMA is a virtual-ashmem region file,
+/// whose page-rounded range is exactly that whole
+/// VMA, whose current perms are the born-RWX
+/// private state, and whose requested prot is
+/// exactly PROT_READ|PROT_EXEC -- the one-shot
+/// RWX -> RX narrowing dvmCompilerSetupCodeCache
+/// ends JIT code-cache setup with. Pure: the
+/// caller supplies the VMA facts it already read.
+///
+/// The whole-VMA term is the isolation key against
+/// the JIT per-method 7->5 flips, which share the
+/// mprotect entry branch but only ever cover
+/// subranges of the cache; the perms term keeps
+/// shared regions (their maps line carries 's',
+/// never 'p', in the fourth perms slot) and
+/// already-narrowed VMAs out. Nothing else is a
+/// hit: every other mprotect keeps the pre-0.9.156
+/// path byte for byte.
+fn ashmem_rx_narrow_shape(
+    prot: u64,
+    page_start: u64,
+    page_end: u64,
+    vlo: u64,
+    vhi: u64,
+    perms: &str,
+    path: &str,
+) -> bool {
+    prot == 0x5
+        && perms == "rwxp"
+        && page_end > page_start
+        && page_start == vlo
+        && page_end == vhi
+        && path.contains("/.ashmem/")
+}
+
 /// Ride an anonymous MAP_FIXED mmap over [addr,
 /// addr+len) in the stopped tracee, in the style of
 /// inject_openat: overwrite the current syscall's
@@ -18663,13 +18703,61 @@ fn tracer_loop(ctx: TracerCtx) {
                     let page_start = addr & !0xfff;
                     let page_end = (addr + len + 0xfff) & !0xfff;
                     let mut handled = false;
+                    let mut synthesized = false;
                     if page_end > page_start
                         && page_end - page_start <= (8 << 20)
                     {
-                        if let Some((vlo, vhi, _p, path)) =
+                        if let Some((vlo, vhi, perms, path)) =
                             vma_range(pid, addr)
                         {
-                            if path.contains("/.ashmem/")
+                            if ashmem_rx_narrow_shape(
+                                prot, page_start, page_end, vlo, vhi,
+                                &perms, &path,
+                            ) {
+                                // 0.9.156 (s10-sigsegv-desk
+                                // section 3.4 branch A):
+                                // the SetupCodeCache
+                                // narrowing. This VMA was
+                                // born RWX through this
+                                // mediation, so its real
+                                // perms already cover the
+                                // requested RX state; the
+                                // narrowing is a guest-view
+                                // formality the conversion
+                                // ride below can only break
+                                // (both 0.9.155 field
+                                // failures of this shape
+                                // were ride failures
+                                // answered -13, and GB
+                                // treats that -1 as fatal:
+                                // dvmCompilerSetupCodeCache
+                                // aborts). Synthesize
+                                // success through the
+                                // standard inject path --
+                                // the syscall is cancelled,
+                                // 0 lands at the exit stop,
+                                // and the pend.mprot /
+                                // last-mprotect memo /
+                                // EXEC tracking bookkeeping
+                                // records the narrowing
+                                // exactly as a native
+                                // success, with the desc
+                                // marker below naming the
+                                // synthesis. The host
+                                // mapping keeps its born
+                                // perms, a superset of the
+                                // guest's request, owned
+                                // by this mediation. The
+                                // shape key (see
+                                // ashmem_rx_narrow_shape)
+                                // cannot hit the per-method
+                                // flips that share this
+                                // branch: they are never
+                                // whole-VMA.
+                                skip_syscall(pid, &mut regs, &mut pend, 0);
+                                dirty = true;
+                                synthesized = true;
+                            } else if path.contains("/.ashmem/")
                                 && page_start >= vlo
                                 && page_end <= vhi
                             {
@@ -18725,7 +18813,13 @@ fn tracer_loop(ctx: TracerCtx) {
                     }
                     pend.desc = Some(format!(
                         "mprotect EXEC addr=0x{addr:x} len={len} prot={prot:#x}{}",
-                        if handled { " (ashmem conversion attempted)" } else { "" }
+                        if synthesized {
+                            " (ashmem RX narrowing synthesized)"
+                        } else if handled {
+                            " (ashmem conversion attempted)"
+                        } else {
+                            ""
+                        }
                     ));
                 } else if is_stat_family(proc.compat, nr) {
                     // 0.9.149 (S10 F2): the stat family
@@ -22634,5 +22728,96 @@ mod tests {
             mprot_memo_str(Some(&m)),
             "addr=0x1000 len=8192 prot=0x5 ret=-1 errno=13"
         );
+    }
+
+    // 0.9.156 (s10-sigsegv-desk section 3.4
+    // branch A): the SetupCodeCache narrowing
+    // shape hits on the field's own numbers --
+    // the two 0.9.155 failures were whole-1MiB
+    // RWX -> RX narrowings over the process's
+    // virtual-ashmem region VMA (media's cache
+    // at 0xe5371000, len 1048576, prot 0x5).
+    #[test]
+    fn ashmem_rx_narrow_hits_setup_code_cache_shape() {
+        let path = "/data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/.ashmem/a19281-3";
+        assert!(ashmem_rx_narrow_shape(
+            0x5,
+            0xe5371000,
+            0xe5471000,
+            0xe5371000,
+            0xe5471000,
+            "rwxp",
+            path,
+        ));
+        assert!(ashmem_rx_narrow_shape(
+            0x5,
+            0xe567b000,
+            0xe577b000,
+            0xe567b000,
+            0xe577b000,
+            "rwxp",
+            path,
+        ));
+    }
+
+    // 0.9.156: the neighbouring shapes must NOT
+    // hit -- each of these keeps the pre-fix path
+    // byte for byte. The subrange case is the
+    // isolation key for the JIT per-method flips
+    // sharing the entry branch.
+    #[test]
+    fn ashmem_rx_narrow_misses_neighbour_shapes() {
+        let path = "/data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/.ashmem/a19281-3";
+        let (vlo, vhi) = (0xe5371000u64, 0xe5471000u64);
+        // Per-method flip: a subrange of the cache.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, 0xe5374000, 0xe5375000, vlo, vhi, "rwxp", path,
+        ));
+        // Range starting at the base but short of
+        // the end, and one running past the end.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vhi - 0x1000, vlo, vhi, "rwxp", path,
+        ));
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vhi + 0x1000, vlo, vhi, "rwxp", path,
+        ));
+        // Whole VMA but the flip target is RWX
+        // (an expansion back, not the narrowing)
+        // or RW (no exec; never reaches the branch,
+        // and the predicate must not hit either).
+        assert!(!ashmem_rx_narrow_shape(
+            0x7, vlo, vhi, vlo, vhi, "rwxp", path,
+        ));
+        assert!(!ashmem_rx_narrow_shape(
+            0x3, vlo, vhi, vlo, vhi, "rwxp", path,
+        ));
+        // Already narrowed once: perms no longer
+        // the born-RWX state.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vhi, vlo, vhi, "r-xp", path,
+        ));
+        // Shared region (surface heap): the maps
+        // perms carry 's', never 'p'.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vhi, vlo, vhi, "rwxs", path,
+        ));
+        // Whole-VMA RX narrowing, but the backing
+        // is not a virtual-ashmem region file.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5,
+            vlo,
+            vhi,
+            vlo,
+            vhi,
+            "rwxp",
+            "/data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/system/lib/libdvm.so",
+        ));
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vhi, vlo, vhi, "rwxp", "",
+        ));
+        // Empty range.
+        assert!(!ashmem_rx_narrow_shape(
+            0x5, vlo, vlo, vlo, vhi, "rwxp", path,
+        ));
     }
 }
