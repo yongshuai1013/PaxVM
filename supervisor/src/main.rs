@@ -584,6 +584,22 @@ impl Regs {
             Regs::A32(r) => r.uregs[15] as u64,
         }
     }
+    /// Link register (x30 / r14). Read only by the
+    /// 0.9.155 full FATAL regdump.
+    fn lr(&self) -> u64 {
+        match self {
+            Regs::A64(r) => r.regs[30],
+            Regs::A32(r) => r.uregs[14] as u64,
+        }
+    }
+    /// Processor state (pstate / cpsr). Read only by
+    /// the 0.9.155 full FATAL regdump.
+    fn cpsr(&self) -> u64 {
+        match self {
+            Regs::A64(r) => r.pstate,
+            Regs::A32(r) => r.uregs[16] as u64,
+        }
+    }
     fn set_pc(&mut self, v: u64) {
         match self {
             Regs::A64(r) => r.pc = v,
@@ -622,6 +638,29 @@ impl Regs {
             Regs::A32(r) => r.uregs[7] = v as u32,
         }
     }
+}
+
+/// 0.9.155 (s10-sigsegv-desk section 5.3 item 1):
+/// the FATAL line's register dump, expanded to the
+/// full group r0-r12 + lr + cpsr. The pre-0.9.155
+/// dump carried only r0-r3 + sp, which left the
+/// RefBase seats' fault target recoverable only
+/// indirectly through the sp window frame -- the
+/// desk's named fragility. Pure formatting of the
+/// register set get_regs already fetched; nothing
+/// here feeds any decision.
+fn fatal_regdump(r: &Regs) -> String {
+    let mut s = String::new();
+    for i in 0..=12usize {
+        s += &format!(" r{}=0x{:x}", i, r.arg(i));
+    }
+    s += &format!(
+        " lr=0x{:x} cpsr=0x{:x} sp=0x{:x}",
+        r.lr(),
+        r.cpsr(),
+        r.sp()
+    );
+    s
 }
 
 /// The guest binary's personality, from its ELF header: EI_CLASS
@@ -1247,10 +1286,13 @@ struct Pending {
     /// length). At the exit stop the returned address becomes
     /// the arena base for this thread.
     mmap_binder: Option<(String, u32)>,
-    /// A compat mprotect in flight: (addr, prot). The exit
+    /// A compat mprotect in flight: (addr, len, prot). The exit
     /// stop names the target VMA when the host refuses the
-    /// call (0.9.31 telemetry).
-    mprot: Option<(u64, u64)>,
+    /// call (0.9.31 telemetry). The len joined in 0.9.155:
+    /// the per-thread last-mprotect memo the dvmabort
+    /// FATAL batch reads (s10-sigsegv-desk section
+    /// 5.3 item 3) carries the full call shape.
+    mprot: Option<(u64, u64, u64)>,
     /// 0.9.140 (s9-140-desk-ignition M1): a futex of the
     /// WAIT family (WAIT / WAIT_BITSET) seen at this
     /// call's entry stop: (uaddr, op, val) exactly as the
@@ -1265,6 +1307,39 @@ struct Pending {
     /// (WAKE / WAKE_BITSET): (uaddr, nr_wake). See
     /// last_futex.
     last_wake: Option<(u32, u32)>,
+}
+
+/// 0.9.155 (s10-sigsegv-desk section 5.3 item 3):
+/// one thread's most recent completed compat
+/// mprotect, kept per ProcState so the dvmabort
+/// FATAL batch can name the exact call the JIT
+/// code-cache setup died behind (the seat-three
+/// trigger is an mprotect RWX->RX narrowing
+/// returning -1; its errno splits the fix between
+/// the mediation's prot synthesis and the virtual
+/// ashmem size ledger). errno is the guest-visible
+/// one: -ret when ret is a -errno, else 0.
+/// Telemetry only -- written at the mprotect exit
+/// seat, read only by the FATAL batch.
+#[derive(Clone, Copy)]
+struct MprotRec {
+    addr: u64,
+    len: u64,
+    prot: u64,
+    ret: i64,
+    errno: i64,
+}
+
+/// Format one thread's last-mprotect memo for the
+/// dvmabort FATAL batch (see MprotRec).
+fn mprot_memo_str(m: Option<&MprotRec>) -> String {
+    match m {
+        Some(m) => format!(
+            "addr=0x{:x} len={} prot=0x{:x} ret={} errno={}",
+            m.addr, m.len, m.prot, m.ret, m.errno
+        ),
+        None => "none".to_string(),
+    }
 }
 
 struct ProcState {
@@ -1289,6 +1364,10 @@ struct ProcState {
     /// bytes the guest was consuming can be compared against
     /// the batches the supervisor assembled.
     last_binder_read: Option<(u32, u32)>,
+    /// 0.9.155: this thread's most recent completed
+    /// compat mprotect (see MprotRec). Telemetry
+    /// only.
+    last_mprotect: Option<MprotRec>,
     /// 0.9.108: consecutive pre-entry SIGSYS swallows for
     /// this tracee (reset when an entry stop assigns a
     /// fresh pending record). A cap keeps a pathological
@@ -1657,6 +1736,7 @@ impl ProcState {
             shard_decided: false,
             exec_armed: false,
             last_binder_read: None,
+            last_mprotect: None,
             sigsys_preentry: 0,
             win: WinProfile::default(),
             last_stop_seq: 0,
@@ -2756,6 +2836,27 @@ struct BinderNode {
     /// outstanding handles to it dead-reply, and a fresh
     /// registration creates a new node (S5c)
     dead: bool,
+    /// 0.9.155 (s10-sigsegv-desk section 5.3 item
+    /// 2c): this registration's stamp on the
+    /// coordinator's node-event sequence (see
+    /// BinderState::node_event_seq), and the same
+    /// sequence's stamp when the node was marked
+    /// dead (0 while alive). One shared sequence
+    /// space, so a ledger line can order a node's
+    /// birth, death and any re-registration of the
+    /// same identity against each other. Telemetry
+    /// only -- written at registration and at the
+    /// proc-exit death marking, read only by the
+    /// FATAL node-ledger dump.
+    reg_seq: u64,
+    dead_seq: u64,
+    /// 0.9.155: transactions successfully delivered
+    /// to this node (binder_send_txn's deliver
+    /// succeeded). Telemetry only, read only by
+    /// the FATAL node-ledger dump -- the verdict
+    /// tree's "this cookie served fine N times
+    /// before" fact.
+    deliveries: u64,
 }
 
 struct ParkedIoctl {
@@ -3394,6 +3495,15 @@ struct ThreadAcct {
 struct BinderState {
     procs: HashMap<String, BinderProc>,
     nodes: Vec<BinderNode>,
+    /// 0.9.155: the coordinator's node-event
+    /// sequence -- bumped on every node
+    /// registration and every node death marking,
+    /// stamped onto the node both times (see
+    /// BinderNode::reg_seq). Telemetry only, like
+    /// claim_seq: written at the two event seats,
+    /// printed by the FATAL node-ledger dump,
+    /// never read by any decision.
+    node_event_seq: u64,
     mgr_arena: Option<String>,
     mgr_node: Option<usize>,
     parked: HashMap<i32, ParkedIoctl>,
@@ -4142,11 +4252,16 @@ impl BinderState {
         }) {
             return i;
         }
+        self.node_event_seq += 1;
+        let reg_seq = self.node_event_seq;
         self.nodes.push(BinderNode {
             owner: owner.to_string(),
             ptr,
             cookie,
             dead: false,
+            reg_seq,
+            dead_seq: 0,
+            deliveries: 0,
         });
         let id = self.nodes.len() - 1;
         bsup!(
@@ -4282,6 +4397,14 @@ const MSG_REQ_FATAL_DUMP: u8 = 11;
 // because the tracer joins them against its own
 // futex tables before printing.
 const MSG_REQ_CRASH_LEGS: u8 = 12;
+// 0.9.155 (s10-sigsegv-desk section 5.3 item
+// 2c): at a RefBase-seat FATAL the tracer hands
+// the coordinator the fatal transaction's
+// (target ptr, cookie); the reply carries the
+// node-ledger lines for that identity in the
+// dying thread's arena, for in-order replay
+// beside the FATAL line like the fatal dump.
+const MSG_REQ_FATAL_NODE: u8 = 13;
 const MSG_ONEWAY_HANDOFF: u8 = 25;
 const MSG_ONEWAY_REGISTER_PID: u8 = 26;
 const MSG_ONEWAY_UNREGISTER_PID: u8 = 27;
@@ -4336,6 +4459,7 @@ const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
 const MSG_RESP_FATAL_DUMP: u8 = 111;
 const MSG_RESP_CRASH_LEGS: u8 = 112;
+const MSG_RESP_FATAL_NODE: u8 = 113;
 const MSG_RESP_ACTIONS: u8 = 101;
 const MSG_RESP_COMPLETE: u8 = 102;
 const MSG_RESP_THREAD_EXIT: u8 = 103;
@@ -5186,6 +5310,29 @@ impl CoordClient {
         e.u32(apk_scanned);
         e.string(last_apk);
         let p = self.rpc(MSG_REQ_FATAL_DUMP, &e.0, MSG_RESP_FATAL_DUMP);
+        let mut d = Dec::new(&p);
+        d.logs()
+    }
+
+    /// 0.9.155 (s10-sigsegv-desk section 5.3 item
+    /// 2c): ask the coordinator for the node-ledger
+    /// lines of one (target ptr, cookie) identity
+    /// in the dying thread's arena; the coordinator
+    /// resolves the arena from the pid itself. The
+    /// reply carries the captured lines for
+    /// in-order replay beside the FATAL line,
+    /// exactly like fatal_dump.
+    fn fatal_node(
+        &mut self,
+        pid: i32,
+        ptr: u32,
+        cookie: u32,
+    ) -> Vec<(String, String)> {
+        let mut e = Enc::new();
+        e.i32(pid);
+        e.u32(ptr);
+        e.u32(cookie);
+        let p = self.rpc(MSG_REQ_FATAL_NODE, &e.0, MSG_RESP_FATAL_NODE);
         let mut d = Dec::new(&p);
         d.logs()
     }
@@ -6849,6 +6996,16 @@ impl CoordServer {
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 self.send_to(ci, MSG_RESP_FATAL_DUMP, &e.0);
+            }
+            MSG_REQ_FATAL_NODE => {
+                let pid = d.i32();
+                let ptr = d.u32();
+                let cookie = d.u32();
+                cap_clear();
+                binder_fatal_node(&self.st, pid, ptr, cookie);
+                let mut e = Enc::new();
+                e.logs(&cap_take());
+                self.send_to(ci, MSG_RESP_FATAL_NODE, &e.0);
             }
             MSG_REQ_CRASH_LEGS => {
                 // 0.9.152 (s10-frontdoor-desk section
@@ -9477,6 +9634,70 @@ fn binder_fatal_dump(
     );
 }
 
+/// 0.9.155 (s10-sigsegv-desk section 5.3 item
+/// 2c): the node-ledger lines for one fatal
+/// transaction's (target ptr, cookie), read off
+/// the coordinator's ledger in the dying thread's
+/// arena. Formatted by a pure helper so the line
+/// shape is unit-testable; binder_fatal_node
+/// prints them. The fields are the verdict
+/// tree's: registration order and generation
+/// (which registration of this identity, and
+/// whether it is the live one), the death stamp,
+/// and the cumulative delivery count. An absent
+/// identity and an unknown arena print as their
+/// own lines -- all three shapes are verdict
+/// inputs, not errors.
+fn fatal_node_lines(
+    st: &BinderState,
+    pid: i32,
+    ptr: u32,
+    cookie: u32,
+) -> Vec<String> {
+    let Some(arena) = st.thread_arena.get(&pid) else {
+        return vec![format!(
+            "binder: fatal-node pid={pid} ptr=0x{ptr:x} cookie=0x{cookie:x} ledger=arena-unknown"
+        )];
+    };
+    let matches: Vec<usize> = st
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.owner == *arena && n.ptr == ptr && n.cookie == cookie)
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        return vec![format!(
+            "binder: fatal-node pid={pid} ptr=0x{ptr:x} cookie=0x{cookie:x} ledger=absent arena={arena}"
+        )];
+    }
+    matches
+        .iter()
+        .enumerate()
+        .map(|(rank, &i)| {
+            let n = &st.nodes[i];
+            format!(
+                "binder: fatal-node pid={pid} node#{i} arena={arena} ptr=0x{ptr:x} cookie=0x{cookie:x} gen={} reg_seq={} dead={} dead_seq={} deliveries={}",
+                rank + 1,
+                n.reg_seq,
+                n.dead as u8,
+                n.dead_seq,
+                n.deliveries
+            )
+        })
+        .collect()
+}
+
+/// The printing half of the 0.9.155 node-ledger
+/// query (see fatal_node_lines), assembled at
+/// the tracer's request (MSG_REQ_FATAL_NODE) and
+/// replayed beside the FATAL line.
+fn binder_fatal_node(st: &BinderState, pid: i32, ptr: u32, cookie: u32) {
+    for line in fatal_node_lines(st, pid, ptr, cookie) {
+        bsup!("{line}");
+    }
+}
+
 /// 0.9.140 (M2): the first outstanding wait one
 /// thread owns as sender, wherever it currently
 /// lives -- the shared per-target queues, or claimed
@@ -12056,6 +12277,25 @@ fn binder_send_txn(
         None,
     );
     let delivered_off = delivered.as_ref().ok().copied();
+    // 0.9.155 (s10-sigsegv-desk section 5.3 item
+    // 2c): the node's cumulative delivery count,
+    // credited only on a successful deliver and
+    // resolved back to the one live node of this
+    // identity (the caller resolved exactly it by
+    // handle and checked it alive; at most one
+    // live node of an (owner, ptr, cookie) exists,
+    // node_for_local reuses it). Counter only --
+    // nothing reads it but the FATAL node-ledger
+    // dump.
+    if delivered_off.is_some() {
+        if let Some(n) = st
+            .nodes
+            .iter_mut()
+            .find(|n| !n.dead && n.owner == owner && n.ptr == nptr && n.cookie == ncookie)
+        {
+            n.deliveries += 1;
+        }
+    }
     if let Err(why) = delivered {
         if let Some(bp) = st.procs.get_mut(arena) {
             bp.push_to(pid, &BR_DEAD_REPLY.to_le_bytes());
@@ -14959,6 +15199,11 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     for (i, n) in st.nodes.iter_mut().enumerate() {
         if n.owner == arena && !n.dead {
             n.dead = true;
+            // 0.9.155: the death marking takes the
+            // next node-event stamp (see
+            // BinderNode::dead_seq). Telemetry only.
+            st.node_event_seq += 1;
+            n.dead_seq = st.node_event_seq;
             dead_nodes.push(i);
         }
     }
@@ -16954,6 +17199,154 @@ fn wedge_snapshot(
 /// here, in order, straight after the snapshot lines.
 /// The holder the coordinator's provisional verdict
 /// names is kept for the traces harvest (M5).
+/// 0.9.155 (s10-sigsegv-desk section 5.3 item
+/// 2): name a FATAL's seat when its pc lands in
+/// one of the two RefBase ranges the desk fixed
+/// -- android_atomic_add's body in libcutils
+/// (0x4a00-0x4a40, seat one) or RefBase::
+/// incStrong's body in libutils (0x14cc9-0x14cf5,
+/// seat two). The offset is taken against the
+/// lowest mapping of the containing library, the
+/// same load-base convention fatal_form's key
+/// was derived with. Read-only maps inspection
+/// of the stopped tracee; prints nothing itself.
+fn fatal_seat(pid: i32, pc: u64) -> Option<(&'static str, u64)> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    let mut ranges: Vec<(u64, u64, String)> = Vec::new();
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let Some(range) = it.next() else { continue };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+        let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+        let name = line
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        ranges.push((lo, hi, name));
+    }
+    let (_, _, libname) = ranges.iter().find(|(lo, hi, _)| pc >= *lo && pc < *hi)?;
+    let base = ranges
+        .iter()
+        .filter(|(_, _, n)| n == libname && !n.is_empty())
+        .map(|(lo, _, _)| *lo)
+        .min()?;
+    let off = pc - base;
+    match (libname.as_str(), off) {
+        ("libcutils.so", 0x4a00..0x4a40) => Some(("atomic", off)),
+        ("libutils.so", 0x14cc9..0x14cf5) => Some(("incstrong", off)),
+        _ => None,
+    }
+}
+
+/// One BR_TRANSACTION unit decoded from a tracee
+/// read fill (see fatal_txn_select).
+struct FatalTxn {
+    target: u32,
+    cookie: u32,
+    code: u32,
+    sender: i32,
+}
+
+/// 0.9.155 (s10-sigsegv-desk section 5.3 item
+/// 2a): choose the fatal transaction out of the
+/// dying thread's last binder read fill -- the
+/// desk's prescribed cookie source. Walked with
+/// the same advance rules as every other stream
+/// consumer. The selection is named in the
+/// printout (the `how` of the return): a unit
+/// whose cookie equals the faulting thread's
+/// `this` (r0 -- seat two reads it directly)
+/// wins; a lone transaction is the only
+/// candidate; otherwise the last unit in the
+/// fill is taken (the claim machinery hands the
+/// fill's work to the thread in order, and the
+/// .154 field identification this mirrors was
+/// made on the fill's claimed unit). Returns
+/// the chosen unit, how it was chosen, and how
+/// many BR_TRANSACTION units the fill held.
+fn fatal_txn_select(bytes: &[u8], this_hint: u64) -> Option<(FatalTxn, &'static str, usize)> {
+    let mut units: Vec<FatalTxn> = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            break;
+        }
+        if cmd == BR_TRANSACTION && len == 44 {
+            units.push(FatalTxn {
+                target: u32_at(bytes, off + 4),
+                cookie: u32_at(bytes, off + 8),
+                code: u32_at(bytes, off + 12),
+                sender: u32_at(bytes, off + 20) as i32,
+            });
+        }
+        off += len;
+    }
+    let count = units.len();
+    if count == 0 {
+        return None;
+    }
+    if this_hint > 0x10000 {
+        if let Some(i) = units.iter().position(|u| u.cookie as u64 == this_hint) {
+            return Some((units.into_iter().nth(i).unwrap(), "this", count));
+        }
+    }
+    if count == 1 {
+        Some((units.into_iter().next().unwrap(), "only", count))
+    } else {
+        Some((units.into_iter().last().unwrap(), "last", count))
+    }
+}
+
+/// The raw maps line containing `addr` in the
+/// stopped tracee, for the unreadable arm of the
+/// FATAL object dumps ("none" when no mapping
+/// holds it -- itself a verdict input).
+fn fatal_mapline(pid: i32, addr: u64) -> String {
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        for line in maps.lines() {
+            let mut it = line.split_whitespace();
+            let Some(range) = it.next() else { continue };
+            let Some((lo, hi)) = range.split_once('-') else {
+                continue;
+            };
+            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+            if addr >= lo && addr < hi {
+                return line.trim().to_string();
+            }
+        }
+    }
+    "none".to_string()
+}
+
+/// One FATAL memory window as the u32 words the
+/// verdict tree reads (an object's vtable word,
+/// its counter words), in the minbuf print's
+/// shape; None when the window is unreadable.
+fn fatal_words(pid: i32, addr: u64, n: usize) -> Option<Vec<u32>> {
+    let mem = read_mem_vec(pid, addr, n * 4)?;
+    Some(
+        mem.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+    )
+}
+
+/// A FATAL memory window's words in print shape.
+fn fatal_words_str(ws: &[u32]) -> String {
+    ws.iter()
+        .map(|w| format!("0x{w:08x}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 0.9.142 (s9-142-desk sections 3.1 / 3.2 item
 /// 4): name a SIGSEGV's shape against the reading
 /// key. Both field faults of the SS native
@@ -17947,7 +18340,7 @@ fn tracer_loop(ctx: TracerCtx) {
                     }
                 }
                 if proc.compat && nr == 125 {
-                    pend.mprot = Some((regs.arg(0), regs.arg(2)));
+                    pend.mprot = Some((regs.arg(0), regs.arg(1), regs.arg(2)));
                 }
                 // 0.9.140 (M1): futex entry capture, at
                 // the same seat the peercred / killfam
@@ -19185,8 +19578,40 @@ fn tracer_loop(ctx: TracerCtx) {
                             }
                             q.push_back((pend.nr as u32, ret >= 0));
                         }
+                        // 0.9.155 (s10-sigsegv-desk
+                        // section 5.3 item 3): per-thread
+                        // last-mprotect memo, and the
+                        // mprotect EXEC tracking line
+                        // gains the pid and the returned
+                        // errno. The errno is the
+                        // guest-visible one, the same
+                        // derivation the memo stores.
+                        // Telemetry only: the return the
+                        // guest sees is untouched.
+                        if proc.compat && pend.nr == 125 {
+                            if let Some((addr, len, prot)) = pend.mprot {
+                                let errno =
+                                    if ret < 0 && ret > -4096 { -ret } else { 0 };
+                                proc.last_mprotect = Some(MprotRec {
+                                    addr,
+                                    len,
+                                    prot,
+                                    ret,
+                                    errno,
+                                });
+                            }
+                        }
                         if let Some(d) = &pend.desc {
-                            sys!("{d} => {ret}");
+                            if proc.compat
+                                && pend.nr == 125
+                                && d.starts_with("mprotect EXEC")
+                            {
+                                let errno =
+                                    if ret < 0 && ret > -4096 { -ret } else { 0 };
+                                sys!("{d} => {ret} pid={pid} errno={errno}");
+                            } else {
+                                sys!("{d} => {ret}");
+                            }
                         }
                         if proc.compat && pend.nr == 125 && ret < 0 {
                             // Telemetry (0.9.26): any failing
@@ -19196,7 +19621,7 @@ fn tracer_loop(ctx: TracerCtx) {
                             // NULLs allocations the same way.
                             // 0.9.31: name the denied VMA and
                             // the caller's context.
-                            let (addr, prot) = pend.mprot.unwrap_or((0, 0));
+                            let (addr, _, prot) = pend.mprot.unwrap_or((0, 0, 0));
                             sup!(
                                 "mprotect FAILED pid={pid} ret={ret} addr={addr:#x} prot={prot:#x} vma=[{}] ctx=[{}]",
                                 vma_desc(pid, addr),
@@ -19206,7 +19631,7 @@ fn tracer_loop(ctx: TracerCtx) {
                         if proc.compat
                             && pend.nr == 125
                             && ret == 0
-                            && pend.mprot.is_some_and(|(_, p)| p & 7 == 7)
+                            && pend.mprot.is_some_and(|(_, _, p)| p & 7 == 7)
                             && !MPROT_OK_SAMPLED.swap(
                                 true,
                                 std::sync::atomic::Ordering::Relaxed,
@@ -19217,7 +19642,7 @@ fn tracer_loop(ctx: TracerCtx) {
                             // ACCEPTS, with its VMA named --
                             // the contrast case for the
                             // denials above.
-                            let (addr, _) = pend.mprot.unwrap();
+                            let (addr, _, _) = pend.mprot.unwrap();
                             sup!(
                                 "mprotect RWX ok sample pid={pid} addr={addr:#x} vma=[{}] ctx=[{}]",
                                 vma_desc(pid, addr),
@@ -19634,16 +20059,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 let pc = fregs.as_ref().map(|r| r.pc()).unwrap_or(0);
                 let regdump = fregs
                     .as_ref()
-                    .map(|r| {
-                        format!(
-                            " r0=0x{:x} r1=0x{:x} r2=0x{:x} r3=0x{:x} sp=0x{:x}",
-                            r.arg(0),
-                            r.arg(1),
-                            r.arg(2),
-                            r.arg(3),
-                            r.sp()
-                        )
-                    })
+                    .map(|r| fatal_regdump(r))
                     .unwrap_or_default();
                 let mut buf = [0u8; 128];
                 let ok = ptrace4(
@@ -19684,6 +20100,23 @@ fn tracer_loop(ctx: TracerCtx) {
                 if sig == 11 && (DVMABORT_PC_LO..DVMABORT_PC_HI).contains(&pc) {
                     let logs = coord.ignition_dump(pid, "dvmabort");
                     replay_logs(logs);
+                    // 0.9.155 (s10-sigsegv-desk
+                    // section 5.3 item 3): the dying
+                    // thread's most recent mprotect
+                    // rides this batch -- the seat-
+                    // three caller (dvmCompiler-
+                    // SetupCodeCache) aborts on the
+                    // mprotect it just made, and its
+                    // errno is the fork the fix waits
+                    // on (EACCES class: prot
+                    // synthesis; ENOMEM class: the
+                    // virtual ashmem size ledger).
+                    sup!(
+                        "FATAL dvmabort-mprotect pid={pid} last=[{}]",
+                        mprot_memo_str(
+                            procs.get(&pid).and_then(|p| p.last_mprotect.as_ref())
+                        )
+                    );
                 }
                 // 0.9.133 ignition forensics, trigger C:
                 // a SIGILL death gets the same evidence
@@ -19742,6 +20175,131 @@ fn tracer_loop(ctx: TracerCtx) {
                                 parts.join(",")
                             );
                         }
+                    }
+                }
+                // 0.9.155 (s10-sigsegv-desk section
+                // 5.3 item 2): the RefBase seats'
+                // FATAL batch. When the pc lands in
+                // android_atomic_add (libcutils) or
+                // RefBase::incStrong (libutils), the
+                // batch names the fatal transaction
+                // (decoded from this thread's last
+                // read fill), dumps the 64B header of
+                // the object its cookie names, the
+                // weakref impl's 32B when an mRefs
+                // value is readable, and the
+                // coordinator's node-ledger lines for
+                // the identity. Capture only -- the
+                // signal and everything downstream of
+                // this block proceed exactly as
+                // before.
+                if let Some((seat, loff)) = fatal_seat(pid, pc) {
+                    let this_hint =
+                        fregs.as_ref().map(|r| r.arg(0)).unwrap_or(0);
+                    let mut sel: Option<(FatalTxn, &'static str, usize)> = None;
+                    if let Some((rb, flen)) =
+                        procs.get(&pid).and_then(|p| p.last_binder_read)
+                    {
+                        let n = ((flen as usize) + 128).min(512);
+                        if let Some(mem) = read_mem_vec(pid, rb as u64, n) {
+                            sel = fatal_txn_select(&mem, this_hint);
+                        }
+                    }
+                    match &sel {
+                        Some((t, how, units)) => sup!(
+                            "FATAL seat pid={pid} seat={seat} lib_off=0x{loff:x} txn=[target=0x{:x} cookie=0x{:x} code={} sender={} how={how} units={units}]",
+                            t.target, t.cookie, t.code, t.sender
+                        ),
+                        None => sup!(
+                            "FATAL seat pid={pid} seat={seat} lib_off=0x{loff:x} txn=none"
+                        ),
+                    }
+                    // (a) the object header at the
+                    // transaction's cookie; its +4
+                    // word is the mRefs the impl dump
+                    // below stands on.
+                    let mut mrefs: Option<u64> = None;
+                    if let Some((t, _, _)) = &sel {
+                        let ck = t.cookie as u64;
+                        if ck > 0x10000 {
+                            match fatal_words(pid, ck, 16) {
+                                Some(ws) => {
+                                    sup!(
+                                        "FATAL obj pid={pid} at=0x{ck:x} w=[{}]",
+                                        fatal_words_str(&ws)
+                                    );
+                                    mrefs = ws.get(1).map(|w| *w as u64);
+                                }
+                                None => sup!(
+                                    "FATAL obj pid={pid} at=0x{ck:x} unreadable map=[{}]",
+                                    fatal_mapline(pid, ck)
+                                ),
+                            }
+                        }
+                    }
+                    // Seat two's `this` (r0) is the
+                    // object itself: when it is not
+                    // the transaction's cookie, its
+                    // header is a verdict input of
+                    // its own.
+                    if seat == "incstrong"
+                        && this_hint > 0x10000
+                        && sel.as_ref().map_or(true, |(t, _, _)| {
+                            t.cookie as u64 != this_hint
+                        })
+                    {
+                        match fatal_words(pid, this_hint, 16) {
+                            Some(ws) => {
+                                sup!(
+                                    "FATAL obj pid={pid} at=0x{this_hint:x} (this) w=[{}]",
+                                    fatal_words_str(&ws)
+                                );
+                                if mrefs.is_none() {
+                                    mrefs = ws.get(1).map(|w| *w as u64);
+                                }
+                            }
+                            None => sup!(
+                                "FATAL obj pid={pid} at=0x{this_hint:x} (this) unreadable map=[{}]",
+                                fatal_mapline(pid, this_hint)
+                            ),
+                        }
+                    }
+                    if mrefs.is_none() && seat == "atomic" {
+                        // Seat one's fault address is
+                        // &mRefs->mWeakCount (impl +
+                        // 4): the impl address rides
+                        // r1 even when the object's
+                        // own header could not be
+                        // read.
+                        if let Some(r) = &fregs {
+                            let impl_addr = r.arg(1).wrapping_sub(4);
+                            if impl_addr > 0x10000 {
+                                mrefs = Some(impl_addr);
+                            }
+                        }
+                    }
+                    // (b) the impl's first 32B.
+                    if let Some(mr) = mrefs {
+                        if mr > 0x10000 {
+                            match fatal_words(pid, mr, 8) {
+                                Some(ws) => {
+                                    sup!(
+                                        "FATAL impl pid={pid} at=0x{mr:x} w=[{}]",
+                                        fatal_words_str(&ws)
+                                    );
+                                }
+                                None => sup!(
+                                    "FATAL impl pid={pid} at=0x{mr:x} unreadable map=[{}]",
+                                    fatal_mapline(pid, mr)
+                                ),
+                            }
+                        }
+                    }
+                    // (c) the node ledger for the
+                    // identity, from the coordinator.
+                    if let Some((t, _, _)) = &sel {
+                        let logs = coord.fatal_node(pid, t.target, t.cookie);
+                        replay_logs(logs);
                     }
                 }
                 // 0.9.102: dump the tracee's binder input
@@ -21937,5 +22495,144 @@ mod tests {
         assert_eq!(leg.depth, 1);
         assert!(leg.t_resolved.is_none());
         assert!(leg.arena.ends_with("/777"));
+    }
+
+    // 0.9.155 (s10-sigsegv-desk section 5.3 item
+    // 1): the expanded FATAL regdump names the
+    // full register group both personalities
+    // carry, lr and cpsr included.
+    #[test]
+    fn fatal_regdump_covers_full_group() {
+        let mut u = [0u32; 18];
+        for (i, v) in u.iter_mut().enumerate() {
+            *v = 0x1000 + i as u32;
+        }
+        let s = fatal_regdump(&Regs::A32(CompatPtRegs { uregs: u }));
+        assert!(s.contains(" r0=0x1000"), "{s}");
+        assert!(s.contains(" r4=0x1004"), "{s}");
+        assert!(s.contains(" r12=0x100c"), "{s}");
+        assert!(s.contains(" lr=0x100e"), "{s}");
+        assert!(s.contains(" cpsr=0x1010"), "{s}");
+        assert!(s.contains(" sp=0x100d"), "{s}");
+        let mut g = UserPtRegs::default();
+        g.regs[30] = 0xbeef;
+        g.pstate = 0x600;
+        let s = fatal_regdump(&Regs::A64(g));
+        assert!(s.contains(" lr=0xbeef"), "{s}");
+        assert!(s.contains(" cpsr=0x600"), "{s}");
+    }
+
+    // One whole BR_TRANSACTION unit in the
+    // stream layout the walkers use (44B: cmd,
+    // then target, cookie, code, flags, sender,
+    // euid, data size, offsets size, buffer,
+    // offsets).
+    fn txn_unit(target: u32, cookie: u32, code: u32, sender: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&BR_TRANSACTION.to_le_bytes());
+        for w in [target, cookie, code, 0, sender, 0, 0, 0, 0, 0] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        v
+    }
+
+    // 0.9.155 (section 5.3 item 2a): the fatal
+    // transaction selection out of a read fill --
+    // `this` wins, a lone unit is the only
+    // candidate, otherwise the last unit.
+    #[test]
+    fn fatal_txn_select_picks_this_then_only_then_last() {
+        let s = txn_unit(0x1111, 0x41aa_0000, 7, 42);
+        let (t, how, n) = fatal_txn_select(&s, 0).expect("one unit");
+        assert_eq!((t.cookie, how, n), (0x41aa_0000, "only", 1));
+        assert_eq!((t.target, t.code, t.sender), (0x1111, 7, 42));
+        let mut s = Vec::new();
+        s.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        s.extend_from_slice(&[0u8; 8]);
+        s.extend_from_slice(&txn_unit(0x2222, 0x41bb_0000, 8, 43));
+        s.extend_from_slice(&txn_unit(0x3333, 0x41cc_0000, 9, 44));
+        let (t, how, n) = fatal_txn_select(&s, 0x41cc_0000).expect("this");
+        assert_eq!((t.cookie, how, n), (0x41cc_0000, "this", 2));
+        let (t, how, _) = fatal_txn_select(&s, 0).expect("last");
+        assert_eq!((t.cookie, how), (0x41cc_0000, "last"));
+        let (t, how, _) = fatal_txn_select(&s, 0x9999_0000).expect("last fallback");
+        assert_eq!((t.cookie, how), (0x41cc_0000, "last"));
+        assert!(fatal_txn_select(&[], 0).is_none());
+        assert!(fatal_txn_select(&BR_TRANSACTION.to_le_bytes(), 0).is_none());
+    }
+
+    // 0.9.155 (section 5.3 item 2c): the ledger
+    // lines across a death and re-registration of
+    // one identity -- generations in registration
+    // order, reg/death stamps on one sequence,
+    // absence and unknown arena as their own
+    // shapes.
+    #[test]
+    fn fatal_node_lines_generations_and_absence() {
+        let mut st = BinderState::default();
+        st.thread_arena.insert(777, "ss".to_string());
+        let a = st.node_for_local("ss", 0x1000, 0x2000);
+        // The proc-exit settlement runs after the
+        // arena's thread records are gone (its
+        // guard refuses while any remain).
+        st.thread_arena.remove(&777);
+        let mut wakes = Vec::new();
+        binder_on_proc_exit("ss", &mut st, &mut wakes);
+        st.thread_arena.insert(777, "ss".to_string());
+        let b = st.node_for_local("ss", 0x1000, 0x2000);
+        assert_ne!(a, b);
+        let lines = fatal_node_lines(&st, 777, 0x1000, 0x2000);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains(&format!("node#{a} ")), "{}", lines[0]);
+        assert!(lines[0].contains("gen=1"), "{}", lines[0]);
+        assert!(lines[0].contains("dead=1"), "{}", lines[0]);
+        assert!(lines[0].contains("deliveries=0"), "{}", lines[0]);
+        assert!(lines[1].contains(&format!("node#{b} ")), "{}", lines[1]);
+        assert!(lines[1].contains("gen=2"), "{}", lines[1]);
+        assert!(lines[1].contains("dead=0"), "{}", lines[1]);
+        let (ra, da, rb) = (
+            st.nodes[a].reg_seq,
+            st.nodes[a].dead_seq,
+            st.nodes[b].reg_seq,
+        );
+        assert!(0 < ra && ra < da && da < rb, "{ra} {da} {rb}");
+        let lines = fatal_node_lines(&st, 777, 0x9999, 0x8888);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("ledger=absent"), "{}", lines[0]);
+        let lines = fatal_node_lines(&st, 424242, 0x1000, 0x2000);
+        assert!(lines[0].contains("ledger=arena-unknown"), "{}", lines[0]);
+    }
+
+    // 0.9.155 (section 5.3 item 2c): successful
+    // sends credit the target node's delivery
+    // count, through the same send seat the tc
+    // family already drives.
+    #[test]
+    fn node_deliveries_count_successful_sends() {
+        let mut st = tc_state();
+        let node = st.node_for_local("ss", 0x1000, 0);
+        tc_send(&mut st, 7, 0);
+        assert_eq!(st.nodes[node].deliveries, 1);
+        tc_send(&mut st, 7, 0);
+        assert_eq!(st.nodes[node].deliveries, 2);
+    }
+
+    // 0.9.155 (section 5.3 item 3): the
+    // last-mprotect memo's print shape, empty and
+    // populated.
+    #[test]
+    fn mprot_memo_str_shapes() {
+        assert_eq!(mprot_memo_str(None), "none");
+        let m = MprotRec {
+            addr: 0x1000,
+            len: 8192,
+            prot: 5,
+            ret: -1,
+            errno: 13,
+        };
+        assert_eq!(
+            mprot_memo_str(Some(&m)),
+            "addr=0x1000 len=8192 prot=0x5 ret=-1 errno=13"
+        );
     }
 }
