@@ -1293,6 +1293,12 @@ struct Pending {
     /// FATAL batch reads (s10-sigsegv-desk section
     /// 5.3 item 3) carries the full call shape.
     mprot: Option<(u64, u64, u64)>,
+    /// 0.9.158 (s10-158-spec): this call's
+    /// proxied-mprotect entry/exit register
+    /// sampling record, when the call was
+    /// admitted at its entry stop. Telemetry
+    /// only.
+    jitmp: Option<JitMpPend>,
     /// 0.9.140 (s9-140-desk-ignition M1): a futex of the
     /// WAIT family (WAIT / WAIT_BITSET) seen at this
     /// call's entry stop: (uaddr, op, val) exactly as the
@@ -1342,6 +1348,244 @@ fn mprot_memo_str(m: Option<&MprotRec>) -> String {
     }
 }
 
+/// 0.9.158 (s10-158-spec sections 1-4): one
+/// register snapshot for the proxied-mprotect
+/// entry/exit sampling -- the full callee-saved
+/// group r4-r11 plus sp and lr, read off the
+/// Regs surface at a stop. Pure data; the
+/// sampling never feeds a decision.
+#[derive(Clone, Copy)]
+struct JitMpRegs {
+    cs: [u64; 8], // r4..r11
+    sp: u64,
+    lr: u64,
+}
+
+impl JitMpRegs {
+    fn snap(r: &Regs) -> JitMpRegs {
+        let mut cs = [0u64; 8];
+        for i in 0..8 {
+            cs[i] = r.arg(4 + i);
+        }
+        JitMpRegs {
+            cs,
+            sp: r.sp(),
+            lr: r.lr(),
+        }
+    }
+    /// " r4=0x.. .. sp=0x.." rendering shared by
+    /// the in/out lines.
+    fn render(&self) -> String {
+        let mut s = String::new();
+        for i in 0..8 {
+            s += &format!(" r{}=0x{:x}", 4 + i, self.cs[i]);
+        }
+        s += &format!(" sp=0x{:x}", self.sp);
+        s
+    }
+}
+
+/// How one sampled proxied mprotect actually
+/// travelled through the mediation (s10-158-spec
+/// section 2): the guest's own call passed
+/// through, the ashmem conversion ride, or the
+/// seat-three synthesized narrowing. Stamped on
+/// the pend at the entry seat, upgraded inside
+/// the mprotect EXEC branch when the call is
+/// diverted; the printed lines keep the three
+/// apart.
+#[derive(Clone, Copy, PartialEq)]
+enum JitMpSrc {
+    Guest,
+    Conv,
+    Synth,
+}
+
+impl JitMpSrc {
+    fn as_str(&self) -> &'static str {
+        match self {
+            JitMpSrc::Guest => "guest",
+            JitMpSrc::Conv => "conv",
+            JitMpSrc::Synth => "synth",
+        }
+    }
+}
+
+/// One proxied mprotect admitted to the 0.9.158
+/// sampling: its entry register snapshot and the
+/// facts the paired out line re-reads. Lives in
+/// the call's Pending, exactly the span of the
+/// call.
+#[derive(Clone, Copy)]
+struct JitMpPend {
+    seq: u64,
+    key: &'static str,
+    src: JitMpSrc,
+    entry: JitMpRegs,
+}
+
+/// Per-thread admission cap for the sampling
+/// (s10-158-spec section 6).
+const JITMP_CAP: u64 = 1024;
+
+/// Pairs printed so far by this supervisor
+/// process (s10-158-spec section 4: an out
+/// line's tot is the running total including
+/// itself).
+static JITMP_TOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-thread sampling admission (s10-158-spec
+/// section 6): a thread's first CAP hits print
+/// as pairs; the hit that finds the cap full
+/// prints the truncation marker once; later
+/// hits are suppressed (and still counted in
+/// the thread's hit total). Pure.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum JitMpGate {
+    Admit,
+    TruncNow,
+    Suppress,
+}
+
+fn jitmp_gate(printed: u64, trunc_printed: bool) -> JitMpGate {
+    if printed < JITMP_CAP {
+        JitMpGate::Admit
+    } else if !trunc_printed {
+        JitMpGate::TruncNow
+    } else {
+        JitMpGate::Suppress
+    }
+}
+
+/// The libdvm mapping ranges in one /proc maps
+/// text: every range whose backing path ends in
+/// /libdvm.so. Pure parse (the caller reads the
+/// file). Empty for processes that never load
+/// the guest VM library.
+fn dvm_ranges_from_maps(maps: &str) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for line in maps.lines() {
+        let Some(range) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        let Some(path) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !path.ends_with("/libdvm.so") {
+            continue;
+        }
+        let Ok(lo) = u64::from_str_radix(lo, 16) else {
+            continue;
+        };
+        let Ok(hi) = u64::from_str_radix(hi, 16) else {
+            continue;
+        };
+        out.push((lo, hi));
+    }
+    out
+}
+
+/// The 0.9.158 JIT-neighbourhood key for one
+/// compat mprotect (s10-158-spec section 1):
+/// "lr" when the call's return address lands in
+/// a libdvm mapping, else "tgt" when an
+/// exec-bearing call's page range overlaps a
+/// virtual-ashmem VMA, else no sampling. Pure:
+/// the caller supplies the map facts it read.
+fn jitmp_key(
+    lr: u64,
+    dvm_ranges: &[(u64, u64)],
+    prot: u64,
+    page_start: u64,
+    page_end: u64,
+    tgt_vma: Option<(u64, u64, &str)>,
+) -> Option<&'static str> {
+    if dvm_ranges.iter().any(|&(lo, hi)| lr >= lo && lr < hi) {
+        return Some("lr");
+    }
+    if prot & 0x4 != 0 && page_end > page_start {
+        if let Some((vlo, vhi, path)) = tgt_vma {
+            if page_start < vhi && vlo < page_end && path.contains("/.ashmem/") {
+                return Some("tgt");
+            }
+        }
+    }
+    None
+}
+
+/// Entry -> exit changes across the callee-saved
+/// group (s10-158-spec section 4): "-" when the
+/// group is intact, else the changed registers
+/// as rN:0x<in>->0x<out> in register order. sp
+/// and lr render on both lines but are not
+/// diffed here (a plain syscall keeps both; a
+/// divergence is read off the raw lines).
+fn jitmp_chg(entry: &JitMpRegs, exit: &JitMpRegs) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..8 {
+        if entry.cs[i] != exit.cs[i] {
+            parts.push(format!(
+                "r{}:0x{:x}->0x{:x}",
+                4 + i,
+                entry.cs[i],
+                exit.cs[i]
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
+/// The sampling's in line (s10-158-spec section
+/// 4): printed at the entry tail, when src is
+/// settled. tot is the count of pairs completed
+/// before this one.
+fn jitmp_in_line(
+    pid: i32,
+    j: &JitMpPend,
+    tot: u64,
+    addr: u64,
+    len: u64,
+    prot: u64,
+) -> String {
+    format!(
+        "MPJIT in  pid={pid} seq={} tot={tot} src={} key={} lr=0x{:x} addr=0x{addr:x} len={len} prot=0x{prot:x}{} t={}",
+        j.seq,
+        j.src.as_str(),
+        j.key,
+        j.entry.lr,
+        j.entry.render(),
+        field_t_ms()
+    )
+}
+
+/// The sampling's out line (s10-158-spec section
+/// 4): tot includes this pair.
+fn jitmp_out_line(
+    pid: i32,
+    j: &JitMpPend,
+    tot: u64,
+    ret: i64,
+    exit: &JitMpRegs,
+) -> String {
+    format!(
+        "MPJIT out pid={pid} seq={} tot={tot} src={} ret={ret}{} lr=0x{:x} chg={} t={}",
+        j.seq,
+        j.src.as_str(),
+        exit.render(),
+        exit.lr,
+        jitmp_chg(&j.entry, exit),
+        field_t_ms()
+    )
+}
+
 struct ProcState {
     expect_exit: bool,
     pending: Option<Pending>,
@@ -1368,6 +1612,23 @@ struct ProcState {
     /// compat mprotect (see MprotRec). Telemetry
     /// only.
     last_mprotect: Option<MprotRec>,
+    /// 0.9.158 (s10-158-spec section 1): this
+    /// process's libdvm mapping ranges, read from
+    /// its maps on the first compat mprotect and
+    /// cached for the thread's lifetime (the
+    /// guest library never moves inside one
+    /// process). None until first looked up;
+    /// Some(empty) for processes without libdvm.
+    /// Telemetry only.
+    dvm_ranges: Option<Vec<(u64, u64)>>,
+    /// 0.9.158 (s10-158-spec section 6): this
+    /// thread's sampling accounting -- admitted
+    /// (printed) pairs, all criterion hits, and
+    /// whether the truncation marker has printed.
+    /// Telemetry only.
+    jitmp_printed: u64,
+    jitmp_hits: u64,
+    jitmp_trunc: bool,
     /// 0.9.108: consecutive pre-entry SIGSYS swallows for
     /// this tracee (reset when an entry stop assigns a
     /// fresh pending record). A cap keeps a pathological
@@ -1737,6 +1998,10 @@ impl ProcState {
             exec_armed: false,
             last_binder_read: None,
             last_mprotect: None,
+            dvm_ranges: None,
+            jitmp_printed: 0,
+            jitmp_hits: 0,
+            jitmp_trunc: false,
             sigsys_preentry: 0,
             win: WinProfile::default(),
             last_stop_seq: 0,
@@ -18481,6 +18746,7 @@ fn tracer_loop(ctx: TracerCtx) {
                     binder_parked: false,
                     mmap_binder: None,
                     mprot: None,
+                    jitmp: None,
                     last_futex: None,
                     last_wake: None,
                 };
@@ -18508,6 +18774,66 @@ fn tracer_loop(ctx: TracerCtx) {
                 }
                 if proc.compat && nr == 125 {
                     pend.mprot = Some((regs.arg(0), regs.arg(1), regs.arg(2)));
+                    // 0.9.158 (s10-158-spec sections
+                    // 1 and 6): admit this call to
+                    // the proxied-mprotect register
+                    // sampling when it lands in the
+                    // JIT neighbourhood. The entry
+                    // registers are still the guest's
+                    // own here -- no branch below has
+                    // touched them. Telemetry only:
+                    // the record rides the pend and
+                    // prints at the entry tail / exit
+                    // stop; nothing here feeds the
+                    // call's handling.
+                    if proc.dvm_ranges.is_none() {
+                        let maps =
+                            std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                                .unwrap_or_default();
+                        proc.dvm_ranges = Some(dvm_ranges_from_maps(&maps));
+                    }
+                    let addr = regs.arg(0);
+                    let len = regs.arg(1);
+                    let prot = regs.arg(2);
+                    let page_start = addr & !0xfff;
+                    let page_end = (addr + len + 0xfff) & !0xfff;
+                    let ranges = proc.dvm_ranges.as_deref().unwrap_or(&[]);
+                    let mut key =
+                        jitmp_key(regs.lr(), ranges, prot, page_start, page_end, None);
+                    if key.is_none() && prot & 0x4 != 0 {
+                        if let Some((vlo, vhi, _perms, path)) = vma_range(pid, addr) {
+                            key = jitmp_key(
+                                regs.lr(),
+                                ranges,
+                                prot,
+                                page_start,
+                                page_end,
+                                Some((vlo, vhi, path.as_str())),
+                            );
+                        }
+                    }
+                    if let Some(key) = key {
+                        proc.jitmp_hits += 1;
+                        match jitmp_gate(proc.jitmp_printed, proc.jitmp_trunc) {
+                            JitMpGate::Admit => {
+                                proc.jitmp_printed += 1;
+                                pend.jitmp = Some(JitMpPend {
+                                    seq: proc.jitmp_printed,
+                                    key,
+                                    src: JitMpSrc::Guest,
+                                    entry: JitMpRegs::snap(&regs),
+                                });
+                            }
+                            JitMpGate::TruncNow => {
+                                proc.jitmp_trunc = true;
+                                sup!(
+                                    "MPJIT trunc pid={pid} hits={} cap={JITMP_CAP}",
+                                    proc.jitmp_hits
+                                );
+                            }
+                            JitMpGate::Suppress => {}
+                        }
+                    }
                 }
                 // 0.9.140 (M1): futex entry capture, at
                 // the same seat the peercred / killfam
@@ -18882,6 +19208,9 @@ fn tracer_loop(ctx: TracerCtx) {
                                 // branch: they are never
                                 // whole-VMA.
                                 skip_syscall(pid, &mut regs, &mut pend, 0);
+                                if let Some(j) = &mut pend.jitmp {
+                                    j.src = JitMpSrc::Synth;
+                                }
                                 dirty = true;
                                 synthesized = true;
                             } else if path.contains("/.ashmem/")
@@ -18894,6 +19223,9 @@ fn tracer_loop(ctx: TracerCtx) {
                                     (page_end - page_start) as usize,
                                 ) {
                                     skip_syscall(pid, &mut regs, &mut pend, 0);
+                                    if let Some(j) = &mut pend.jitmp {
+                                        j.src = JitMpSrc::Conv;
+                                    }
                                     let r = inject_mmap(
                                         pid,
                                         proc.compat,
@@ -19658,6 +19990,28 @@ fn tracer_loop(ctx: TracerCtx) {
                     }
                     proc.fill_release = Some(fr);
                 }
+                // 0.9.158 (s10-158-spec sections 3
+                // and 4): the sampling's in line,
+                // printed here because src is only
+                // settled once the branch chain has
+                // run. A call whose transition the
+                // entry handling already consumed
+                // (the conversion ride) never reaches
+                // an exit stop: its out line prints
+                // here too, off the registers the
+                // thread is about to resume with.
+                if let Some(j) = &pend.jitmp {
+                    let tot = JITMP_TOT.load(std::sync::atomic::Ordering::Relaxed);
+                    let (a, l, p) = pend.mprot.unwrap_or((0, 0, 0));
+                    sup!("{}", jitmp_in_line(pid, j, tot, a, l, p));
+                    if transition_consumed {
+                        let out = JitMpRegs::snap(&regs);
+                        let tot = JITMP_TOT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        sup!("{}", jitmp_out_line(pid, j, tot, regs.retval(), &out));
+                    }
+                }
                 proc.sigsys_preentry = 0;
                 proc.pending = Some(pend);
                 proc.expect_exit = !transition_consumed;
@@ -19821,6 +20175,20 @@ fn tracer_loop(ctx: TracerCtx) {
                                     errno,
                                 });
                             }
+                        }
+                        // 0.9.158 (s10-158-spec sections
+                        // 3 and 4): the sampling's out
+                        // line, off the registers as
+                        // they stand now -- inject
+                        // applied, memo recorded -- which
+                        // is what the thread resumes
+                        // with. Telemetry only.
+                        if let Some(j) = &pend.jitmp {
+                            let out = JitMpRegs::snap(&regs);
+                            let tot = JITMP_TOT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            sup!("{}", jitmp_out_line(pid, j, tot, ret, &out));
                         }
                         if let Some(d) = &pend.desc {
                             if proc.compat
@@ -23221,5 +23589,207 @@ mod tests {
         assert!(!ashmem_rx_narrow_shape(
             0x5, vlo, vlo, vlo, vhi, "rwxp", path,
         ));
+    }
+
+    // 0.9.158 (s10-158-spec section 1): the
+    // libdvm ranges come out of a maps text with
+    // every other mapping family around them.
+    #[test]
+    fn dvm_ranges_parse_maps_text() {
+        let maps = "\
+80000000-800a3000 r-xp 00000000 08:01 4242 /data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/system/lib/libdvm.so
+800a3000-800a4000 r--p 000a3000 08:01 4242 /data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/system/lib/libdvm.so
+800a4000-800ad000 rw-p 000a4000 08:01 4242 /data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/system/lib/libdvm.so
+800ad000-800f7000 r-xp 00000000 08:01 4243 /data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/system/lib/libc.so
+e5557000-e5657000 rwxp 00000000 00:00 0
+f1234000-f1235000 rw-p 00000000 00:00 0 [stack]
+";
+        assert_eq!(
+            dvm_ranges_from_maps(maps),
+            vec![
+                (0x80000000, 0x800a3000),
+                (0x800a3000, 0x800a4000),
+                (0x800a4000, 0x800ad000),
+            ]
+        );
+        assert!(dvm_ranges_from_maps("").is_empty());
+    }
+
+    // 0.9.158 (section 1): the lr key hits on
+    // the field's own numbers -- dvmJitChain's
+    // return address inside the specimen's
+    // libdvm text range (base 0x80000000 +
+    // offset 0x7f4b3).
+    #[test]
+    fn jitmp_key_lr_hits_libdvm_caller() {
+        let dvm = [(0x80000000u64, 0x800a3000u64)];
+        assert_eq!(
+            jitmp_key(0x8007f4b3, &dvm, 0x5, 0xe557b000, 0xe557c000, None),
+            Some("lr")
+        );
+        // The lr key does not need the exec bit
+        // or an ashmem target.
+        assert_eq!(
+            jitmp_key(0x8007f4b3, &dvm, 0x3, 0xe557b000, 0xe557c000, None),
+            Some("lr")
+        );
+        // Half-open range: the byte past the
+        // text end is not a libdvm return.
+        assert_eq!(
+            jitmp_key(0x800a3000, &dvm, 0x5, 0xe557b000, 0xe557c000, None),
+            None
+        );
+    }
+
+    // 0.9.158 (section 1): the tgt key covers
+    // the pre-conversion flips whose caller the
+    // lr key somehow missed -- exec-bearing,
+    // overlapping a virtual-ashmem VMA -- and
+    // nothing else.
+    #[test]
+    fn jitmp_key_tgt_hits_and_misses() {
+        let dvm = [(0x80000000u64, 0x800a3000u64)];
+        let ash = "/data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/.ashmem/a19281-3";
+        let (vlo, vhi) = (0xe5557000u64, 0xe5657000u64);
+        // Flip at the cache base, caller outside
+        // libdvm: tgt hit.
+        assert_eq!(
+            jitmp_key(
+                0x800ad000,
+                &dvm,
+                0x7,
+                0xe5557000,
+                0xe5558000,
+                Some((vlo, vhi, ash)),
+            ),
+            Some("tgt")
+        );
+        // No exec bit: not a conversion-window
+        // flip, no hit.
+        assert_eq!(
+            jitmp_key(
+                0x800ad000,
+                &dvm,
+                0x3,
+                0xe5557000,
+                0xe5558000,
+                Some((vlo, vhi, ash)),
+            ),
+            None
+        );
+        // Exec-bearing but the backing is a
+        // plain library VMA.
+        assert_eq!(
+            jitmp_key(
+                0x800ad000,
+                &dvm,
+                0x7,
+                0xe5557000,
+                0xe5558000,
+                Some((vlo, vhi, "/system/lib/libc.so")),
+            ),
+            None
+        );
+        // Ashmem VMA but the flipped range lies
+        // wholly outside it.
+        assert_eq!(
+            jitmp_key(
+                0x800ad000,
+                &dvm,
+                0x7,
+                0xe5757000,
+                0xe5758000,
+                Some((vlo, vhi, ash)),
+            ),
+            None
+        );
+        // No VMA fact at all (maps unreadable):
+        // unobserved, no hit.
+        assert_eq!(
+            jitmp_key(0x800ad000, &dvm, 0x7, 0xe5557000, 0xe5558000, None),
+            None
+        );
+    }
+
+    fn jitmp_regs(r5: u64) -> JitMpRegs {
+        JitMpRegs {
+            cs: [0x10, r5, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+            sp: 0xe0001000,
+            lr: 0x8007f4b3,
+        }
+    }
+
+    // 0.9.158 (section 4): the change list --
+    // intact group, the cluster's own shape
+    // (r5 alive in, zero out), and several
+    // changes in register order. sp/lr are
+    // rendered on the lines but never diffed.
+    #[test]
+    fn jitmp_chg_shapes() {
+        let a = jitmp_regs(0x800a9b00);
+        assert_eq!(jitmp_chg(&a, &a), "-");
+        let b = jitmp_regs(0);
+        assert_eq!(jitmp_chg(&a, &b), "r5:0x800a9b00->0x0");
+        let mut c = jitmp_regs(0);
+        c.cs[0] = 0x99; // r4
+        c.cs[7] = 0x77; // r11
+        c.sp = 0xdead;
+        c.lr = 0xbeef;
+        assert_eq!(
+            jitmp_chg(&a, &c),
+            "r4:0x10->0x99,r5:0x800a9b00->0x0,r11:0x80->0x77"
+        );
+    }
+
+    // 0.9.158 (section 6): the admission gate --
+    // under the cap everything prints, the hit
+    // at the full cap prints the marker once,
+    // later hits stay silent.
+    #[test]
+    fn jitmp_gate_cap_and_trunc() {
+        assert_eq!(jitmp_gate(0, false), JitMpGate::Admit);
+        assert_eq!(jitmp_gate(JITMP_CAP - 1, false), JitMpGate::Admit);
+        assert_eq!(jitmp_gate(JITMP_CAP, false), JitMpGate::TruncNow);
+        assert_eq!(jitmp_gate(JITMP_CAP, true), JitMpGate::Suppress);
+        assert_eq!(jitmp_gate(JITMP_CAP + 5, true), JitMpGate::Suppress);
+    }
+
+    // 0.9.158 (sections 3-4): the snapshot reads
+    // the callee-saved group off a compat
+    // register set, and the two line shapes
+    // carry the fields the desk reads (src kept
+    // apart, seq pairing, chg on the out line).
+    #[test]
+    fn jitmp_snap_and_line_shapes() {
+        let mut u = [0u32; 18];
+        for i in 0..8 {
+            u[4 + i] = 0x100 + i as u32;
+        }
+        u[5] = 0x800a9b00; // r5 = &gDvmJit
+        u[13] = 0xe0001000; // sp
+        u[14] = 0x8007f4b3; // lr
+        let regs = Regs::A32(CompatPtRegs { uregs: u });
+        let snap = JitMpRegs::snap(&regs);
+        assert_eq!(snap.cs[1], 0x800a9b00);
+        assert_eq!(snap.cs[7], 0x107);
+        assert_eq!(snap.sp, 0xe0001000);
+        assert_eq!(snap.lr, 0x8007f4b3);
+        let j = JitMpPend {
+            seq: 7,
+            key: "lr",
+            src: JitMpSrc::Conv,
+            entry: snap,
+        };
+        let in_line = jitmp_in_line(4242, &j, 3, 0xe557b000, 0x1000, 0x7);
+        assert!(in_line.starts_with("MPJIT in  pid=4242 seq=7 tot=3"), "{in_line}");
+        assert!(in_line.contains("src=conv key=lr lr=0x8007f4b3"), "{in_line}");
+        assert!(in_line.contains("addr=0xe557b000 len=4096 prot=0x7"), "{in_line}");
+        assert!(in_line.contains("r5=0x800a9b00"), "{in_line}");
+        let mut out = snap;
+        out.cs[1] = 0;
+        let out_line = jitmp_out_line(4242, &j, 4, 0, &out);
+        assert!(out_line.starts_with("MPJIT out pid=4242 seq=7 tot=4"), "{out_line}");
+        assert!(out_line.contains("src=conv ret=0"), "{out_line}");
+        assert!(out_line.contains("chg=r5:0x800a9b00->0x0"), "{out_line}");
     }
 }
