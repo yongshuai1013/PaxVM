@@ -5322,16 +5322,24 @@ impl CoordClient {
     /// reply carries the captured lines for
     /// in-order replay beside the FATAL line,
     /// exactly like fatal_dump.
+    /// 0.9.157 (s10-seat2-desk2 section 6.2 item
+    /// 3): `stale` marks a heuristic pairing that
+    /// is not the fatal identity (the selection's
+    /// `how` was not `this`); the coordinator
+    /// stamps the returned lines so they cannot
+    /// be read as the identity that died.
     fn fatal_node(
         &mut self,
         pid: i32,
         ptr: u32,
         cookie: u32,
+        stale: bool,
     ) -> Vec<(String, String)> {
         let mut e = Enc::new();
         e.i32(pid);
         e.u32(ptr);
         e.u32(cookie);
+        e.bool(stale);
         let p = self.rpc(MSG_REQ_FATAL_NODE, &e.0, MSG_RESP_FATAL_NODE);
         let mut d = Dec::new(&p);
         d.logs()
@@ -7001,8 +7009,9 @@ impl CoordServer {
                 let pid = d.i32();
                 let ptr = d.u32();
                 let cookie = d.u32();
+                let stale = d.bool();
                 cap_clear();
-                binder_fatal_node(&self.st, pid, ptr, cookie);
+                binder_fatal_node(&self.st, pid, ptr, cookie, stale);
                 let mut e = Enc::new();
                 e.logs(&cap_take());
                 self.send_to(ci, MSG_RESP_FATAL_NODE, &e.0);
@@ -9648,52 +9657,73 @@ fn binder_fatal_dump(
 /// identity and an unknown arena print as their
 /// own lines -- all three shapes are verdict
 /// inputs, not errors.
+/// 0.9.157 (s10-seat2-desk2 section 6.2 item
+/// 3): when the pairing behind the query is a
+/// heuristic one rather than the fatal identity
+/// itself (the selection's `how` was not
+/// `this`), every line is stamped `stale-pair`
+/// at its head -- the .156 seat-two post-mortem
+/// read an unstamped bystander node's lines as
+/// a verdict on the identity that died, and the
+/// desk's reading rules now demote any pairing
+/// with how != this to bystander before it is
+/// read at all.
 fn fatal_node_lines(
     st: &BinderState,
     pid: i32,
     ptr: u32,
     cookie: u32,
+    stale: bool,
 ) -> Vec<String> {
-    let Some(arena) = st.thread_arena.get(&pid) else {
-        return vec![format!(
+    let mut lines: Vec<String> = match st.thread_arena.get(&pid) {
+        None => vec![format!(
             "binder: fatal-node pid={pid} ptr=0x{ptr:x} cookie=0x{cookie:x} ledger=arena-unknown"
-        )];
+        )],
+        Some(arena) => {
+            let matches: Vec<usize> = st
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.owner == *arena && n.ptr == ptr && n.cookie == cookie)
+                .map(|(i, _)| i)
+                .collect();
+            if matches.is_empty() {
+                vec![format!(
+                    "binder: fatal-node pid={pid} ptr=0x{ptr:x} cookie=0x{cookie:x} ledger=absent arena={arena}"
+                )]
+            } else {
+                matches
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, &i)| {
+                        let n = &st.nodes[i];
+                        format!(
+                            "binder: fatal-node pid={pid} node#{i} arena={arena} ptr=0x{ptr:x} cookie=0x{cookie:x} gen={} reg_seq={} dead={} dead_seq={} deliveries={}",
+                            rank + 1,
+                            n.reg_seq,
+                            n.dead as u8,
+                            n.dead_seq,
+                            n.deliveries
+                        )
+                    })
+                    .collect()
+            }
+        }
     };
-    let matches: Vec<usize> = st
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.owner == *arena && n.ptr == ptr && n.cookie == cookie)
-        .map(|(i, _)| i)
-        .collect();
-    if matches.is_empty() {
-        return vec![format!(
-            "binder: fatal-node pid={pid} ptr=0x{ptr:x} cookie=0x{cookie:x} ledger=absent arena={arena}"
-        )];
+    if stale {
+        for line in &mut lines {
+            line.insert_str(0, "stale-pair ");
+        }
     }
-    matches
-        .iter()
-        .enumerate()
-        .map(|(rank, &i)| {
-            let n = &st.nodes[i];
-            format!(
-                "binder: fatal-node pid={pid} node#{i} arena={arena} ptr=0x{ptr:x} cookie=0x{cookie:x} gen={} reg_seq={} dead={} dead_seq={} deliveries={}",
-                rank + 1,
-                n.reg_seq,
-                n.dead as u8,
-                n.dead_seq,
-                n.deliveries
-            )
-        })
-        .collect()
+    lines
 }
 
 /// The printing half of the 0.9.155 node-ledger
 /// query (see fatal_node_lines), assembled at
 /// the tracer's request (MSG_REQ_FATAL_NODE) and
 /// replayed beside the FATAL line.
-fn binder_fatal_node(st: &BinderState, pid: i32, ptr: u32, cookie: u32) {
-    for line in fatal_node_lines(st, pid, ptr, cookie) {
+fn binder_fatal_node(st: &BinderState, pid: i32, ptr: u32, cookie: u32, stale: bool) {
+    for line in fatal_node_lines(st, pid, ptr, cookie, stale) {
         bsup!("{line}");
     }
 }
@@ -17283,6 +17313,50 @@ fn fatal_seat(pid: i32, pc: u64) -> Option<(&'static str, u64)> {
     }
 }
 
+/// 0.9.157 (s10-156-verify section 3.2, the
+/// unregistered libdvm +0x1d0e8 seat): attribute
+/// an address to (library, offset from the
+/// library's lowest mapping) -- the load-base
+/// convention every desk offset in this project
+/// is read against, so an address printed in
+/// the field (the crash pc's caller, above all)
+/// resolves against the donor library's dynsym
+/// and disassembly at the desk without a maps
+/// transcript. Pure over the maps text so the
+/// shape is unit-testable; only pathname
+/// mappings take part.
+fn fatal_lib_offset(maps: &str, addr: u64) -> Option<(String, u64)> {
+    let mut ranges: Vec<(u64, u64, String)> = Vec::new();
+    for line in maps.lines() {
+        if !line.contains('/') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let Some(range) = it.next() else { continue };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+        let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+        let name = line
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            ranges.push((lo, hi, name));
+        }
+    }
+    let (_, _, libname) = ranges.iter().find(|(lo, hi, _)| addr >= *lo && addr < *hi)?;
+    let base = ranges
+        .iter()
+        .filter(|(_, _, n)| n == libname)
+        .map(|(lo, _, _)| *lo)
+        .min()?;
+    Some((libname.clone(), addr - base))
+}
+
 /// One BR_TRANSACTION unit decoded from a tracee
 /// read fill (see fatal_txn_select).
 struct FatalTxn {
@@ -17309,7 +17383,24 @@ struct FatalTxn {
 /// made on the fill's claimed unit). Returns
 /// the chosen unit, how it was chosen, and how
 /// many BR_TRANSACTION units the fill held.
-fn fatal_txn_select(bytes: &[u8], this_hint: u64) -> Option<(FatalTxn, &'static str, usize)> {
+/// 0.9.157 (s10-seat2-desk2 section 6.2 item
+/// 1): the walk is bounded by `filled`, the
+/// fill's own byte count -- never beyond it.
+/// The 0.9.155 caller read filled+128 bytes of
+/// the guest's read buffer and this walk paired
+/// the .156 seat-two sample with a previous
+/// fill's residue shadow past the boundary (the
+/// thread's real fill held no transaction at
+/// all; see the desk's section 1.3). Residue is
+/// the buffer's history, not the dying thread's
+/// work: units outside `filled` do not exist
+/// for pairing, however well-formed they look.
+fn fatal_txn_select(
+    bytes: &[u8],
+    filled: usize,
+    this_hint: u64,
+) -> Option<(FatalTxn, &'static str, usize)> {
+    let bytes = &bytes[..filled.min(bytes.len())];
     let mut units: Vec<FatalTxn> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= bytes.len() {
@@ -17342,6 +17433,42 @@ fn fatal_txn_select(bytes: &[u8], this_hint: u64) -> Option<(FatalTxn, &'static 
     } else {
         Some((units.into_iter().last().unwrap(), "last", count))
     }
+}
+
+/// 0.9.157 (s10-seat2-desk2 section 6.2 item
+/// 2): the dying thread's last reference notice
+/// in its final fill -- the last complete
+/// BR_INCREFS / BR_ACQUIRE unit inside the
+/// `filled` bound, as (command, ptr, cookie).
+/// The .156 seat-two death executed a BR_ACQUIRE
+/// whose (ptr, cookie) no transaction pairing
+/// could name (the fill held no transaction);
+/// the pair itself is the decisive identity --
+/// its cookie's header word is what the next
+/// sample's verdict reads first. Trailing
+/// complete words after the notice (the .156
+/// fill ends with a completion word) do not
+/// displace it: the guest executes the fill in
+/// order and a death on the notice never reaches
+/// them. A trailing partial unit does not count.
+/// Walked with the same advance rules and the
+/// same `filled` bound as fatal_txn_select.
+fn fatal_last_ref(bytes: &[u8], filled: usize) -> Option<(u32, u32, u32)> {
+    let bytes = &bytes[..filled.min(bytes.len())];
+    let mut last: Option<(u32, u32, u32)> = None;
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let cmd = u32_at(bytes, off);
+        let len = br_one_len(cmd);
+        if off + len > bytes.len() {
+            break;
+        }
+        if cmd == BR_INCREFS || cmd == BR_ACQUIRE {
+            last = Some((cmd, u32_at(bytes, off + 4), u32_at(bytes, off + 8)));
+        }
+        off += len;
+    }
+    last
 }
 
 /// The raw maps line containing `addr` in the
@@ -20287,16 +20414,36 @@ fn tracer_loop(ctx: TracerCtx) {
                 // signal and everything downstream of
                 // this block proceed exactly as
                 // before.
+                // 0.9.157 (s10-seat2-desk2 section
+                // 6.2): the selection window is now
+                // exactly the filled bytes (item 1);
+                // the fill's last reference notice is
+                // decoded and dumped with its own
+                // ledger lines (item 2 -- also seat
+                // one's missing face when its death
+                // rides a BR_ACQUIRE and the fill
+                // holds no transaction to pair); a
+                // pairing with how != this stamps its
+                // ledger lines stale-pair (item 3);
+                // and an mRefs value too small to
+                // dump prints its unreadable line
+                // instead of silence (seat one's NULL
+                // shape is five of its six samples).
                 if let Some((seat, loff)) = fatal_seat(pid, pc) {
                     let this_hint =
                         fregs.as_ref().map(|r| r.arg(0)).unwrap_or(0);
                     let mut sel: Option<(FatalTxn, &'static str, usize)> = None;
+                    let mut fill: Vec<u8> = Vec::new();
+                    let mut fill_len = 0usize;
                     if let Some((rb, flen)) =
                         procs.get(&pid).and_then(|p| p.last_binder_read)
                     {
-                        let n = ((flen as usize) + 128).min(512);
-                        if let Some(mem) = read_mem_vec(pid, rb as u64, n) {
-                            sel = fatal_txn_select(&mem, this_hint);
+                        if let Some(mem) =
+                            read_mem_vec(pid, rb as u64, flen as usize)
+                        {
+                            sel = fatal_txn_select(&mem, flen as usize, this_hint);
+                            fill = mem;
+                            fill_len = flen as usize;
                         }
                     }
                     match &sel {
@@ -20387,12 +20534,106 @@ fn tracer_loop(ctx: TracerCtx) {
                                     fatal_mapline(pid, mr)
                                 ),
                             }
+                        } else {
+                            // 0.9.157: an mRefs value
+                            // at or below the mapped
+                            // range is itself the
+                            // datum (NULL in five of
+                            // seat one's six registered
+                            // samples, a small garbage
+                            // word in the sixth) -- it
+                            // prints as its own
+                            // unreadable line, map
+                            // verdict attached, instead
+                            // of leaving the value only
+                            // implicit in the obj words.
+                            sup!(
+                                "FATAL impl pid={pid} at=0x{mr:x} unreadable map=[{}]",
+                                fatal_mapline(pid, mr)
+                            );
                         }
                     }
                     // (c) the node ledger for the
                     // identity, from the coordinator.
-                    if let Some((t, _, _)) = &sel {
-                        let logs = coord.fatal_node(pid, t.target, t.cookie);
+                    // 0.9.157 (item 3): a pairing that
+                    // is not `this` is a bystander by
+                    // the desk's reading rules; its
+                    // ledger lines are stamped so.
+                    if let Some((t, how, _)) = &sel {
+                        let logs = coord.fatal_node(
+                            pid,
+                            t.target,
+                            t.cookie,
+                            *how != "this",
+                        );
+                        replay_logs(logs);
+                    }
+                    // 0.9.157 (s10-seat2-desk2 section
+                    // 6.2 item 2): the fill's last
+                    // reference notice, with the dumps
+                    // its pair earns -- the cookie
+                    // object's 64B header (its word0
+                    // is the desk's first verdict
+                    // read), the impl's 32B at the
+                    // pair's ptr, and the coordinator's
+                    // ledger lines for the pair's own
+                    // identity (an exact identity from
+                    // the fill itself, never a pairing,
+                    // so never stamped stale). This is
+                    // also the only batch face that can
+                    // name a seat-one death riding a
+                    // BR_ACQUIRE, whose fill holds no
+                    // transaction for (a)-(c) to pair.
+                    if let Some((cmd, ptr, cookie)) =
+                        fatal_last_ref(&fill, fill_len)
+                    {
+                        let cname = if cmd == BR_INCREFS {
+                            "BR_INCREFS"
+                        } else {
+                            "BR_ACQUIRE"
+                        };
+                        sup!(
+                            "FATAL lastref pid={pid} cmd={cname} ptr=0x{ptr:x} cookie=0x{cookie:x}"
+                        );
+                        if cookie > 0x10000 {
+                            match fatal_words(pid, cookie as u64, 16) {
+                                Some(ws) => {
+                                    sup!(
+                                        "FATAL obj pid={pid} at=0x{cookie:x} (lastref cookie) w=[{}]",
+                                        fatal_words_str(&ws)
+                                    );
+                                }
+                                None => sup!(
+                                    "FATAL obj pid={pid} at=0x{cookie:x} (lastref cookie) unreadable map=[{}]",
+                                    fatal_mapline(pid, cookie as u64)
+                                ),
+                            }
+                        } else {
+                            sup!(
+                                "FATAL obj pid={pid} at=0x{cookie:x} (lastref cookie) unreadable map=[{}]",
+                                fatal_mapline(pid, cookie as u64)
+                            );
+                        }
+                        if ptr > 0x10000 {
+                            match fatal_words(pid, ptr as u64, 8) {
+                                Some(ws) => {
+                                    sup!(
+                                        "FATAL impl pid={pid} at=0x{ptr:x} (lastref ptr) w=[{}]",
+                                        fatal_words_str(&ws)
+                                    );
+                                }
+                                None => sup!(
+                                    "FATAL impl pid={pid} at=0x{ptr:x} (lastref ptr) unreadable map=[{}]",
+                                    fatal_mapline(pid, ptr as u64)
+                                ),
+                            }
+                        } else {
+                            sup!(
+                                "FATAL impl pid={pid} at=0x{ptr:x} (lastref ptr) unreadable map=[{}]",
+                                fatal_mapline(pid, ptr as u64)
+                            );
+                        }
+                        let logs = coord.fatal_node(pid, ptr, cookie, false);
                         replay_logs(logs);
                     }
                 }
@@ -20590,6 +20831,35 @@ fn tracer_loop(ctx: TracerCtx) {
                                     pc - lo
                                 );
                                 break;
+                            }
+                        }
+                        // 0.9.157 (s10-156-verify section
+                        // 3.2): the caller's own line -- lr
+                        // attributed against its library's
+                        // load base, the convention the
+                        // desks resolve offsets against.
+                        // The .156 T3 death (libdvm
+                        // +0x1d0e8, no dynsym coverage, its
+                        // caller never named) carried lr
+                        // only as a bare word in the
+                        // regdump; with the attribution
+                        // printed here, an unregistered
+                        // seat's next sample names its
+                        // call chain at the desk from this
+                        // line, the regdump and the stk
+                        // lines below.
+                        if let Some(r) = &fregs {
+                            let lr = r.lr();
+                            if lr > 0x10000 {
+                                match fatal_lib_offset(&maps, lr) {
+                                    Some((name, off)) => sup!(
+                                        "FATAL lr pid={pid} lr=0x{lr:x} in {name} (+0x{off:x})"
+                                    ),
+                                    None => sup!(
+                                        "FATAL lr pid={pid} lr=0x{lr:x} map=[{}]",
+                                        fatal_mapline(pid, lr)
+                                    ),
+                                }
                             }
                         }
                         // Resolve the first stack words the
@@ -22637,7 +22907,7 @@ mod tests {
     #[test]
     fn fatal_txn_select_picks_this_then_only_then_last() {
         let s = txn_unit(0x1111, 0x41aa_0000, 7, 42);
-        let (t, how, n) = fatal_txn_select(&s, 0).expect("one unit");
+        let (t, how, n) = fatal_txn_select(&s, s.len(), 0).expect("one unit");
         assert_eq!((t.cookie, how, n), (0x41aa_0000, "only", 1));
         assert_eq!((t.target, t.code, t.sender), (0x1111, 7, 42));
         let mut s = Vec::new();
@@ -22645,14 +22915,122 @@ mod tests {
         s.extend_from_slice(&[0u8; 8]);
         s.extend_from_slice(&txn_unit(0x2222, 0x41bb_0000, 8, 43));
         s.extend_from_slice(&txn_unit(0x3333, 0x41cc_0000, 9, 44));
-        let (t, how, n) = fatal_txn_select(&s, 0x41cc_0000).expect("this");
+        let (t, how, n) = fatal_txn_select(&s, s.len(), 0x41cc_0000).expect("this");
         assert_eq!((t.cookie, how, n), (0x41cc_0000, "this", 2));
-        let (t, how, _) = fatal_txn_select(&s, 0).expect("last");
+        let (t, how, _) = fatal_txn_select(&s, s.len(), 0).expect("last");
         assert_eq!((t.cookie, how), (0x41cc_0000, "last"));
-        let (t, how, _) = fatal_txn_select(&s, 0x9999_0000).expect("last fallback");
+        let (t, how, _) = fatal_txn_select(&s, s.len(), 0x9999_0000).expect("last fallback");
         assert_eq!((t.cookie, how), (0x41cc_0000, "last"));
-        assert!(fatal_txn_select(&[], 0).is_none());
-        assert!(fatal_txn_select(&BR_TRANSACTION.to_le_bytes(), 0).is_none());
+        assert!(fatal_txn_select(&[], 0, 0).is_none());
+        assert!(fatal_txn_select(&BR_TRANSACTION.to_le_bytes(), 4, 0).is_none());
+    }
+
+    // 0.9.157 (s10-seat2-desk2 section 6.2 item
+    // 1): the selection never pairs a unit past
+    // `filled` -- the .156 mis-pairing's exact
+    // shape. A residue transaction whose cookie
+    // equals `this` still loses to the fill's own
+    // lone unit, and a fill with no transaction
+    // of its own selects nothing however
+    // well-formed the residue behind it looks.
+    #[test]
+    fn fatal_txn_select_never_pairs_beyond_filled() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes.extend_from_slice(&txn_unit(0x2222, 0x41bb_0000, 8, 43));
+        let filled = bytes.len();
+        bytes.extend_from_slice(&txn_unit(0x3333, 0x41cc_0000, 9, 44));
+        let (t, how, n) =
+            fatal_txn_select(&bytes, filled, 0x41cc_0000).expect("filled unit");
+        assert_eq!((t.cookie, how, n), (0x41bb_0000, "only", 1));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        bytes.extend_from_slice(&0x41117e00u32.to_le_bytes());
+        bytes.extend_from_slice(&0x41117de0u32.to_le_bytes());
+        let filled = bytes.len();
+        bytes.extend_from_slice(&txn_unit(0x3333, 0x41cc_0000, 9, 44));
+        assert!(fatal_txn_select(&bytes, filled, 0x41cc_0000).is_none());
+        assert!(fatal_txn_select(&bytes, filled, 0).is_none());
+    }
+
+    // 0.9.157 (s10-seat2-desk2 section 6.2 item
+    // 2): the last reference notice inside the
+    // filled bound -- the .156 specimen's fill
+    // (completion word, INCREFS, ACQUIRE,
+    // completion word) yields the ACQUIRE pair;
+    // a notice cut off by the fill's end does not
+    // count, and neither does one living only in
+    // the residue beyond `filled`.
+    #[test]
+    fn fatal_last_ref_takes_last_ref_pair_within_filled() {
+        let mut s = Vec::new();
+        s.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        s.extend_from_slice(&BR_INCREFS.to_le_bytes());
+        s.extend_from_slice(&0x41117e00u32.to_le_bytes());
+        s.extend_from_slice(&0x41117de0u32.to_le_bytes());
+        s.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+        s.extend_from_slice(&0x41117e00u32.to_le_bytes());
+        s.extend_from_slice(&0x41117de0u32.to_le_bytes());
+        s.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        assert_eq!(
+            fatal_last_ref(&s, s.len()),
+            Some((BR_ACQUIRE, 0x41117e00, 0x41117de0))
+        );
+        // The same fill with its ACQUIRE truncated
+        // by the fill's end falls back to the
+        // INCREFS before it.
+        let filled = s.len() - 4 - 8;
+        assert_eq!(
+            fatal_last_ref(&s, filled),
+            Some((BR_INCREFS, 0x41117e00, 0x41117de0))
+        );
+        // A fill with no notice at all, and a
+        // notice that exists only past `filled`.
+        let s2 = txn_unit(0x1111, 0x41aa_0000, 7, 42);
+        assert!(fatal_last_ref(&s2, s2.len()).is_none());
+        let filled = s.len() - 16;
+        assert_eq!(
+            fatal_last_ref(&s, filled),
+            Some((BR_INCREFS, 0x41117e00, 0x41117de0))
+        );
+        let mut s3 = Vec::new();
+        s3.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_le_bytes());
+        let filled3 = s3.len();
+        s3.extend_from_slice(&BR_ACQUIRE.to_le_bytes());
+        s3.extend_from_slice(&0x41117e00u32.to_le_bytes());
+        s3.extend_from_slice(&0x41117de0u32.to_le_bytes());
+        assert!(fatal_last_ref(&s3, filled3).is_none());
+    }
+
+    // 0.9.157 (s10-156-verify section 3.2): an
+    // address attributes to its library at the
+    // load-base offset, whichever segment of the
+    // library holds it; anonymous and unmapped
+    // addresses attribute to nothing.
+    #[test]
+    fn fatal_lib_offset_uses_load_base() {
+        let maps = "\
+80000000-800ac000 r--p 00000000 fe:00 1234 /system/lib/libdvm.so
+800ac000-80120000 r-xp 000ac000 fe:00 1234 /system/lib/libdvm.so
+80120000-80130000 rw-p 00120000 fe:00 1234 /system/lib/libdvm.so
+80130000-80140000 rw-p 00000000 00:00 0
+80200000-80210000 r-xp 00000000 fe:00 99 /system/lib/libc.so
+";
+        assert_eq!(
+            fatal_lib_offset(maps, 0x800a_d0e8),
+            Some(("libdvm.so".to_string(), 0xad0e8))
+        );
+        assert_eq!(
+            fatal_lib_offset(maps, 0x8000_0010),
+            Some(("libdvm.so".to_string(), 0x10))
+        );
+        assert_eq!(
+            fatal_lib_offset(maps, 0x8020_5000),
+            Some(("libc.so".to_string(), 0x5000))
+        );
+        assert!(fatal_lib_offset(maps, 0x8013_5000).is_none());
+        assert!(fatal_lib_offset(maps, 0x9000_0000).is_none());
     }
 
     // 0.9.155 (section 5.3 item 2c): the ledger
@@ -22675,7 +23053,7 @@ mod tests {
         st.thread_arena.insert(777, "ss".to_string());
         let b = st.node_for_local("ss", 0x1000, 0x2000);
         assert_ne!(a, b);
-        let lines = fatal_node_lines(&st, 777, 0x1000, 0x2000);
+        let lines = fatal_node_lines(&st, 777, 0x1000, 0x2000, false);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains(&format!("node#{a} ")), "{}", lines[0]);
         assert!(lines[0].contains("gen=1"), "{}", lines[0]);
@@ -22690,11 +23068,35 @@ mod tests {
             st.nodes[b].reg_seq,
         );
         assert!(0 < ra && ra < da && da < rb, "{ra} {da} {rb}");
-        let lines = fatal_node_lines(&st, 777, 0x9999, 0x8888);
+        let lines = fatal_node_lines(&st, 777, 0x9999, 0x8888, false);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("ledger=absent"), "{}", lines[0]);
-        let lines = fatal_node_lines(&st, 424242, 0x1000, 0x2000);
+        let lines = fatal_node_lines(&st, 424242, 0x1000, 0x2000, false);
         assert!(lines[0].contains("ledger=arena-unknown"), "{}", lines[0]);
+    }
+
+    // 0.9.157 (s10-seat2-desk2 section 6.2 item
+    // 3): a stale pairing stamps every ledger
+    // line at its head, in all three shapes; a
+    // non-stale query stays byte-identical to the
+    // 0.9.155 lines.
+    #[test]
+    fn fatal_node_lines_stale_pair_marker() {
+        let mut st = BinderState::default();
+        st.thread_arena.insert(777, "ss".to_string());
+        st.node_for_local("ss", 0x1000, 0x2000);
+        let lines = fatal_node_lines(&st, 777, 0x1000, 0x2000, true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("stale-pair binder: fatal-node"), "{}", lines[0]);
+        assert!(lines[0].contains("gen=1"), "{}", lines[0]);
+        let lines = fatal_node_lines(&st, 777, 0x9999, 0x8888, true);
+        assert!(lines[0].starts_with("stale-pair "), "{}", lines[0]);
+        assert!(lines[0].contains("ledger=absent"), "{}", lines[0]);
+        let lines = fatal_node_lines(&st, 424242, 0x1000, 0x2000, true);
+        assert!(lines[0].starts_with("stale-pair "), "{}", lines[0]);
+        assert!(lines[0].contains("ledger=arena-unknown"), "{}", lines[0]);
+        let lines = fatal_node_lines(&st, 777, 0x1000, 0x2000, false);
+        assert!(lines[0].starts_with("binder: fatal-node"), "{}", lines[0]);
     }
 
     // 0.9.155 (section 5.3 item 2c): successful
