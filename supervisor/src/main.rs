@@ -13651,6 +13651,33 @@ fn ashmem_rx_narrow_shape(
         && path.contains("/.ashmem/")
 }
 
+/// 0.9.159 (s10-158-spec section 7, proven by
+/// s10-158-verify branch one): the register set a
+/// conversion-ride guest resumes with -- the set
+/// saved before the ride, with only the result
+/// register carrying the ride's outcome. The ride
+/// (inject_mmap below) overwrites r0-r5 with its
+/// mmap parameters (r5 = offset, always 0; r4 =
+/// fd -1) and r7 with the mmap number, and the
+/// pre-fix exit wrote that parameter set back
+/// whole: 67/67 sampled conversion pairs in the
+/// 0.9.158 field returned with the guest's
+/// callee-saved r5 zeroed -- the JIT patching
+/// cluster's killer (dvmJitChain reads &gDvmJit
+/// out of r5 on its first use after the proxied
+/// mprotect). A native mprotect return preserves
+/// every register except r0, so the mediated call
+/// now does the same: the conversion's success
+/// and failure exits share this one restore and
+/// differ only in the value r0 carries (0 / -13).
+/// Pure, so unit tests pin the semantics without
+/// a tracee.
+fn conv_final_regs(saved: &Regs, result: i64) -> Regs {
+    let mut out = *saved;
+    out.set_retval(result);
+    out
+}
+
 /// Ride an anonymous MAP_FIXED mmap over [addr,
 /// addr+len) in the stopped tracee, in the style of
 /// inject_openat: overwrite the current syscall's
@@ -19222,6 +19249,21 @@ fn tracer_loop(ctx: TracerCtx) {
                                     page_start,
                                     (page_end - page_start) as usize,
                                 ) {
+                                    // 0.9.159 (s10-158-spec
+                                    // section 7; s10-158-verify
+                                    // branch one): snapshot the
+                                    // guest's registers BEFORE
+                                    // anything in this branch
+                                    // rewrites them --
+                                    // skip_syscall's number-
+                                    // register cancel first, then
+                                    // the ride's mmap parameter
+                                    // set. Both ride exits below
+                                    // resume the guest from this
+                                    // snapshot through
+                                    // conv_final_regs; only r0
+                                    // carries the outcome.
+                                    let saved = regs;
                                     skip_syscall(pid, &mut regs, &mut pend, 0);
                                     if let Some(j) = &mut pend.jitmp {
                                         j.src = JitMpSrc::Conv;
@@ -19243,24 +19285,38 @@ fn tracer_loop(ctx: TracerCtx) {
                                     // (0.9.32's bug -- the mmap
                                     // landed and the contents
                                     // restore was skipped).
-                                    if (r as u32) == (page_start as u32)
+                                    let ok = (r as u32) == (page_start as u32)
                                         && write_mem(pid, page_start, &contents)
-                                            .is_ok()
-                                    {
-                                        regs.set_retval(0);
-                                        if set_regs(pid, &regs) {
-                                            pend.applied = true;
-                                        }
+                                            .is_ok();
+                                    if !ok {
+                                        pend.inject = Some(-13);
+                                    }
+                                    // The single restore
+                                    // exit, success and
+                                    // failure alike: the
+                                    // guest resumes with its
+                                    // own register set and
+                                    // the result in r0 (0 /
+                                    // -13, each exactly the
+                                    // value the pre-fix code
+                                    // answered) -- no other
+                                    // word of the ride's
+                                    // parameter set leaks
+                                    // back (0.9.159; the
+                                    // pre-fix exits wrote
+                                    // the ride set back
+                                    // whole, r5 = the mmap
+                                    // offset 0 included).
+                                    regs = conv_final_regs(&saved, if ok { 0 } else { -13 });
+                                    if set_regs(pid, &regs) {
+                                        pend.applied = true;
+                                    }
+                                    if ok {
                                         sup!(
                                             "mprotect: ashmem range {page_start:#x}..{page_end:#x} of pid={pid} converted to anonymous ({} bytes preserved)",
                                             contents.len()
                                         );
                                     } else {
-                                        pend.inject = Some(-13);
-                                        regs.set_retval(-13);
-                                        if set_regs(pid, &regs) {
-                                            pend.applied = true;
-                                        }
                                         sup!(
                                             "mprotect: anonymous conversion FAILED for pid={pid} at {page_start:#x} (ride={r}); guest gets -13 as before"
                                         );
@@ -23791,5 +23847,119 @@ f1234000-f1235000 rw-p 00000000 00:00 0 [stack]
         assert!(out_line.starts_with("MPJIT out pid=4242 seq=7 tot=4"), "{out_line}");
         assert!(out_line.contains("src=conv ret=0"), "{out_line}");
         assert!(out_line.contains("chg=r5:0x800a9b00->0x0"), "{out_line}");
+    }
+
+    // 0.9.159: a guest register set at a conversion
+    // candidate's entry stop, in the .158 field's
+    // own sample values (r5 = 0x48 alive, r4 a stack
+    // address, lr at dvmJitChain's call site).
+    fn conv_saved_regs() -> Regs {
+        let mut u = [0u32; 18];
+        u[0] = 0xe2515000; // r0: the mprotect's addr arg
+        u[1] = 72; // r1: len
+        u[2] = 0x7; // r2: prot
+        u[3] = 0xaaaa; // r3
+        u[4] = 0xe4bdec70; // r4: callee-saved, stack-ish
+        u[5] = 0x48; // r5: the field sample's live value
+        u[6] = 0x6666; // r6
+        u[7] = 125; // r7: the mprotect number itself
+        u[8] = 0x8888;
+        u[9] = 0x9999;
+        u[10] = 0x1010;
+        u[11] = 0x1111;
+        u[12] = 0x1212;
+        u[13] = 0xe0001000; // sp
+        u[14] = 0x8007fbef; // lr
+        u[15] = 0x8007f400; // pc
+        u[16] = 0x60000010; // cpsr
+        u[17] = 0xe2515000; // orig_r0
+        Regs::A32(CompatPtRegs { uregs: u })
+    }
+
+    // 0.9.159: replaying inject_mmap's writes on the
+    // saved set reproduces the .158 conv fingerprint
+    // exactly (the fixture is the field shape, not a
+    // caricature), and the restore erases it: the
+    // paired chg the next field reads is empty.
+    #[test]
+    fn conv_final_regs_undoes_the_ride_clobber() {
+        let saved = conv_saved_regs();
+        let entry = JitMpRegs::snap(&saved);
+        let mut ride = saved;
+        ride.set_nr(192);
+        ride.set_arg(0, 0xe2515000);
+        ride.set_arg(1, 72);
+        ride.set_arg(2, 0x7);
+        ride.set_arg(3, 0x32);
+        ride.set_arg(4, (-1i32) as i64 as u64);
+        ride.set_arg(5, 0);
+        assert_eq!(
+            jitmp_chg(&entry, &JitMpRegs::snap(&ride)),
+            "r4:0xe4bdec70->0xffffffff,r5:0x48->0x0,r7:0x7d->0xc0"
+        );
+        let fin = conv_final_regs(&saved, 0);
+        assert_eq!(jitmp_chg(&entry, &JitMpRegs::snap(&fin)), "-");
+        assert_eq!(fin.retval(), 0);
+    }
+
+    // 0.9.159: the restore is whole-set, not just
+    // the callee-saved group -- the ride's other
+    // overwritten words (r1-r3 args, sp/pc/lr/cpsr
+    // carried through) also come back as the
+    // guest's own; r0 alone carries the result.
+    #[test]
+    fn conv_final_regs_restores_everything_but_r0() {
+        let saved = conv_saved_regs();
+        let fin = conv_final_regs(&saved, 0);
+        for i in 1..=15usize {
+            assert_eq!(fin.arg(i), saved.arg(i), "r{i} must come back");
+        }
+        assert_eq!(fin.sp(), saved.sp());
+        assert_eq!(fin.pc(), saved.pc());
+        assert_eq!(fin.lr(), saved.lr());
+        assert_eq!(fin.cpsr(), saved.cpsr());
+        // r5's own value, not the ride's offset 0:
+        assert_eq!(fin.arg(5), 0x48);
+        assert_eq!(fin.arg(4), 0xe4bdec70);
+    }
+
+    // 0.9.159: the failure exit (the .158 field's
+    // ret=-13 variant leaked the same way) restores
+    // identically; only r0 differs.
+    #[test]
+    fn conv_final_regs_failure_exit_same_restore() {
+        let saved = conv_saved_regs();
+        let fin = conv_final_regs(&saved, -13);
+        assert_eq!(fin.retval(), -13);
+        assert_eq!(
+            jitmp_chg(&JitMpRegs::snap(&saved), &JitMpRegs::snap(&fin)),
+            "-"
+        );
+        assert_eq!(fin.arg(5), 0x48);
+        assert_eq!(fin.arg(4), 0xe4bdec70);
+        assert_eq!(fin.arg(7), 125);
+    }
+
+    // 0.9.159: the restore is personality-agnostic
+    // (the helper never names a personality); the
+    // native set keeps every word but x0 too.
+    #[test]
+    fn conv_final_regs_native_personality() {
+        let mut p = UserPtRegs::default();
+        for i in 0..31 {
+            p.regs[i] = 0x1000 + i as u64;
+        }
+        p.regs[5] = 0x800a9b00;
+        p.sp = 0xe0001000;
+        p.pc = 0x400f400;
+        let saved = Regs::A64(p);
+        let fin = conv_final_regs(&saved, -13);
+        assert_eq!(fin.retval(), -13);
+        for i in 1..31usize {
+            assert_eq!(fin.arg(i), saved.arg(i), "x{i} must come back");
+        }
+        assert_eq!(fin.arg(5), 0x800a9b00);
+        assert_eq!(fin.sp(), saved.sp());
+        assert_eq!(fin.pc(), saved.pc());
     }
 }
