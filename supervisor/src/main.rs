@@ -1775,6 +1775,19 @@ struct FutexAcct {
     wakes: u64,
     last_wake_pid: i32,
     last_wake_seq: u64,
+    // 0.9.163 (s10-163-spec section 3.1): the
+    // account's time face -- when this address was
+    // first entered, the most recent wait's thread
+    // and instant, the most recent wake's instant,
+    // and the thread that most recently completed
+    // a wait here with its instant (the holder
+    // evidence; see futex_holder_candidates).
+    first_t: u64,
+    last_wait_pid: i32,
+    last_wait_t: u64,
+    last_wake_t: u64,
+    last_done_pid: i32,
+    last_done_t: u64,
 }
 
 const FUTEX_ACCT_CAP: usize = 512;
@@ -1786,8 +1799,10 @@ fn futex_acct_add(
     uaddr: u32,
     is_wait: bool,
     pid: i32,
+    t: u64,
 ) {
     let key = (leader, uaddr);
+    let mut fresh = false;
     if !map.contains_key(&key) {
         let n = addrs.entry(leader).or_insert(0);
         if *n >= FUTEX_ACCT_CAP {
@@ -1795,14 +1810,113 @@ fn futex_acct_add(
         }
         *n += 1;
         map.insert(key, FutexAcct::default());
+        fresh = true;
     }
     let a = map.get_mut(&key).expect("futex account entry");
+    // 0.9.163 (s10-163-spec section 3.1): integer
+    // assignments only on this hot path -- the
+    // entry instant stamps the first-seen column
+    // on a fresh entry, and each family keeps its
+    // own most-recent thread / instant columns.
+    if fresh {
+        a.first_t = t;
+    }
     if is_wait {
         a.waits += 1;
+        a.last_wait_pid = pid;
+        a.last_wait_t = t;
     } else {
         a.wakes += 1;
         a.last_wake_pid = pid;
         a.last_wake_seq = emit_seq_now();
+        a.last_wake_t = t;
+    }
+}
+
+/// 0.9.163 (s10-163-spec section 3.1): record a
+/// completed wait in the address's account, at the
+/// exit seat where the wait book closes. Existing
+/// entries only: an address with no account (past
+/// the cap, or never entered) stays absent -- the
+/// absence itself is the coverage signal the
+/// snapshot seats print as acct=missing. Returns
+/// whether an entry was updated.
+fn futex_acct_wait_done(
+    map: &mut HashMap<(i32, u32), FutexAcct>,
+    leader: i32,
+    uaddr: u32,
+    pid: i32,
+    t: u64,
+) -> bool {
+    match map.get_mut(&(leader, uaddr)) {
+        Some(a) => {
+            a.last_done_pid = pid;
+            a.last_done_t = t;
+            true
+        }
+        None => false,
+    }
+}
+
+/// 0.9.163 (s10-163-spec section 3.2): the holder
+/// candidates for one futex word, in priority
+/// order, as (pid, basis) slots; an empty slot is
+/// pid 0. Candidate one is the most recent thread
+/// to complete a wait on the word (basis
+/// wait-done): under mutex semantics the woken
+/// waiter takes the lock by a userspace CAS the
+/// supervisor never sees, so the last thread out
+/// of the wait is the prime holder suspect.
+/// Candidate two is the most recent waker (basis
+/// last-wake): an unlock always issues a WAKE, so
+/// the last releaser is the fallback for a holder
+/// who never waited here. A pid that is itself
+/// among the current waiters is excluded (it is
+/// waiting, not holding), pid 0 never qualifies,
+/// and when both evidences name the same pid they
+/// merge into one slot with basis
+/// wait-done+last-wake. This is inference from two
+/// history columns, never an observation of the
+/// take itself.
+fn futex_holder_candidates(
+    acct: &FutexAcct,
+    waiters: &[i32],
+) -> [(i32, &'static str); 2] {
+    let done = acct.last_done_pid;
+    let wake = acct.last_wake_pid;
+    let done_ok = done != 0 && !waiters.contains(&done);
+    let wake_ok = wake != 0 && !waiters.contains(&wake);
+    let mut out = [(0, "-"); 2];
+    if done_ok && wake_ok && done == wake {
+        out[0] = (done, "wait-done+last-wake");
+    } else if done_ok && wake_ok {
+        out[0] = (done, "wait-done");
+        out[1] = (wake, "last-wake");
+    } else if done_ok {
+        out[0] = (done, "wait-done");
+    } else if wake_ok {
+        out[0] = (wake, "last-wake");
+    }
+    out
+}
+
+/// 0.9.163: one candidate slot as printed --
+/// "{pid}:{basis}", or "-" for an empty slot.
+fn futex_cand_str(c: (i32, &'static str)) -> String {
+    if c.0 != 0 {
+        format!("{}:{}", c.0, c.1)
+    } else {
+        "-".to_string()
+    }
+}
+
+/// 0.9.163: the holder guess as printed -- the
+/// first candidate's pid, or "none".
+fn futex_holder_guess(cands: &[(i32, &'static str); 2]) -> String {
+    if cands[0].0 != 0 {
+        cands[0].0.to_string()
+    } else {
+        "none".to_string()
     }
 }
 
@@ -17567,6 +17681,7 @@ fn next_stop(
     vcreds: &mut HashMap<i32, (u32, u32)>,
     shard_root: &mut i32,
     dump_candidate: &mut Option<i32>,
+    futex_acct: &HashMap<(i32, u32), FutexAcct>,
     selfpipe_rd: i32,
 ) -> NextStop {
     // S10 I3: time blocked in this call's poll is
@@ -17687,7 +17802,7 @@ fn next_stop(
                     // its face from its own tables.
                     for x in &pids {
                         if procs.contains_key(x) {
-                            print_servicer_face(&arena, *x, procs);
+                            print_servicer_face(&arena, *x, procs, futex_acct);
                         }
                     }
                 }
@@ -17898,7 +18013,12 @@ fn do_handoff(
 /// age in this worker's own emitted lines since
 /// the thread's last processed stop. Nothing is
 /// inferred across workers.
-fn print_servicer_face(ss_arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
+fn print_servicer_face(
+    ss_arena: &str,
+    x: i32,
+    procs: &HashMap<i32, ProcState>,
+    futex_acct: &HashMap<(i32, u32), FutexAcct>,
+) {
     let Some(proc) = procs.get(&x) else {
         return;
     };
@@ -17916,59 +18036,113 @@ fn print_servicer_face(ss_arena: &str, x: i32, procs: &HashMap<i32, ProcState>) 
         p
     };
     let leader = leader_of(x);
-    let (last_syscall, state, futex_uaddr, futex_grp, last_op) = match &proc.pending {
-        Some(pd) => {
-            let ls = format!("{}({})", nr_name(proc.compat, pd.nr), pd.nr);
-            let state = if pd.binder_parked {
-                "parked-binder"
-            } else if (proc.compat && pd.nr == 240) || (!proc.compat && pd.nr == 98) {
-                "futex"
-            } else {
-                "parked-other"
-            };
-            let (ua, grp, op) = match pd.last_futex {
-                Some((u, o, _)) => {
-                    let n = procs
-                        .iter()
-                        .filter(|(p, pr)| {
-                            **p != x
-                                && leader_of(**p) == leader
-                                && pr.pending
-                                    .as_ref()
-                                    .is_some_and(|q| q.last_futex.is_some_and(|(u2, _, _)| u2 == u))
-                        })
-                        .count()
-                        + 1;
-                    (
-                        format!("0x{u:x}"),
-                        if n == 1 {
-                            "solo".to_string()
-                        } else {
-                            n.to_string()
-                        },
-                        if o == 9 { "WAIT_BITSET" } else { "WAIT" },
-                    )
-                }
-                None => (
-                    "-".to_string(),
-                    "-".to_string(),
-                    if pd.last_wake.is_some() { "WAKE" } else { "-" },
-                ),
-            };
-            (ls, state, ua, grp, op)
-        }
-        None => (
-            "-".to_string(),
-            "running",
-            "-".to_string(),
-            "-".to_string(),
-            "-",
-        ),
-    };
+    let (last_syscall, state, futex_uaddr, futex_grp, last_op, futex_u, futex_waiters) =
+        match &proc.pending {
+            Some(pd) => {
+                let ls = format!("{}({})", nr_name(proc.compat, pd.nr), pd.nr);
+                let state = if pd.binder_parked {
+                    "parked-binder"
+                } else if (proc.compat && pd.nr == 240) || (!proc.compat && pd.nr == 98) {
+                    "futex"
+                } else {
+                    "parked-other"
+                };
+                let (ua, grp, op, fu, fws) = match pd.last_futex {
+                    Some((u, o, _)) => {
+                        // 0.9.163 (s10-163-spec
+                        // section 3.3 seat A): the
+                        // group scan now also keeps
+                        // the waiters it counts (x
+                        // itself appended) -- the
+                        // count the face line prints
+                        // is the list's length,
+                        // unchanged.
+                        let mut ws: Vec<i32> = procs
+                            .iter()
+                            .filter(|(p, pr)| {
+                                **p != x
+                                    && leader_of(**p) == leader
+                                    && pr.pending.as_ref().is_some_and(|q| {
+                                        q.last_futex.is_some_and(|(u2, _, _)| u2 == u)
+                                    })
+                            })
+                            .map(|(p, _)| *p)
+                            .collect();
+                        ws.push(x);
+                        let n = ws.len();
+                        (
+                            format!("0x{u:x}"),
+                            if n == 1 {
+                                "solo".to_string()
+                            } else {
+                                n.to_string()
+                            },
+                            if o == 9 { "WAIT_BITSET" } else { "WAIT" },
+                            Some(u),
+                            ws,
+                        )
+                    }
+                    None => (
+                        "-".to_string(),
+                        "-".to_string(),
+                        if pd.last_wake.is_some() { "WAKE" } else { "-" },
+                        None,
+                        Vec::new(),
+                    ),
+                };
+                (ls, state, ua, grp, op, fu, fws)
+            }
+            None => (
+                "-".to_string(),
+                "running",
+                "-".to_string(),
+                "-".to_string(),
+                "-",
+                None,
+                Vec::new(),
+            ),
+        };
     let age = emit_seq_now().saturating_sub(proc.last_stop_seq);
     sup!(
         "binder: wedge-servicer-face arena={ss_arena} pid={x} last_syscall={last_syscall} state={state} futex_uaddr={futex_uaddr} futex_grp={futex_grp} last_op={last_op} age={age}"
     );
+    // 0.9.163 (s10-163-spec section 3.3 seat A):
+    // when this servicer is frozen on a futex, its
+    // word's settlement account and holder
+    // candidates ride on a line of their own, read
+    // from this worker's own account (fed in by
+    // parameter, the wedge_snapshot pattern). An
+    // absent account prints acct=missing with the
+    // account columns dashed -- nothing is guessed
+    // across workers.
+    if let Some(u) = futex_u {
+        let now = field_t_ms();
+        match futex_acct.get(&(leader, u)) {
+            Some(a) => {
+                let cands = futex_holder_candidates(a, &futex_waiters);
+                let cand1 = futex_cand_str(cands[0]);
+                let cand2 = futex_cand_str(cands[1]);
+                let guess = futex_holder_guess(&cands);
+                sup!(
+                    "binder: wedge-servicer-futex arena={ss_arena} pid={x} servicer_leader={leader} uaddr=0x{u:x} grp={futex_grp} acct=present waits={} wakes={} first_t={} last_waiter={}@{} last_waker={}@{} last_done={}@{} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
+                    a.waits,
+                    a.wakes,
+                    a.first_t,
+                    a.last_wait_pid,
+                    a.last_wait_t,
+                    a.last_wake_pid,
+                    a.last_wake_t,
+                    a.last_done_pid,
+                    a.last_done_t
+                );
+            }
+            None => {
+                sup!(
+                    "binder: wedge-servicer-futex arena={ss_arena} pid={x} servicer_leader={leader} uaddr=0x{u:x} grp={futex_grp} acct=missing waits=- wakes=- first_t=- last_waiter=- last_waker=- last_done=- cand1=- cand2=- holder_guess=none t={now}"
+                );
+            }
+        }
+    }
 }
 
 /// The tracing loop, shared verbatim by W0 and every
@@ -18209,6 +18383,47 @@ fn wedge_snapshot(
         }
         if solo_groups == 1 {
             *solo_out = Some(solo_pid);
+        }
+        // 0.9.163 (s10-163-spec section 3.3 seat
+        // B): holder-candidate lines for the
+        // multi-waiter groups only, after the group
+        // lines above; solo groups keep the
+        // standing verdict path, untouched. The
+        // waiter list is the snapshot's own grouping
+        // (the authoritative face); an absent
+        // account dashes its columns and names no
+        // candidate.
+        for (u, ws) in &futex_groups {
+            if ws.len() < 2 {
+                continue;
+            }
+            let now = field_t_ms();
+            match futex_acct.get(&(leader, *u)) {
+                Some(a) => {
+                    let cands = futex_holder_candidates(a, ws);
+                    let cand1 = futex_cand_str(cands[0]);
+                    let cand2 = futex_cand_str(cands[1]);
+                    let guess = futex_holder_guess(&cands);
+                    sup!(
+                        "binder: wedge-futex-holder arena={leader} uaddr=0x{u:x} waiters={} waits={} wakes={} last_waiter={}@{} last_waker={}@{} last_done={}@{} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
+                        ws.len(),
+                        a.waits,
+                        a.wakes,
+                        a.last_wait_pid,
+                        a.last_wait_t,
+                        a.last_wake_pid,
+                        a.last_wake_t,
+                        a.last_done_pid,
+                        a.last_done_t
+                    );
+                }
+                None => {
+                    sup!(
+                        "binder: wedge-futex-holder arena={leader} uaddr=0x{u:x} waiters={} waits=- wakes=- last_waiter=- last_waker=- last_done=- cand1=- cand2=- holder_guess=none t={now}",
+                        ws.len()
+                    );
+                }
+            }
         }
     }
     true
@@ -19284,6 +19499,7 @@ fn tracer_loop(ctx: TracerCtx) {
             &mut vcreds,
             &mut shard_root,
             &mut dump_candidate,
+            &futex_acct,
             selfpipe_rd,
         ) {
             NextStop::Stop(p, s, reap, idle) => {
@@ -19615,6 +19831,11 @@ fn tracer_loop(ctx: TracerCtx) {
                     } else {
                         pid
                     };
+                    // 0.9.163 (s10-163-spec section
+                    // 3.1): the entry instant rides
+                    // into the account's time
+                    // columns (see futex_acct_add).
+                    let ft = field_t_ms();
                     if let Some((u, _, _)) = pend.last_futex {
                         // 0.9.152 (M-c): the wait book
                         // opens this thread's wait at
@@ -19628,6 +19849,7 @@ fn tracer_loop(ctx: TracerCtx) {
                             u,
                             true,
                             pid,
+                            ft,
                         );
                     }
                     if let Some((u, _)) = pend.last_wake {
@@ -19638,6 +19860,7 @@ fn tracer_loop(ctx: TracerCtx) {
                             u,
                             false,
                             pid,
+                            ft,
                         );
                     }
                 }
@@ -20837,6 +21060,26 @@ fn tracer_loop(ctx: TracerCtx) {
                             if ou == u {
                                 futex_wait_last
                                     .insert(pid, (u, t0, field_t_ms()));
+                                // 0.9.163 (s10-163-spec
+                                // section 3.1): the
+                                // completion lands in
+                                // the futex account's
+                                // last_done_* at the
+                                // same seat (existing
+                                // entry only; see
+                                // futex_acct_wait_done).
+                                let leader = if proc.proc_leader != 0 {
+                                    proc.proc_leader
+                                } else {
+                                    pid
+                                };
+                                futex_acct_wait_done(
+                                    &mut futex_acct,
+                                    leader,
+                                    u,
+                                    pid,
+                                    field_t_ms(),
+                                );
                             }
                         }
                     }
@@ -22841,16 +23084,16 @@ mod tests {
     fn futex_account_counts_and_names_last_waker() {
         let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
         let mut addrs: HashMap<i32, usize> = HashMap::new();
-        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101);
-        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 102);
-        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, false, 103);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101, 1000);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 102, 1001);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, false, 103, 1002);
         let a = map[&(100, 0x2000)];
         assert_eq!(a.waits, 2);
         assert_eq!(a.wakes, 1);
         assert_eq!(a.last_wake_pid, 103);
         // Another arena's account at the same uaddr
         // is a separate entry (the cross-arena seat).
-        futex_acct_add(&mut map, &mut addrs, 200, 0x2000, false, 201);
+        futex_acct_add(&mut map, &mut addrs, 200, 0x2000, false, 201, 1003);
         assert_eq!(map[&(200, 0x2000)].wakes, 1);
         assert_eq!(map[&(100, 0x2000)].wakes, 1);
     }
@@ -22860,15 +23103,118 @@ mod tests {
         let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
         let mut addrs: HashMap<i32, usize> = HashMap::new();
         for i in 0..FUTEX_ACCT_CAP as u32 {
-            futex_acct_add(&mut map, &mut addrs, 100, 0x1000 + i * 4, true, 101);
+            futex_acct_add(&mut map, &mut addrs, 100, 0x1000 + i * 4, true, 101, 7);
         }
         assert_eq!(map.len(), FUTEX_ACCT_CAP);
         // Past the cap a new address is never
         // entered, but an entered one keeps counting.
-        futex_acct_add(&mut map, &mut addrs, 100, 0x9999, false, 101);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x9999, false, 101, 8);
         assert!(!map.contains_key(&(100, 0x9999)));
-        futex_acct_add(&mut map, &mut addrs, 100, 0x1000, false, 101);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x1000, false, 101, 9);
         assert_eq!(map[&(100, 0x1000)].wakes, 1);
+    }
+
+    // 0.9.163 (s10-163-spec sections 3.1 / 3.2):
+    // the account's time columns, the wait-done
+    // completion stamp and the holder-candidate
+    // decision tree. Pure ledger only -- no tracer,
+    // no guest.
+    #[test]
+    fn futex_account_records_time_columns() {
+        let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
+        let mut addrs: HashMap<i32, usize> = HashMap::new();
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101, 111);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 102, 222);
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, false, 103, 333);
+        let a = map[&(100, 0x2000)];
+        assert_eq!(a.first_t, 111);
+        assert_eq!(a.last_wait_pid, 102);
+        assert_eq!(a.last_wait_t, 222);
+        assert_eq!(a.last_wake_pid, 103);
+        assert_eq!(a.last_wake_t, 333);
+        assert_eq!(a.last_done_pid, 0);
+        assert_eq!(a.last_done_t, 0);
+        // An account opened by a wake takes that
+        // call's instant as its first_t too.
+        futex_acct_add(&mut map, &mut addrs, 100, 0x3000, false, 104, 444);
+        assert_eq!(map[&(100, 0x3000)].first_t, 444);
+    }
+
+    #[test]
+    fn futex_account_wait_done_updates_existing_only() {
+        let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
+        let mut addrs: HashMap<i32, usize> = HashMap::new();
+        // No account: nothing is created, false.
+        assert!(!futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555));
+        assert!(!map.contains_key(&(100, 0x2000)));
+        futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101, 111);
+        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555));
+        let a = map[&(100, 0x2000)];
+        assert_eq!(a.last_done_pid, 101);
+        assert_eq!(a.last_done_t, 555);
+        // A later completion overwrites; another
+        // arena's key is a different entry and
+        // stays absent.
+        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 102, 666));
+        assert_eq!(map[&(100, 0x2000)].last_done_pid, 102);
+        assert_eq!(map[&(100, 0x2000)].last_done_t, 666);
+        assert!(!futex_acct_wait_done(&mut map, 200, 0x2000, 201, 777));
+    }
+
+    #[test]
+    fn futex_holder_candidates_decision_tree() {
+        let waiters = [60, 61];
+        // No evidence at all: no candidate (pid 0
+        // never qualifies).
+        let a = FutexAcct::default();
+        assert_eq!(futex_holder_candidates(&a, &waiters), [(0, "-"), (0, "-")]);
+        // Only a completed wait.
+        let mut a = FutexAcct::default();
+        a.last_done_pid = 50;
+        assert_eq!(
+            futex_holder_candidates(&a, &waiters),
+            [(50, "wait-done"), (0, "-")]
+        );
+        // Only a wake.
+        let mut a = FutexAcct::default();
+        a.last_wake_pid = 70;
+        assert_eq!(
+            futex_holder_candidates(&a, &waiters),
+            [(70, "last-wake"), (0, "-")]
+        );
+        // Both evidences, same pid: merged into
+        // one slot at the strongest basis.
+        let mut a = FutexAcct::default();
+        a.last_done_pid = 50;
+        a.last_wake_pid = 50;
+        assert_eq!(
+            futex_holder_candidates(&a, &waiters),
+            [(50, "wait-done+last-wake"), (0, "-")]
+        );
+        // Both evidences, different pids: the
+        // wait-done candidate outranks last-wake.
+        let mut a = FutexAcct::default();
+        a.last_done_pid = 50;
+        a.last_wake_pid = 70;
+        assert_eq!(
+            futex_holder_candidates(&a, &waiters),
+            [(50, "wait-done"), (70, "last-wake")]
+        );
+        // A candidate sitting in the waiters is
+        // waiting, not holding: it is excluded and
+        // the other evidence takes the first slot.
+        let mut a = FutexAcct::default();
+        a.last_done_pid = 60;
+        a.last_wake_pid = 70;
+        assert_eq!(
+            futex_holder_candidates(&a, &waiters),
+            [(70, "last-wake"), (0, "-")]
+        );
+        // Both evidences inside the waiters: none.
+        let mut a = FutexAcct::default();
+        a.last_done_pid = 60;
+        a.last_wake_pid = 61;
+        assert_eq!(futex_holder_candidates(&a, &waiters), [(0, "-"), (0, "-")]);
     }
 
     // 0.9.147 (s9-147-desk section 2): the gated
