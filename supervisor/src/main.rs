@@ -3543,6 +3543,21 @@ struct SyncStamp {
 /// arena nobody settles stay until the cap trims
 /// them. Telemetry only: no field is read by any
 /// pairing, delivery, shield or discipline path.
+/// 0.9.161 (s10-maingate-case section 4 item
+/// ii): two completion-leg-side columns join the
+/// record, both taken at claim time from the
+/// coordinator's own tables (see claim_env):
+/// athread_sig, the claim-instant shape of the
+/// claimer arena's downstream face -- the
+/// supervisor-side stand-in for the completion
+/// leg executor's stack shape, which itself
+/// lives only in the guest's traces -- and
+/// surf_claim, whether the claimer arena had an
+/// unreplied send outstanding at the claim
+/// instant. The settlement's classification keys
+/// on leg-side evidence from this build on (see
+/// leg_class); depth stays a printed column and
+/// keys nothing.
 struct CrashLeg {
     arena: String,
     claim_seq: u64,
@@ -3552,6 +3567,38 @@ struct CrashLeg {
     depth: u32,
     t_claim: u64,
     t_resolved: Option<u64>,
+    athread_sig: u8,
+    surf_claim: bool,
+}
+
+/// 0.9.161: the claim-instant downstream shape
+/// of a crash leg's arena (see CrashLeg), as a
+/// pure function of two counts read off the
+/// coordinator's tables: how many of the arena's
+/// parked threads sit in a registered reply wait,
+/// and how many sends the arena has outstanding
+/// (queued waits plus claimed frames). A parked
+/// reply waiter means the downstream path the
+/// completion leg needs is occupied by a thread
+/// frozen mid-call; outstanding sends without a
+/// parked waiter mean the path is loaded but its
+/// senders are elsewhere; neither is quiet.
+fn leg_env_sig(parked_waiters: u32, out_waits: u32) -> u8 {
+    if parked_waiters > 0 {
+        2
+    } else if out_waits > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn leg_env_sig_name(sig: u8) -> &'static str {
+    match sig {
+        2 => "wait",
+        1 => "queued",
+        _ => "quiet",
+    }
 }
 
 /// 0.9.153 (s10-152-verify section 5): one arena's
@@ -3687,6 +3734,51 @@ fn surface_top(cands: &[SurfCand], n: usize) -> Vec<&SurfCand> {
     });
     idx.truncate(n);
     idx.iter().map(|i| &cands[*i]).collect()
+}
+
+/// 0.9.161 (s10-maingate-case section 4 item
+/// ii): the completion-leg-side environment of
+/// one arena at a crash claim's instant, read
+/// off the coordinator's tables: the leg_env_sig
+/// shape and whether the arena has any unreplied
+/// send outstanding (a queued wait addressed to
+/// another arena, or a claimed frame on another
+/// arena's stack, whose sender is this arena).
+/// Pure reads, taken once per crash claim at the
+/// claim seat; the values ride the CrashLeg to
+/// its settlement and feed nothing else.
+fn claim_env(st: &BinderState, arena: &str) -> (u8, bool) {
+    let mut out_waits = 0u32;
+    for q in st.waiters.values() {
+        for w in q {
+            if w.sender_arena == arena {
+                out_waits += 1;
+            }
+        }
+    }
+    for stack in st.serving.values() {
+        for g in &stack.groups {
+            for fr in &g.frames {
+                if let ServingFrame::Reply(w, _) = fr {
+                    if w.sender_arena == arena {
+                        out_waits += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut parked_waiters = 0u32;
+    for p in st.parked.keys() {
+        if st.thread_arena.get(p).map(|a| a.as_str()) == Some(arena)
+            && find_wait_for_sender(st, *p).is_some()
+        {
+            parked_waiters += 1;
+        }
+    }
+    (
+        leg_env_sig(parked_waiters, out_waits),
+        out_waits > 0,
+    )
 }
 
 /// 0.9.142 (s9-142-desk section 3.2): one entry of
@@ -5514,11 +5606,13 @@ impl CoordClient {
     /// arena's downstream surface evidence (see
     /// SurfEv) and the cumulative crash-leg noise
     /// total, returned beside the legs.
+    /// 0.9.161: each leg also carries its
+    /// claim-time leg-side columns (see CrashLeg).
     fn crash_legs(
         &mut self,
         leader: i32,
     ) -> (
-        Vec<(u64, i32, i32, String, u32, u64, u64)>,
+        Vec<(u64, i32, i32, String, u32, u64, u64, u8, bool)>,
         Option<SurfEv>,
         u64,
     ) {
@@ -5536,6 +5630,8 @@ impl CoordClient {
             let depth = d.u32();
             let t_claim = d.u64();
             let t_resolved = d.u64();
+            let athread_sig = d.u32() as u8;
+            let surf_claim = d.u32() != 0;
             out.push((
                 seq,
                 claimer,
@@ -5544,6 +5640,8 @@ impl CoordClient {
                 depth,
                 t_claim,
                 t_resolved,
+                athread_sig,
+                surf_claim,
             ));
         }
         let surf = if d.u32() == 1 {
@@ -7325,6 +7423,10 @@ impl CoordServer {
                     e.u32(leg.depth);
                     e.u64(leg.t_claim);
                     e.u64(leg.t_resolved.unwrap_or(0));
+                    // 0.9.161: the leg-side columns
+                    // ride the same response.
+                    e.u32(leg.athread_sig as u32);
+                    e.u32(leg.surf_claim as u32);
                 }
                 // 0.9.153: the settlement's downstream
                 // evidence (the arena's latest wedge-
@@ -10318,6 +10420,64 @@ fn print_inferred(arena: &str, pid: i32, inf: &[InferredWait]) {
     }
 }
 
+/// 0.9.161 (s10-maingate-case section 4, the
+/// M-b widening): the servicer arenas a wedge
+/// snapshot photographs whole -- the arenas its
+/// claimed out-waits named first, then the
+/// target arenas of its merely-queued out-waits,
+/// the wedged arena itself excluded (its own
+/// face is the dump's main body), capped at
+/// four so a snapshot's copy volume stays
+/// bounded no matter how many arenas the tenure
+/// was talking to. Pure selection; the caller
+/// prints.
+fn face_arena_list(
+    claimed: &[String],
+    queued_targets: &[String],
+    own: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in claimed.iter().chain(queued_targets.iter()) {
+        if a.as_str() != own && !out.contains(a) {
+            out.push(a.clone());
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
+/// 0.9.161: fold one photographed thread's park
+/// kind into its servicer arena's summary counts
+/// ([wait-reply, wait-reply-inferred, idle]; see
+/// the wedge-servicer-summary line in
+/// binder_wedge_chain). A thread that was not
+/// parked printed no line and counts nothing;
+/// a thread the dump printed twice (an arena
+/// with two named servicers runs its census
+/// twice) counts once -- the counted set is the
+/// guard.
+fn kind_count(
+    counts: &mut HashMap<String, [u64; 3]>,
+    counted: &mut HashSet<(String, i32)>,
+    arena: &str,
+    pid: i32,
+    kind: Option<&'static str>,
+) {
+    if let Some(k) = kind {
+        if !counted.insert((arena.to_string(), pid)) {
+            return;
+        }
+        let e = counts.entry(arena.to_string()).or_default();
+        match k {
+            "wait-reply" => e[0] += 1,
+            "wait-reply-inferred" => e[1] += 1,
+            _ => e[2] += 1,
+        }
+    }
+}
+
 /// One parked thread's wedge-servicer-park line
 /// plus its inferred-waits lines, in the shape the
 /// chain dump has printed since 0.9.141 (S6).
@@ -10326,16 +10486,21 @@ fn print_inferred(arena: &str, pid: i32, inf: &[InferredWait]) {
 /// binder_wedge_chain prints the whole arena in
 /// exactly the per-thread shape the single named
 /// servicer always got. Pure reads, like every
-/// caller.
+/// caller. 0.9.161: the park kind it judged is
+/// returned (None when the thread is not parked
+/// and no line printed) so binder_wedge_chain
+/// can settle each photographed arena's
+/// wait-reply summary from the same judgements
+/// its per-thread lines carry.
 fn print_servicer_park<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     st: &BinderState,
     arena: &str,
     s_arena: &str,
     x: i32,
     rd: &mut R,
-) {
+) -> Option<&'static str> {
     let Some(park) = st.parked.get(&x) else {
-        return;
+        return None;
     };
     let fs = decode_frozen_stream(rd, x, park);
     let inferred = frozen_inferred(st, s_arena, x, &fs);
@@ -10357,6 +10522,7 @@ fn print_servicer_park<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         "binder: wedge-servicer-park arena={arena} servicer_arena={s_arena} pid={x} park_kind={kind} target_arena={t_s} code={c_s} frozen_full=[{skel}]"
     );
     print_inferred(s_arena, x, &inferred);
+    Some(kind)
 }
 
 /// 0.9.142 (s9-142-desk section 2.4): the reverse
@@ -10836,6 +11002,29 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     servicer_hits.sort();
     servicer_hits.dedup();
     servicer_hits.truncate(2);
+    // 0.9.161 (s10-maingate-case section 4, the
+    // M-b widening): the arenas this snapshot
+    // photographs whole -- the claimed servicers
+    // below plus the target arenas of this
+    // arena's queued out-waits, whose servicer
+    // face the claimed scan never names (a
+    // surface call still queued at the snapshot
+    // instant leaves SF unphotographed under the
+    // pre-.161 selection, exactly the gate-2
+    // instants the photograph exists for). The
+    // per-arena park-kind counts the servicer
+    // summary settles are gathered from this
+    // point on.
+    let face_arenas = face_arena_list(
+        &servicer_hits
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect::<Vec<_>>(),
+        &out_waits.iter().map(|w| w.1.clone()).collect::<Vec<_>>(),
+        &arena,
+    );
+    let mut kind_counts: HashMap<String, [u64; 3]> = HashMap::new();
+    let mut kind_counted: HashSet<(String, i32)> = HashSet::new();
     for (s_arena, x) in &servicer_hits {
         let x = *x;
         bsup!(
@@ -10912,7 +11101,8 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={x} depth={depth} frames=[{frames}]"
         );
-        print_servicer_park(st, arena.as_str(), s_arena, x, rd);
+        let k = print_servicer_park(st, arena.as_str(), s_arena, x, rd);
+        kind_count(&mut kind_counts, &mut kind_counted, s_arena, x, k);
         // 0.9.152 (s10-frontdoor-desk section 6
         // M-b): the servicer arena's whole parked
         // face, in the same per-thread shape --
@@ -10944,10 +11134,98 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             );
             for q in arena_parked.iter().take(16) {
                 if *q != x {
-                    print_servicer_park(st, arena.as_str(), s_arena, *q, rd);
+                    let k =
+                        print_servicer_park(st, arena.as_str(), s_arena, *q, rd);
+                    kind_count(
+                        &mut kind_counts,
+                        &mut kind_counted,
+                        s_arena,
+                        *q,
+                        k,
+                    );
                 }
             }
         }
+    }
+    // 0.9.161: the face arenas the claimed
+    // servicer view above did not already
+    // photograph (named only by a queued
+    // out-wait) get the same whole-arena face
+    // here: every serving stack in the servicer
+    // shape, then the parked census in the
+    // servicer-park shape, cap 16 as there. Then
+    // every face arena's wait-reply summary
+    // settles from the park kinds its own lines
+    // judged above (the census lines carry the
+    // true parked totals; the summary counts the
+    // threads whose lines were printed).
+    for s_arena in &face_arenas {
+        if servicer_hits.iter().any(|(a, _)| a == s_arena) {
+            continue;
+        }
+        let mut stack_pids2: Vec<i32> = st
+            .serving
+            .iter()
+            .filter(|(_, s)| &s.arena == s_arena)
+            .map(|(p, _)| *p)
+            .collect();
+        stack_pids2.sort_unstable();
+        for tpid in &stack_pids2 {
+            let stack = &st.serving[tpid];
+            let mut parts: Vec<String> = Vec::new();
+            for g in &stack.groups {
+                for fr in &g.frames {
+                    match fr {
+                        ServingFrame::Reply(w, _) => {
+                            parts.push(format!("({},{})", w.sender_pid, w.code))
+                        }
+                        ServingFrame::Other => {
+                            parts.push("(-,oneway)".to_string())
+                        }
+                    }
+                }
+            }
+            let depth = stack.depth();
+            let frames = parts.join(",");
+            bsup!(
+                "binder: wedge-servicer-serving arena={arena} servicer_arena={s_arena} pid={tpid} depth={depth} frames=[{frames}]"
+            );
+        }
+        let mut arena_parked: Vec<i32> = st
+            .parked
+            .keys()
+            .copied()
+            .filter(|q| st.thread_arena.get(q) == Some(s_arena))
+            .collect();
+        arena_parked.sort_unstable();
+        let serving_n = st
+            .serving
+            .values()
+            .filter(|s| &s.arena == s_arena)
+            .count();
+        bsup!(
+            "binder: wedge-servicer-arena arena={arena} servicer_arena={s_arena} parked={} serving={serving_n}",
+            arena_parked.len()
+        );
+        for q in arena_parked.iter().take(16) {
+            let k = print_servicer_park(st, arena.as_str(), s_arena, *q, rd);
+            kind_count(&mut kind_counts, &mut kind_counted, s_arena, *q, k);
+        }
+    }
+    for s_arena in &face_arenas {
+        let c = kind_counts.get(s_arena).copied().unwrap_or([0; 3]);
+        let serving_n = st
+            .serving
+            .values()
+            .filter(|s| &s.arena == s_arena)
+            .count();
+        bsup!(
+            "binder: wedge-servicer-summary arena={arena} servicer_arena={s_arena} parked={} idle={} wait_reply={} wait_reply_inferred={} serving={serving_n}",
+            c[0] + c[1] + c[2],
+            c[2],
+            c[0],
+            c[1]
+        );
     }
     // 0.9.153: the wedged arena's own sends among
     // the surface candidates below, across every
@@ -10968,7 +11246,12 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     // went in long before the snapshot and never
     // came back is the gate-2 shape in numbers.
     // Pure reads of the same tables.
-    for (s_arena, _) in &servicer_hits {
+    // 0.9.161: the account iterates the face
+    // arenas, not only the claimed servicers --
+    // an arena named by a queued out-wait alone
+    // now gets its unreplied account (and its
+    // share of the SurfEv evidence) too.
+    for s_arena in &face_arenas {
         let mut cands: Vec<SurfCand> = Vec::new();
         if let Some(q) = st.waiters.get(s_arena) {
             for w in q {
@@ -13307,19 +13590,34 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                             st.crash_legs.retain(|l| l.claim_seq != ds);
                         }
                     }
+                    // 0.9.161: the leg-side columns
+                    // are read at this same instant,
+                    // before the leg joins the ledger
+                    // (see claim_env). The depth is
+                    // copied out first: claim_env
+                    // reads the whole state, so the
+                    // serving stack's borrow ends
+                    // here, as it does for the
+                    // evidence tags below.
+                    let depth_now = stack.depth() as u32;
+                    let (athread_sig, surf_claim) = claim_env(st, arena);
                     st.crash_legs.push(CrashLeg {
                         arena: arena.to_string(),
                         claim_seq: seq,
                         claimer: pid,
                         sender_pid: wsender,
                         sender_arena: wsarena.clone(),
-                        depth: stack.depth() as u32,
+                        depth: depth_now,
                         t_claim: field_t_ms(),
                         t_resolved: None,
+                        athread_sig,
+                        surf_claim,
                     });
                     bsup!(
-                        "binder: crash-leg claim claim_seq={seq} arena={arena} claimer={pid} sender={wsender} depth={} t={}",
-                        stack.depth(),
+                        "binder: crash-leg claim claim_seq={seq} arena={arena} claimer={pid} sender={wsender} depth={} athread_sig={} surf_claim={} t={}",
+                        depth_now,
+                        leg_env_sig_name(athread_sig),
+                        surf_claim as u32,
                         field_t_ms()
                     );
                 }
@@ -17978,64 +18276,66 @@ fn fire_wedge_chain(
 /// classify one crash leg at its tenure's death,
 /// from supervisor-visible evidence only. Returns
 /// (class, basis). Resolved legs need no class.
-/// An open leg claimed nested (depth >= 2) is
-/// gate1: the claimer's outer serving frame is
-/// the monitor-holding chain of the .146 shape.
-/// An open pool-root leg splits on the AMS
-/// monitor's futex queue as the wedge snapshot
-/// grouped it: a queue on some other address --
-/// two or more waiters, or the leader itself
-/// among them -- means a third party holds the
-/// monitor and is blocked downstream (gate1v,
-/// the AThread variant); no such queue leaves
-/// the completion leg's WMS / SF path as the
-/// blocker (gate2). No snapshot groups at all
-/// reads gate2 on a no-snapshot basis, named as
-/// such so forensics can re-judge.
 /// 0.9.153 (s10-152-verify section 2.7): the
-/// gate2 branch additionally takes the tenure's
-/// downstream surface evidence (surf: the wedge
-/// snapshot's surface account found this arena's
-/// own sends into a servicer still unreplied).
-/// When a record exists its verdict stands in
-/// the basis (depth+surf / surf when present,
-/// depth+nosurf / nosurf when the account ran
-/// and found none), keying gate2 on completion-
-/// leg-side evidence; with no record the claim-
-/// side bases above stand unchanged. The
-/// resolved / gate1 / gate1v keys do not consult
-/// surf at all and are byte-identical to .152.
+/// gate2 branch took the tenure's downstream
+/// surface evidence (surf: the wedge snapshot's
+/// surface account found this arena's own sends
+/// into a servicer still unreplied) as its key.
+/// 0.9.161 (s10-maingate-case section 4 item
+/// ii): the classification key moves to the
+/// completion-leg side whole. Through 0.9.160
+/// the claim-side geometry keyed first -- a
+/// nested claim (depth >= 2) read gate1 and a
+/// pool-root claim with a monitor queue read
+/// gate1v before surf was ever consulted -- so
+/// legs whose physical block sat on the
+/// completion leg (WMS / SF) landed in the
+/// gate1 / gate1v buckets and the per-gate leg
+/// account the case's C1 / C2 verdicts need did
+/// not exist. From this build the keys are, in
+/// order: resolved (the reply pop) stands; a
+/// surface record with unreplied sends stands
+/// gate2, its basis naming the claim-time
+/// surface flag beside it (surf+claim / surf);
+/// a surface record that ran and found none
+/// clears the leg's downstream path, and the
+/// monitor's futex queue as the wedge snapshot
+/// grouped it splits the rest -- a queue on some
+/// other address (two or more waiters, or the
+/// leader itself among them) means the
+/// completion leg's executor was itself blocked
+/// at the monitor (gate1v, nosurf+queue), no
+/// such queue leaves the claimer's own chain as
+/// the only seat the block can sit on (gate1,
+/// nosurf / nosurf+noqueue); with no surface
+/// record at all the queue alone splits gate1v
+/// (queue) from gate2 (noqueue / no-snapshot),
+/// named as such so forensics can re-judge.
+/// depth is still printed on the claim and
+/// settle lines as a column; it keys nothing.
 fn leg_class(
-    depth: u32,
     resolved: bool,
     queue: Option<bool>,
     surf: Option<bool>,
+    surf_claim: bool,
 ) -> (&'static str, &'static str) {
     if resolved {
         return ("resolved", "pop");
     }
-    if depth >= 2 {
-        return ("gate1", "depth");
-    }
-    if queue == Some(true) {
-        return ("gate1v", "depth+queue");
-    }
     match surf {
         Some(true) => (
             "gate2",
-            if queue.is_some() { "depth+surf" } else { "surf" },
+            if surf_claim { "surf+claim" } else { "surf" },
         ),
-        Some(false) => (
-            "gate2",
-            if queue.is_some() {
-                "depth+nosurf"
-            } else {
-                "nosurf"
-            },
-        ),
+        Some(false) => match queue {
+            Some(true) => ("gate1v", "nosurf+queue"),
+            Some(false) => ("gate1", "nosurf"),
+            None => ("gate1", "nosurf+noqueue"),
+        },
         None => match queue {
-            Some(false) => ("gate2", "depth+noqueue"),
-            _ => ("gate2", "no-snapshot"),
+            Some(true) => ("gate1v", "queue"),
+            Some(false) => ("gate2", "noqueue"),
+            None => ("gate2", "no-snapshot"),
         },
     }
 }
@@ -18105,6 +18405,10 @@ fn settle_crash_legs(
     // evidence keys every leg's gate2 verdict
     // (see leg_class); the record's own fields
     // ride the settle lines below.
+    // 0.9.161: leg_class keys on the leg side
+    // whole (see its note); each leg's own
+    // claim-time leg-side columns ride the same
+    // lines beside depth.
     let surf = surf_ev.map(|e| e.n > 0);
     let surf_s = match &surf_ev {
         Some(e) => format!("n={} sender={} code={}", e.n, e.sender, e.code),
@@ -18112,7 +18416,9 @@ fn settle_crash_legs(
     };
     let now = field_t_ms();
     let queue_known = !wedge_groups.is_empty();
-    for (seq, claimer, sender, _s_arena, depth, t_claim, t_resolved) in &legs {
+    for (seq, claimer, sender, _s_arena, depth, t_claim, t_resolved, athread_sig, surf_claim) in
+        &legs
+    {
         let resolved = *t_resolved > 0;
         let sleep = leg_sleep_pick(
             wait_open.get(claimer).copied(),
@@ -18128,7 +18434,7 @@ fn settle_crash_legs(
                     && (ws.len() >= 2 || ws.contains(&leader))
             }))
         };
-        let (class, basis) = leg_class(*depth, resolved, queue, surf);
+        let (class, basis) = leg_class(resolved, queue, surf, *surf_claim);
         let (u_s, start_s, ms_s, vs_s) = match sleep {
             Some((u, t0, t1)) => {
                 let end = t1.unwrap_or(now);
@@ -18148,7 +18454,9 @@ fn settle_crash_legs(
             ),
         };
         sup!(
-            "binder: crash-leg settle arena={leader} claim_seq={seq} claimer={claimer} sender={sender} depth={depth} class={class} basis={basis} claim_t={t_claim} sleep_uaddr={u_s} sleep_start_t={start_s} sleep_ms={ms_s} vs300={vs_s} surf={surf_s} resolved={} span_ms={}",
+            "binder: crash-leg settle arena={leader} claim_seq={seq} claimer={claimer} sender={sender} depth={depth} athread_sig={} surf_claim={} class={class} basis={basis} claim_t={t_claim} sleep_uaddr={u_s} sleep_start_t={start_s} sleep_ms={ms_s} vs300={vs_s} surf={surf_s} resolved={} span_ms={}",
+            leg_env_sig_name(*athread_sig),
+            *surf_claim as u32,
             if resolved { "yes" } else { "no" },
             if resolved {
                 t_resolved.saturating_sub(*t_claim).to_string()
@@ -18205,6 +18513,36 @@ fn settle_crash_legs(
 /// had to be read off a later tenure's leftovers
 /// or not at all). The keyword pass and the
 /// whole-section fallback are unchanged.
+/// 0.9.161 (s10-maingate-case section 4 item
+/// i): the priority set becomes the fixed,
+/// unconditional census the case asks for --
+/// the holder's block, the AThread block, the
+/// WindowManager block, the WindowManagerPolicy
+/// block (the WMS lock holder of the gate-2
+/// shape, named in every .150-.152 copy but
+/// only ever selected by the keyword pass's
+/// Surface match, under its cap), and the
+/// waiting-point block: the thread whose own
+/// stack stands in the AppErrorResult wait (see
+/// is_wait_block), which through 0.9.160 shared
+/// the keyword pass's 200-line cap with every
+/// other Surface-named block. The set no longer
+/// drifts with the build's instrumentation
+/// focus: a tenure whose deciding blocks are
+/// any of these five prints them whole.
+/// 0.9.161: is this traces block the waiting
+/// point itself -- a thread whose stack stands
+/// inside AppErrorResult.get()'s wait? The wait
+/// frame names the class and the wait itself
+/// (Object.wait, under a "waiting on" line in
+/// the Dalvik dump). A block that merely
+/// mentions the class in passing (a lock line,
+/// a held-by note) is not the sleeper.
+fn is_wait_block(body: &str) -> bool {
+    body.contains("AppErrorResult")
+        && (body.contains("waiting on") || body.contains("Object.wait"))
+}
+
 /// One kept block's header line in the traces
 /// harvest (the format is field tooling; the
 /// fallback excerpt below prints the same shape
@@ -18302,12 +18640,17 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     }
     let is_main = |tid: i32, name: &str| tid == 1 || name == "main";
     // 0.9.152 (M-a): the priority set (see the
-    // note above wedge_block_header).
-    let is_prio = |tid: i32, name: &str, systid: &Option<i32>| {
+    // note above wedge_block_header). 0.9.161:
+    // WindowManagerPolicy and the waiting-point
+    // block join it (the body test costs a join
+    // per block; sections carry tens of blocks).
+    let is_prio = |tid: i32, name: &str, systid: &Option<i32>, blines: &[&str]| {
         is_main(tid, name)
             || (holder > 0 && *systid == Some(holder))
             || name == "ActivityManager"
             || name == "WindowManager"
+            || name == "WindowManagerPolicy"
+            || is_wait_block(&blines.join("\n"))
     };
     let mut printed = 0usize;
     let mut kept = 0usize;
@@ -18315,7 +18658,7 @@ fn wedge_traces_harvest(rootfs: &str, leader: i32, holder: i32) {
     // Priority pass: whole blocks, in file order,
     // outside the keyword pass's cap.
     for (i, (tid, name, blines, systid)) in blocks.iter().enumerate() {
-        if !is_prio(*tid, name, systid) {
+        if !is_prio(*tid, name, systid, blines) {
             continue;
         }
         done[i] = true;
@@ -22850,51 +23193,126 @@ mod tests {
     }
 
     // 0.9.152 (s10-frontdoor-desk section 6 M-c):
-    // the crash-leg settlement's classification,
-    // over synthetic legs: resolved beats depth,
-    // nested beats the queue test, and the queue
-    // test splits gate1v from gate2 (with the
-    // no-snapshot case named, not hidden).
+    // the crash-leg settlement's classification.
+    // 0.9.161 (s10-maingate-case section 4 item
+    // ii): the tree re-keyed to the completion-
+    // leg side -- resolved stands first; a
+    // surface record with unreplied sends keys
+    // gate2 whatever the claim-side geometry was
+    // (the .152-.160 tree read a nested claim as
+    // gate1 without consulting surf at all); a
+    // clean surface record hands the split to
+    // the monitor queue (gate1v with a queue,
+    // gate1 without); no record at all leaves
+    // the queue to split gate1v from gate2, with
+    // the no-snapshot case named, not hidden.
     #[test]
     fn leg_class_decision_tree() {
-        // The .152 keys, carried with surf=None:
-        // byte-identical verdicts.
-        assert_eq!(leg_class(1, true, None, None), ("resolved", "pop"));
+        assert_eq!(leg_class(true, None, None, false), ("resolved", "pop"));
         assert_eq!(
-            leg_class(3, true, Some(true), Some(true)),
+            leg_class(true, Some(true), Some(true), true),
             ("resolved", "pop")
         );
-        assert_eq!(leg_class(2, false, None, None), ("gate1", "depth"));
+        // Surface evidence present: gate2, the
+        // basis naming the claim-time flag beside
+        // it -- including over a monitor queue,
+        // which keyed gate1v through 0.9.160.
         assert_eq!(
-            leg_class(2, false, Some(false), Some(true)),
-            ("gate1", "depth")
+            leg_class(false, Some(true), Some(true), false),
+            ("gate2", "surf")
         );
         assert_eq!(
-            leg_class(1, false, Some(true), None),
-            ("gate1v", "depth+queue")
+            leg_class(false, None, Some(true), true),
+            ("gate2", "surf+claim")
         );
         assert_eq!(
-            leg_class(1, false, Some(true), Some(true)),
-            ("gate1v", "depth+queue")
+            leg_class(false, Some(false), Some(true), true),
+            ("gate2", "surf+claim")
+        );
+        // Surface account ran clean: the queue
+        // splits the executor-blocked variant
+        // from the claimer's own chain.
+        assert_eq!(
+            leg_class(false, Some(true), Some(false), false),
+            ("gate1v", "nosurf+queue")
         );
         assert_eq!(
-            leg_class(1, false, Some(false), None),
-            ("gate2", "depth+noqueue")
+            leg_class(false, Some(false), Some(false), true),
+            ("gate1", "nosurf")
         );
-        assert_eq!(leg_class(1, false, None, None), ("gate2", "no-snapshot"));
-        // 0.9.153: with a surface record the gate2
-        // basis names the downstream evidence (or
-        // its recorded absence).
         assert_eq!(
-            leg_class(1, false, Some(false), Some(true)),
-            ("gate2", "depth+surf")
+            leg_class(false, None, Some(false), false),
+            ("gate1", "nosurf+noqueue")
         );
-        assert_eq!(leg_class(1, false, None, Some(true)), ("gate2", "surf"));
+        // No surface record: the queue alone, the
+        // no-snapshot case named.
         assert_eq!(
-            leg_class(1, false, Some(false), Some(false)),
-            ("gate2", "depth+nosurf")
+            leg_class(false, Some(true), None, false),
+            ("gate1v", "queue")
         );
-        assert_eq!(leg_class(1, false, None, Some(false)), ("gate2", "nosurf"));
+        assert_eq!(
+            leg_class(false, Some(false), None, false),
+            ("gate2", "noqueue")
+        );
+        assert_eq!(
+            leg_class(false, None, None, false),
+            ("gate2", "no-snapshot")
+        );
+    }
+
+    // 0.9.161: the claim-time leg environment
+    // signature -- a parked reply waiter outranks
+    // mere outstanding sends, and an arena with
+    // neither is quiet.
+    #[test]
+    fn leg_env_sig_shapes() {
+        assert_eq!(leg_env_sig(0, 0), 0);
+        assert_eq!(leg_env_sig(0, 3), 1);
+        assert_eq!(leg_env_sig(1, 0), 2);
+        assert_eq!(leg_env_sig(2, 5), 2);
+        assert_eq!(leg_env_sig_name(0), "quiet");
+        assert_eq!(leg_env_sig_name(1), "queued");
+        assert_eq!(leg_env_sig_name(2), "wait");
+        assert_eq!(leg_env_sig_name(9), "quiet");
+    }
+
+    // 0.9.161: the traces waiting-point block --
+    // the sleeper's own stack (the AppErrorResult
+    // wait frame) is priority; a block that only
+    // names the class in a lock note is not.
+    #[test]
+    fn wait_block_needs_the_wait_frame() {
+        let sleeper = "\"Binder Thread #4\" prio=5 tid=12 WAIT\n  | sysTid=29035\n  - waiting on <0x1234> (a com.android.server.am.AppErrorResult)\n  at java.lang.Object.wait(Native Method)\n  at com.android.server.am.AppErrorResult.get(AppErrorResult.java:33)";
+        assert!(is_wait_block(sleeper));
+        let bystander = "\"main\" prio=5 tid=1 MONITOR\n  - waiting to lock <0x2345> (a com.android.server.am.AppErrorResult)\n  at com.android.server.am.ActivityManagerService.crashApplication(ActivityManagerService.java:6921)";
+        assert!(!is_wait_block(bystander));
+        let unrelated = "\"WindowManager\" prio=5 tid=17 NATIVE\n  at android.os.MessageQueue.nativePollOnce(Native Method)";
+        assert!(!is_wait_block(unrelated));
+    }
+
+    // 0.9.161: the snapshot's face arenas --
+    // claimed servicers first, queued targets
+    // behind them, the wedged arena itself never
+    // its own face, capped at four.
+    #[test]
+    fn face_arena_list_orders_and_caps() {
+        let claimed = vec!["sf".to_string(), "wms".to_string()];
+        let queued = vec![
+            "sf".to_string(),
+            "app".to_string(),
+            "ss".to_string(),
+            "drm".to_string(),
+            "gps".to_string(),
+        ];
+        assert_eq!(
+            face_arena_list(&claimed, &queued, "ss"),
+            vec!["sf", "wms", "app", "drm"]
+        );
+        assert!(face_arena_list(&[], &[], "ss").is_empty());
+        assert_eq!(
+            face_arena_list(&[], &["ss".to_string()], "ss"),
+            Vec::<String>::new()
+        );
     }
 
     // 0.9.153: the spawn gate's decision tree --
@@ -23350,12 +23768,18 @@ mod tests {
             depth: 1,
             t_claim: 123_000,
             t_resolved: None,
+            athread_sig: 2,
+            surf_claim: true,
         });
         let leg = &st.crash_legs[0];
         assert_eq!(leg.claim_seq, 42);
         assert_eq!(leg.depth, 1);
         assert!(leg.t_resolved.is_none());
         assert!(leg.arena.ends_with("/777"));
+        // 0.9.161: the leg-side columns ride the
+        // record intact.
+        assert_eq!(leg.athread_sig, 2);
+        assert!(leg.surf_claim);
     }
 
     // 0.9.155 (s10-sigsegv-desk section 5.3 item
