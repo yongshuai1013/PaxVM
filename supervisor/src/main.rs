@@ -1788,6 +1788,15 @@ struct FutexAcct {
     last_wake_t: u64,
     last_done_pid: i32,
     last_done_t: u64,
+    // 0.9.165 (s10-sf-futex-desk section 5): the
+    // completing wait's return value (r0 at the
+    // exit stop), so a completion with no ledgered
+    // WAKE can be told apart on sight -- 0 woken,
+    // -110 timeout, -11 value-changed instant
+    // return. Completions ride the host kernel
+    // (futex passes through untouched); this field
+    // only names which exit the last one took.
+    last_done_ret: i32,
 }
 
 const FUTEX_ACCT_CAP: usize = 512;
@@ -1847,11 +1856,13 @@ fn futex_acct_wait_done(
     uaddr: u32,
     pid: i32,
     t: u64,
+    ret: i32,
 ) -> bool {
     match map.get_mut(&(leader, uaddr)) {
         Some(a) => {
             a.last_done_pid = pid;
             a.last_done_t = t;
+            a.last_done_ret = ret;
             true
         }
         None => false,
@@ -18031,6 +18042,35 @@ fn next_stop(
                             print_servicer_face(&arena, *x, procs, futex_acct);
                         }
                     }
+                    // 0.9.165 (s10-sf-futex-desk
+                    // section 5): roster lines for the
+                    // named threads' family members
+                    // the coordinator did not name, so
+                    // a silent thread of the servicer
+                    // proc is photographed too (see
+                    // print_servicer_roster).
+                    let mut roots: Vec<i32> = Vec::new();
+                    for x in &pids {
+                        if procs.contains_key(x) {
+                            let r = proc_root_of(procs, *x);
+                            if !roots.contains(&r) {
+                                roots.push(r);
+                            }
+                        }
+                    }
+                    if !roots.is_empty() {
+                        let mut members: Vec<i32> = procs
+                            .keys()
+                            .copied()
+                            .filter(|p| {
+                                !pids.contains(p) && roots.contains(&proc_root_of(procs, *p))
+                            })
+                            .collect();
+                        members.sort_unstable();
+                        for m in members {
+                            print_servicer_roster(&arena, m, procs);
+                        }
+                    }
                 }
             }
         }
@@ -18228,6 +18268,60 @@ fn do_handoff(
     );
 }
 
+/// The process root of a tracee inside this
+/// worker: walk the parent chain to its top (the
+/// same walk print_servicer_face's leader_of
+/// closure performs inline).
+fn proc_root_of(procs: &HashMap<i32, ProcState>, mut p: i32) -> i32 {
+    for _ in 0..512 {
+        match procs.get(&p) {
+            Some(pr) if pr.parent != 0 && pr.parent != p && procs.contains_key(&pr.parent) => {
+                p = pr.parent;
+            }
+            _ => break,
+        }
+    }
+    p
+}
+
+/// 0.9.165 (s10-sf-futex-desk section 5): one
+/// roster line for a servicer family member the
+/// coordinator did NOT name. The face seats only
+/// print threads that interact with the wedged
+/// arena; a thread that serves nobody and sleeps
+/// in a plain pass-through syscall never enters
+/// a face -- in the 0.9.164 field exactly one SF
+/// thread spent the whole run in that blind spot,
+/// its fate unrecorded. State derivation mirrors
+/// print_servicer_face's, minus the futex group
+/// scan. Coverage is this worker's own shard,
+/// the same limit the faces have.
+fn print_servicer_roster(arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
+    let Some(proc) = procs.get(&x) else {
+        return;
+    };
+    let root = proc_root_of(procs, x);
+    let (last_syscall, state) = match &proc.pending {
+        Some(pd) => {
+            let ls = format!("{}({})", nr_name(proc.compat, pd.nr), pd.nr);
+            let state = if pd.binder_parked {
+                "parked-binder"
+            } else if (proc.compat && pd.nr == 240) || (!proc.compat && pd.nr == 98) {
+                "futex"
+            } else {
+                "parked-other"
+            };
+            (ls, state)
+        }
+        None => ("-".to_string(), "no-pending"),
+    };
+    let age = emit_seq_now().saturating_sub(proc.last_stop_seq);
+    sup!(
+        "binder: wedge-servicer-roster arena={arena} pid={x} leader={root} last_syscall={last_syscall} state={state} last_stop_age={age} t={}",
+        field_t_ms()
+    );
+}
+
 /// 0.9.141 (s9-141-desk S6): one servicer's
 /// tracer-side face, printed by the worker that
 /// owns it when the coordinator's wedge chain
@@ -18350,7 +18444,7 @@ fn print_servicer_face(
                 let cand2 = futex_cand_str(cands[1]);
                 let guess = futex_holder_guess(&cands);
                 sup!(
-                    "binder: wedge-servicer-futex arena={ss_arena} pid={x} servicer_leader={leader} uaddr=0x{u:x} grp={futex_grp} acct=present waits={} wakes={} first_t={} last_waiter={}@{} last_waker={}@{} last_done={}@{} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
+                    "binder: wedge-servicer-futex arena={ss_arena} pid={x} servicer_leader={leader} uaddr=0x{u:x} grp={futex_grp} acct=present waits={} wakes={} first_t={} last_waiter={}@{} last_waker={}@{} last_done={}@{}/ret={} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
                     a.waits,
                     a.wakes,
                     a.first_t,
@@ -18359,7 +18453,8 @@ fn print_servicer_face(
                     a.last_wake_pid,
                     a.last_wake_t,
                     a.last_done_pid,
-                    a.last_done_t
+                    a.last_done_t,
+                    a.last_done_ret
                 );
             }
             None => {
@@ -18631,7 +18726,7 @@ fn wedge_snapshot(
                     let cand2 = futex_cand_str(cands[1]);
                     let guess = futex_holder_guess(&cands);
                     sup!(
-                        "binder: wedge-futex-holder arena={leader} uaddr=0x{u:x} waiters={} waits={} wakes={} last_waiter={}@{} last_waker={}@{} last_done={}@{} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
+                        "binder: wedge-futex-holder arena={leader} uaddr=0x{u:x} waiters={} waits={} wakes={} last_waiter={}@{} last_waker={}@{} last_done={}@{}/ret={} cand1={cand1} cand2={cand2} holder_guess={guess} t={now}",
                         ws.len(),
                         a.waits,
                         a.wakes,
@@ -18640,7 +18735,8 @@ fn wedge_snapshot(
                         a.last_wake_pid,
                         a.last_wake_t,
                         a.last_done_pid,
-                        a.last_done_t
+                        a.last_done_t,
+                        a.last_done_ret
                     );
                 }
                 None => {
@@ -21299,12 +21395,27 @@ fn tracer_loop(ctx: TracerCtx) {
                                 } else {
                                     pid
                                 };
+                                // 0.9.165: the wait's
+                                // return value lives in
+                                // the tracee's r0 at this
+                                // exit stop; this branch
+                                // fetches registers
+                                // lazily, so fetch them
+                                // here (read-only) --
+                                // i32::MAX names a
+                                // failed fetch, never a
+                                // real return (see
+                                // FutexAcct::last_done_ret).
+                                let done_ret = get_regs(pid, proc.compat)
+                                    .map(|r| r.retval() as i32)
+                                    .unwrap_or(i32::MAX);
                                 futex_acct_wait_done(
                                     &mut futex_acct,
                                     leader,
                                     u,
                                     pid,
                                     field_t_ms(),
+                                    done_ret,
                                 );
                             }
                         }
@@ -23360,6 +23471,7 @@ mod tests {
         assert_eq!(a.last_wake_t, 333);
         assert_eq!(a.last_done_pid, 0);
         assert_eq!(a.last_done_t, 0);
+        assert_eq!(a.last_done_ret, 0);
         // An account opened by a wake takes that
         // call's instant as its first_t too.
         futex_acct_add(&mut map, &mut addrs, 100, 0x3000, false, 104, 444);
@@ -23371,20 +23483,23 @@ mod tests {
         let mut map: HashMap<(i32, u32), FutexAcct> = HashMap::new();
         let mut addrs: HashMap<i32, usize> = HashMap::new();
         // No account: nothing is created, false.
-        assert!(!futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555));
+        assert!(!futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555, 0));
         assert!(!map.contains_key(&(100, 0x2000)));
         futex_acct_add(&mut map, &mut addrs, 100, 0x2000, true, 101, 111);
-        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555));
+        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 101, 555, 0));
         let a = map[&(100, 0x2000)];
         assert_eq!(a.last_done_pid, 101);
         assert_eq!(a.last_done_t, 555);
-        // A later completion overwrites; another
-        // arena's key is a different entry and
-        // stays absent.
-        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 102, 666));
+        assert_eq!(a.last_done_ret, 0);
+        // A later completion overwrites, return
+        // value included (0.9.165: -110 names a
+        // timeout completion); another arena's key
+        // is a different entry and stays absent.
+        assert!(futex_acct_wait_done(&mut map, 100, 0x2000, 102, 666, -110));
         assert_eq!(map[&(100, 0x2000)].last_done_pid, 102);
         assert_eq!(map[&(100, 0x2000)].last_done_t, 666);
-        assert!(!futex_acct_wait_done(&mut map, 200, 0x2000, 201, 777));
+        assert_eq!(map[&(100, 0x2000)].last_done_ret, -110);
+        assert!(!futex_acct_wait_done(&mut map, 200, 0x2000, 201, 777, 0));
     }
 
     #[test]
