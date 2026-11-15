@@ -3162,6 +3162,26 @@ struct ReplyWait {
     /// own code 2) is interface noise and is only
     /// counted (BinderState::crash_leg_noise).
     crash: bool,
+    /// 0.9.162 (s10-162-spec section 2): stamped at
+    /// the same seat -- this call is a serving
+    /// thread's reverse call into the arena it is
+    /// currently serving a caller from (see
+    /// reverse_call_mark): a synchronous code 1
+    /// issued while the sender's innermost serving
+    /// context is a Reply frame whose own waiter
+    /// belongs to this wait's target arena. A marked
+    /// wait's pooled unit is promoted to the head of
+    /// the target arena's inbound transaction order
+    /// at the fill seats (promote_reverse_inbound),
+    /// so when a worker of the frozen pool surfaces
+    /// -- spawned or freed -- the call that unblocks
+    /// its caller is the first one it claims (case
+    /// C2, priority form). The stamp is read by the
+    /// promotion seat and by telemetry (the claim
+    /// line and the RevAcct settlement); it never
+    /// gates a delivery, a claim pairing or a
+    /// discipline predicate.
+    reverse: bool,
 }
 
 /// One frame of a serving thread's transaction stack
@@ -3601,6 +3621,56 @@ fn leg_env_sig_name(sig: u8) -> &'static str {
     }
 }
 
+/// 0.9.162 (s10-162-spec section 2): the C2
+/// identification criterion, evaluated once at send
+/// time in binder_send_txn when a synchronous call's
+/// wait is recorded. True when the call is a serving
+/// thread's reverse call into the arena it is
+/// serving from: code 1, and the first Reply frame
+/// of the sender's innermost (newest) serving group
+/// -- under the stack's FIFO-within-group service
+/// order the earliest unanswered frame of that
+/// group, i.e. the handler context this call issues
+/// from -- is a call whose own waiter belongs to
+/// this call's target arena. Pure and relational:
+/// no process-name registry exists in the
+/// coordinator, so the SF -> SS shape is named by
+/// the serving relation alone, exactly as claim_env
+/// reads the leg-side evidence. The bound is
+/// deliberate: an any-frame scan would also match
+/// calls issued from an outer frame's handler while
+/// a deeper frame from the target arena merely sits
+/// open, promoting calls that are not the serving
+/// thread's reverse call; the price is the false
+/// negative when the executing frame is not the
+/// group's first Reply frame, which degrades to the
+/// standing FIFO behaviour and is priced into the
+/// spec's prediction P1 counting method.
+fn reverse_call_mark(
+    st: &BinderState,
+    sender_pid: i32,
+    target_arena: &str,
+    code: u32,
+) -> bool {
+    if code != 1 {
+        return false;
+    }
+    let Some(stack) = st.serving.get(&sender_pid) else {
+        return false;
+    };
+    let Some(group) = stack.groups.last() else {
+        return false;
+    };
+    group
+        .frames
+        .iter()
+        .find_map(|f| match f {
+            ServingFrame::Reply(w, _) => Some(w.sender_arena == target_arena),
+            ServingFrame::Other => None,
+        })
+        .unwrap_or(false)
+}
+
 /// 0.9.153 (s10-152-verify section 5): one arena's
 /// BR_SPAWN_LOOPER parity account. sent counts
 /// requests appended to a looper's read fill;
@@ -3663,6 +3733,27 @@ struct SpawnAcct {
     sent_instant: u64,
     excl_mgr: u64,
     latch: bool,
+}
+
+/// 0.9.162 (s10-162-spec section 2): one target
+/// arena's reverse-call priority account (case C2).
+/// marked counts waits stamped reverse at send time
+/// (see reverse_call_mark); promoted counts inbound
+/// units the fill seats actually moved to the head
+/// of the arena's transaction order for a marked
+/// wait (a marked unit already standing first is
+/// not a promotion and is not counted); claimed
+/// counts marked waits claimed by a serving thread,
+/// counted at the claim seat in binder_claim_fills.
+/// Telemetry only -- like the discipline accounts,
+/// nothing here feeds a predicate, a gate or a
+/// delivery decision; the promotion seat reads the
+/// waits themselves, never this account.
+#[derive(Clone, Copy, Default)]
+struct RevAcct {
+    marked: u64,
+    promoted: u64,
+    claimed: u64,
 }
 
 /// 0.9.153 (s10-152-verify section 2.7): the
@@ -4008,6 +4099,9 @@ struct BinderState {
     /// declared it (absent = never seen; the gate
     /// falls back to DEFAULT_MAX_BINDER_THREADS).
     spawn_acct: HashMap<String, SpawnAcct>,
+    /// 0.9.162: per-target-arena reverse-call
+    /// priority accounts (see RevAcct).
+    rev_acct: HashMap<String, RevAcct>,
     max_threads: HashMap<String, u32>,
     /// 0.9.153: per-arena downstream surface
     /// evidence from the latest wedge snapshot
@@ -6479,6 +6573,18 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
         );
         (b, 0)
     } else {
+        // 0.9.162: a non-waiting looper's completion
+        // is a claim opportunity -- put a marked
+        // reverse call at the head of the inbound
+        // transaction order before the fill is
+        // peeked (see promote_reverse_inbound).
+        if st
+            .procs
+            .get(&arena)
+            .map_or(false, |bp| bp.loopers.contains(&pid))
+        {
+            promote_reverse_inbound(st, &arena);
+        }
         let Some(bp) = st.procs.get_mut(&arena) else {
             park_lost(
                 st,
@@ -9230,6 +9336,55 @@ fn spawn_latch_gate(
 /// Read-only over the discipline registries:
 /// this seat writes nothing but its own latch
 /// and account.
+/// 0.9.162 (s10-162-spec section 2): the C2
+/// promotion seat, called from both fill paths
+/// (binder_complete_decision's parked completion
+/// and binder_write_read's inline fill) on the
+/// non-gated path, for a registered looper reader,
+/// before the fill is peeked or drained. If the
+/// arena holds an unclaimed reverse-marked wait
+/// (see ReplyWait::reverse) whose transaction unit
+/// stands in the inbound stream behind another
+/// transaction, the unit is promoted to the head
+/// of the transaction order, so this fill -- or the
+/// next looper fill, if this reader's own queue
+/// runs first -- claims the unblocking call before
+/// any ordinary pooled work. Read-only over every
+/// discipline registry; the only writes are the
+/// inbound stream's unit order, the RevAcct count
+/// and the event line. A marked wait whose unit
+/// already stands first, or whose delivery landed
+/// in a private queue (where the addressed-first
+/// read order already serves it), is not a
+/// promotion and counts nothing.
+fn promote_reverse_inbound(st: &mut BinderState, arena: &str) {
+    let want: Vec<(i32, u32)> = st
+        .waiters
+        .get(arena)
+        .map(|q| {
+            q.iter()
+                .filter(|w| w.reverse)
+                .map(|w| (w.sender_pid, w.code))
+                .collect()
+        })
+        .unwrap_or_default();
+    if want.is_empty() {
+        return;
+    }
+    let Some(bp) = st.procs.get_mut(arena) else {
+        return;
+    };
+    if let PromoteOutcome::Moved(from_off, sender, code) =
+        promote_txn_in_stream(&mut bp.inbound, &want)
+    {
+        st.rev_acct.entry(arena.to_string()).or_default().promoted += 1;
+        bsup!(
+            "binder: reverse-claim promoted arena={arena} sender={sender} code={code} from_off={from_off} t={}",
+            field_t_ms()
+        );
+    }
+}
+
 fn maybe_latch_spawn(st: &mut BinderState, arena: &str) {
     if !spawn_eligible(st, arena) {
         st.spawn_acct
@@ -9436,6 +9591,26 @@ fn spawn_looper_account(st: &BinderState, arena: &str) -> String {
         a.latched,
         a.excl_mgr,
         a.carrier,
+        field_t_ms()
+    )
+}
+
+/// The reverse-claim settlement line for one arena
+/// (0.9.162, s10-162-spec section 2): the C2
+/// priority account, printed at the same two seats
+/// as the spawn-looper account (the wedge snapshot's
+/// account bundle and the arena-death settlement),
+/// immediately after it, so a tenure's marked /
+/// promoted / claimed counts settle beside the
+/// spawn counts they interact with.
+fn reverse_claim_account(st: &BinderState, arena: &str) -> String {
+    let z = RevAcct::default();
+    let a = st.rev_acct.get(arena).unwrap_or(&z);
+    format!(
+        "binder: arena {arena} reverse-claim account: marked={} promoted={} claimed={} t={}",
+        a.marked,
+        a.promoted,
+        a.claimed,
         field_t_ms()
     )
 }
@@ -11432,6 +11607,9 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             // 0.9.153: the spawn-looper account
             // settles at the same seat.
             bsup!("{}", spawn_looper_account(st, a));
+            // 0.9.162: the reverse-claim account
+            // settles beside it.
+            bsup!("{}", reverse_claim_account(st, a));
         }
     }
     // 0.9.142 (section 2.4): servicers the v2
@@ -12931,6 +13109,20 @@ fn binder_send_txn(
         format!("txn code={code} size={} from={pid}", tdata.len()),
     );
     if flags & TF_ONE_WAY == 0 {
+        // 0.9.162: the C2 identification seat -- the
+        // sender's serving stack stands exactly as
+        // this call leaves it, so the reverse-call
+        // criterion (see reverse_call_mark) is
+        // evaluated here, once, and stamped on the
+        // wait beside the crash stamp.
+        let reverse = reverse_call_mark(st, pid, &owner, code);
+        if reverse {
+            st.rev_acct.entry(owner.to_string()).or_default().marked += 1;
+            bsup!(
+                "binder: reverse-call marked sender={pid} sender_arena={arena} target_arena={owner} code={code} t={}",
+                field_t_ms()
+            );
+        }
         st.waiters.entry(owner.to_string()).or_default().push(ReplyWait {
             sender_pid: pid,
             sender_arena: arena.to_string(),
@@ -12938,6 +13130,7 @@ fn binder_send_txn(
             target_handle: target,
             code,
             crash: crash_iface,
+            reverse,
         });
         // 0.9.142 (s9-142-desk section 2.2): stamp
         // the call at the same instant its wait is
@@ -13118,6 +13311,18 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     } else {
         None
     };
+    // 0.9.162: the inline twin of the parked seat's
+    // promotion call -- a non-gated looper read is a
+    // claim opportunity (see promote_reverse_inbound).
+    if gated.is_none()
+        && rs > 0
+        && st
+            .procs
+            .get(&arena)
+            .map_or(false, |bp| bp.loopers.contains(&pid))
+    {
+        promote_reverse_inbound(st, &arena);
+    }
     let queue_len = st
         .procs
         .get(&arena)
@@ -13287,6 +13492,111 @@ fn scan_fill_answers(bytes: &[u8]) -> Result<Vec<AnswerKind>, usize> {
         return Err(off);
     }
     Ok(out)
+}
+
+/// The outcome of one promotion walk over an
+/// inbound stream (see promote_txn_in_stream).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromoteOutcome {
+    /// No complete BR_TRANSACTION unit in the stream
+    /// matches any wanted identity (or the want list
+    /// is empty); the stream is untouched.
+    NotFound,
+    /// The first matching unit already stands at the
+    /// stream's first transaction position; the
+    /// stream is untouched.
+    AlreadyFirst,
+    /// The first matching unit stood at this byte
+    /// offset and was moved to the stream's first
+    /// transaction position; the winning identity
+    /// (sender_pid, code) rides along for the event
+    /// line, since it need not be the want list's
+    /// first entry.
+    Moved(usize, i32, u32),
+}
+
+/// 0.9.162 (s10-162-spec section 2): move the first
+/// inbound BR_TRANSACTION unit whose (sender_pid,
+/// code) -- read from the unit's own descriptor
+/// words, the same offsets binder_claim_fills
+/// parses -- matches the want list to the head of
+/// the stream's transaction order. The want list is
+/// in wait-queue order: the oldest wanted wait whose
+/// unit is in the stream wins, so marked calls keep
+/// FIFO among themselves. "Head of the transaction
+/// order" is the offset of the stream's first
+/// BR_TRANSACTION unit: any notice prefix ahead of
+/// it stays byte-identical, every other complete
+/// unit keeps its relative order, and a trailing
+/// partial unit (or one overrunning the stream)
+/// ends the walk and stays in place, exactly the
+/// flush_inbound_notices_to discipline. Answers
+/// never live in the inbound stream, so no unit
+/// crosses an answer; the only order changed is
+/// transaction-versus-transaction (plus any notices
+/// interspersed after the first transaction, whose
+/// relative order among themselves is likewise
+/// preserved). Pure over the byte stream.
+fn promote_txn_in_stream(stream: &mut Vec<u8>, want: &[(i32, u32)]) -> PromoteOutcome {
+    if want.is_empty() || stream.is_empty() {
+        return PromoteOutcome::NotFound;
+    }
+    // Walk the complete units once, remembering each
+    // transaction unit's offset and identity.
+    let mut units: Vec<(usize, usize)> = Vec::new(); // (off, len)
+    let mut first_txn: Option<usize> = None; // index into units
+    let mut off = 0usize;
+    while off + 4 <= stream.len() {
+        let cmd = u32_at(stream, off);
+        let len = br_one_len(cmd);
+        if len < 4 || off + len > stream.len() {
+            break;
+        }
+        if cmd == BR_TRANSACTION {
+            if first_txn.is_none() {
+                first_txn = Some(units.len());
+            }
+        }
+        units.push((off, len));
+        off += len;
+    }
+    let Some(ft) = first_txn else {
+        return PromoteOutcome::NotFound;
+    };
+    // Find the winning unit: want order first, then
+    // stream order within one identity.
+    let mut winner: Option<usize> = None; // index into units
+    'outer: for &(wsender, wcode) in want {
+        for (idx, &(uoff, _)) in units.iter().enumerate().skip(ft) {
+            if u32_at(stream, uoff) != BR_TRANSACTION {
+                continue;
+            }
+            let sender = u32_at(stream, uoff + 20) as i32;
+            let code = u32_at(stream, uoff + 12);
+            if sender == wsender && code == wcode {
+                winner = Some(idx);
+                break 'outer;
+            }
+        }
+    }
+    let Some(widx) = winner else {
+        return PromoteOutcome::NotFound;
+    };
+    if widx == ft {
+        return PromoteOutcome::AlreadyFirst;
+    }
+    let (woff, wlen) = units[widx];
+    let (foff, _) = units[ft];
+    let wsender = u32_at(stream, woff + 20) as i32;
+    let wcode = u32_at(stream, woff + 12);
+    let unit: Vec<u8> = stream[woff..woff + wlen].to_vec();
+    let mut out: Vec<u8> = Vec::with_capacity(stream.len());
+    out.extend_from_slice(&stream[..foff]);
+    out.extend_from_slice(&unit);
+    out.extend_from_slice(&stream[foff..woff]);
+    out.extend_from_slice(&stream[woff + wlen..]);
+    *stream = out;
+    PromoteOutcome::Moved(woff, wsender, wcode)
 }
 
 fn br_one_len(cmd: u32) -> usize {
@@ -13478,6 +13788,23 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                         // same helper the big-reply dump
                         // uses, so the two lines join).
                         st.claim_seq += 1;
+                        // 0.9.162: a claimed reverse
+                        // wait settles the C2 account's
+                        // claimed column at this same
+                        // seat (see RevAcct).
+                        if w.reverse {
+                            st.rev_acct
+                                .entry(arena.to_string())
+                                .or_default()
+                                .claimed += 1;
+                            bsup!(
+                                "binder: reverse-claim claimed claim_seq={} arena={arena} claimer={pid} sender={} code={} t={}",
+                                st.claim_seq,
+                                w.sender_pid,
+                                w.code,
+                                field_t_ms()
+                            );
+                        }
                         // 0.9.142 (s9-142-desk section
                         // 2.2): the claim backfills the
                         // sender's sync-send stamp with
@@ -15579,6 +15906,9 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
         // 0.9.153: the spawn-looper account settles
         // at the same seat.
         bsup!("{}", spawn_looper_account(st, arena));
+        // 0.9.162: the reverse-claim account settles
+        // beside it.
+        bsup!("{}", reverse_claim_account(st, arena));
         // 0.9.154 (s10-spawn-target-desk section
         // 3.2): the latch dies with the arena --
         // cleared here, after the settlement line
@@ -22635,6 +22965,7 @@ mod tests {
                 target_handle: 1,
                 code: 7,
                 crash: false,
+                reverse: false,
             }
         }
         let mut st = BinderState::default();
@@ -23095,6 +23426,7 @@ mod tests {
                 target_handle: 1,
                 code: 5,
                 crash: false,
+                reverse: false,
             });
         assert!(matches!(
             ds_drain_counter(&st, 4242),
@@ -23313,6 +23645,174 @@ mod tests {
             face_arena_list(&[], &["ss".to_string()], "ss"),
             Vec::<String>::new()
         );
+    }
+
+    // 0.9.162: the C2 identification criterion --
+    // a synchronous code 1 is a reverse call only
+    // when the sender's innermost serving context
+    // is a call from the target arena itself.
+    #[test]
+    fn reverse_call_mark_decision_tree() {
+        fn rwait(sender: i32, from: &str) -> ReplyWait {
+            ReplyWait {
+                sender_pid: sender,
+                sender_arena: from.to_string(),
+                cookie: 0,
+                target_handle: 1,
+                code: 9,
+                crash: false,
+                reverse: false,
+            }
+        }
+        fn stack(frames: Vec<ServingFrame>) -> ServingStack {
+            ServingStack {
+                arena: "sf".to_string(),
+                groups: vec![ServingGroup {
+                    fill_id: 1,
+                    frames,
+                }],
+            }
+        }
+        let mut st = BinderState::default();
+        // Not serving at all: a pool-root client
+        // call is never a reverse call.
+        assert!(!reverse_call_mark(&st, 501, "ss", 1));
+        // Serving a call from the target arena: the
+        // .152/.161 shape -- marked.
+        st.serving.insert(
+            501,
+            stack(vec![ServingFrame::Reply(rwait(601, "ss"), 1)]),
+        );
+        assert!(reverse_call_mark(&st, 501, "ss", 1));
+        // Wrong code, wrong target: unmarked.
+        assert!(!reverse_call_mark(&st, 501, "ss", 2));
+        assert!(!reverse_call_mark(&st, 501, "app", 1));
+        // An one-way frame ahead of the Reply frame
+        // does not hide it: the first Reply frame of
+        // the group is the context.
+        st.serving.insert(
+            502,
+            stack(vec![
+                ServingFrame::Other,
+                ServingFrame::Reply(rwait(601, "ss"), 1),
+            ]),
+        );
+        assert!(reverse_call_mark(&st, 502, "ss", 1));
+        // The first Reply frame belongs to another
+        // arena: the executing context is that
+        // frame's, so a call into "ss" from here is
+        // not its reverse call -- no any-frame scan.
+        st.serving.insert(
+            503,
+            stack(vec![
+                ServingFrame::Reply(rwait(602, "app"), 1),
+                ServingFrame::Reply(rwait(601, "ss"), 2),
+            ]),
+        );
+        assert!(!reverse_call_mark(&st, 503, "ss", 1));
+        // A newer group shadows the older one: the
+        // innermost context rules.
+        let mut deep = stack(vec![ServingFrame::Reply(rwait(601, "ss"), 1)]);
+        deep.groups.push(ServingGroup {
+            fill_id: 2,
+            frames: vec![ServingFrame::Reply(rwait(602, "app"), 2)],
+        });
+        st.serving.insert(504, deep);
+        assert!(!reverse_call_mark(&st, 504, "ss", 1));
+        assert!(reverse_call_mark(&st, 504, "app", 1));
+    }
+
+    // 0.9.162: the promotion walk -- unit order,
+    // notice preservation, want-order priority and
+    // the trailing-partial discipline.
+    #[test]
+    fn promote_txn_in_stream_walks() {
+        fn txn(sender: i32, code: u32) -> Vec<u8> {
+            let mut u = vec![0u8; 44];
+            u[0..4].copy_from_slice(&BR_TRANSACTION.to_le_bytes());
+            u[12..16].copy_from_slice(&code.to_le_bytes());
+            u[20..24].copy_from_slice(&sender.to_le_bytes());
+            u
+        }
+        // Empty want list and absent identity: the
+        // stream is byte-identical (spec P3).
+        let mut s = txn(11, 5);
+        s.extend_from_slice(&txn(22, 1));
+        let orig = s.clone();
+        assert_eq!(
+            promote_txn_in_stream(&mut s, &[]),
+            PromoteOutcome::NotFound
+        );
+        assert_eq!(s, orig);
+        assert_eq!(
+            promote_txn_in_stream(&mut s, &[(99, 1)]),
+            PromoteOutcome::NotFound
+        );
+        assert_eq!(s, orig);
+        // Already first: no move, no count.
+        assert_eq!(
+            promote_txn_in_stream(&mut s, &[(11, 5)]),
+            PromoteOutcome::AlreadyFirst
+        );
+        assert_eq!(s, orig);
+        // Behind another transaction: moved to the
+        // first transaction position, the displaced
+        // unit keeps its place behind it.
+        assert_eq!(
+            promote_txn_in_stream(&mut s, &[(22, 1)]),
+            PromoteOutcome::Moved(44, 22, 1)
+        );
+        let mut want_stream = txn(22, 1);
+        want_stream.extend_from_slice(&txn(11, 5));
+        assert_eq!(s, want_stream);
+        // A notice prefix stays byte-identical and
+        // the winner still lands behind it (the head
+        // of the transaction order, not of the
+        // stream).
+        let mut s2 = unit12(BR_INCREFS, 7);
+        s2.extend_from_slice(&txn(11, 5));
+        s2.extend_from_slice(&txn(22, 1));
+        assert_eq!(
+            promote_txn_in_stream(&mut s2, &[(22, 1)]),
+            PromoteOutcome::Moved(56, 22, 1)
+        );
+        let mut want2 = unit12(BR_INCREFS, 7);
+        want2.extend_from_slice(&txn(22, 1));
+        want2.extend_from_slice(&txn(11, 5));
+        assert_eq!(s2, want2);
+        // Want order beats stream order: the oldest
+        // wanted wait wins even when a younger
+        // identity's unit stands earlier.
+        let mut s3 = txn(33, 1);
+        s3.extend_from_slice(&txn(22, 1));
+        assert_eq!(
+            promote_txn_in_stream(&mut s3, &[(22, 1), (33, 1)]),
+            PromoteOutcome::Moved(44, 22, 1)
+        );
+        // A trailing partial unit ends the walk and
+        // stays in place behind the rebuilt stream.
+        let mut s4 = txn(11, 5);
+        s4.extend_from_slice(&txn(22, 1));
+        s4.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(
+            promote_txn_in_stream(&mut s4, &[(22, 1)]),
+            PromoteOutcome::Moved(44, 22, 1)
+        );
+        let mut want4 = txn(22, 1);
+        want4.extend_from_slice(&txn(11, 5));
+        want4.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(s4, want4);
+        // Identity is (sender, code) jointly: the
+        // same sender with another code is not the
+        // wanted unit.
+        let mut s5 = txn(11, 5);
+        s5.extend_from_slice(&txn(22, 2));
+        let orig5 = s5.clone();
+        assert_eq!(
+            promote_txn_in_stream(&mut s5, &[(22, 1)]),
+            PromoteOutcome::NotFound
+        );
+        assert_eq!(s5, orig5);
     }
 
     // 0.9.153: the spawn gate's decision tree --
