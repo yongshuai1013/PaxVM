@@ -3188,9 +3188,32 @@ impl BinderProc {
     /// answer off behind the gate forever. Returns
     /// the fill bytes and how many transaction units
     /// this walk left in place.
-    fn drain_gated_for(&mut self, pid: i32, cap: usize) -> (Vec<u8>, u64) {
+    /// 0.9.164 (s10-164-desk section 3): the keyed
+    /// form takes one release key -- the (sender,
+    /// code, target ptr, cookie) identity of a
+    /// direct-landed reverse call addressed to this
+    /// very reader (see ReplyWait::direct_to). The
+    /// first queued transaction unit matching the
+    /// key is released in place, in queue order,
+    /// ahead of the reader's own answer: the one
+    /// exemption to the gate, restoring the kernel's
+    /// transaction-stack delivery for exactly the
+    /// call class the gate's geometry otherwise
+    /// wedges. A keyed unit that does not fit whole
+    /// is held like any other transaction, and the
+    /// walk still reaches the answer behind it. The
+    /// unkeyed wrapper below keeps the .147
+    /// behaviour byte-identical for every reader
+    /// with no direct unit addressed to it.
+    fn drain_gated_for_key(
+        &mut self,
+        pid: i32,
+        cap: usize,
+        release: Option<(i32, u32, u32, u32)>,
+    ) -> (Vec<u8>, u64) {
         let mut out = Vec::new();
         let mut suppressed = 0u64;
+        let mut released = false;
         if let Some(q) = self.queues.get_mut(&pid) {
             let mut kept: Vec<u8> = Vec::new();
             let mut off = 0usize;
@@ -3201,8 +3224,22 @@ impl BinderProc {
                     break;
                 }
                 if cmd == BR_TRANSACTION {
-                    suppressed += 1;
-                    kept.extend_from_slice(&q[off..off + len]);
+                    let keyed = !released
+                        && len >= 44
+                        && release
+                            == Some((
+                                u32_at(q, off + 20) as i32,
+                                u32_at(q, off + 12),
+                                u32_at(q, off + 4),
+                                u32_at(q, off + 8),
+                            ));
+                    if keyed && out.len() + len <= cap {
+                        released = true;
+                        out.extend_from_slice(&q[off..off + len]);
+                    } else {
+                        suppressed += 1;
+                        kept.extend_from_slice(&q[off..off + len]);
+                    }
                 } else if out.len() + len <= cap {
                     out.extend_from_slice(&q[off..off + len]);
                 } else {
@@ -3214,6 +3251,12 @@ impl BinderProc {
             *q = kept;
         }
         (out, suppressed)
+    }
+
+    /// The .147 gated drain, unkeyed: no unit is
+    /// released (see drain_gated_for_key).
+    fn drain_gated_for(&mut self, pid: i32, cap: usize) -> (Vec<u8>, u64) {
+        self.drain_gated_for_key(pid, cap, None)
     }
 }
 
@@ -3296,6 +3339,22 @@ struct ReplyWait {
     /// gates a delivery, a claim pairing or a
     /// discipline predicate.
     reverse: bool,
+    /// 0.9.164 (s10-164-desk section 3): the stack-
+    /// matched direct-delivery stamp. Some(w) when
+    /// this wait's transaction was landed in waiter
+    /// w's own queue at delivery time instead of the
+    /// pooled stream: w is the thread whose own
+    /// outstanding call this reverse call nests on
+    /// (see reverse_call_waiter), the delivery the
+    /// kernel's transaction-stack targeting performs
+    /// and the pooled order cannot. Read by the
+    /// gated drains (the release key that lets
+    /// exactly this unit through the .147 gate into
+    /// w's wait) and by the claim seat (the RevAcct
+    /// nested column). It never changes a pairing:
+    /// the wait is claimed by whoever's fill carries
+    /// the unit, exactly as an unstamped wait is.
+    direct_to: Option<i32>,
 }
 
 /// One frame of a serving thread's transaction stack
@@ -3760,6 +3819,22 @@ fn leg_env_sig_name(sig: u8) -> &'static str {
 /// group's first Reply frame, which degrades to the
 /// standing FIFO behaviour and is priced into the
 /// spec's prediction P1 counting method.
+/// The first Reply frame of a serving thread's
+/// newest serving group: (the frame wait's sender
+/// pid, its sender arena). The one walk both
+/// reverse-call readers stand on (0.9.164: the
+/// mark below and the direct-delivery waiter
+/// lookup must agree frame-for-frame, so they
+/// share this walk instead of duplicating it).
+fn reverse_call_frame(st: &BinderState, sender_pid: i32) -> Option<(i32, String)> {
+    let stack = st.serving.get(&sender_pid)?;
+    let group = stack.groups.last()?;
+    group.frames.iter().find_map(|f| match f {
+        ServingFrame::Reply(w, _) => Some((w.sender_pid, w.sender_arena.clone())),
+        ServingFrame::Other => None,
+    })
+}
+
 fn reverse_call_mark(
     st: &BinderState,
     sender_pid: i32,
@@ -3769,20 +3844,42 @@ fn reverse_call_mark(
     if code != 1 {
         return false;
     }
-    let Some(stack) = st.serving.get(&sender_pid) else {
-        return false;
-    };
-    let Some(group) = stack.groups.last() else {
-        return false;
-    };
-    group
-        .frames
-        .iter()
-        .find_map(|f| match f {
-            ServingFrame::Reply(w, _) => Some(w.sender_arena == target_arena),
-            ServingFrame::Other => None,
-        })
-        .unwrap_or(false)
+    match reverse_call_frame(st, sender_pid) {
+        Some((_, a)) => a == target_arena,
+        None => false,
+    }
+}
+
+/// 0.9.164 (s10-164-desk section 3): the waiter a
+/// marked reverse call nests on -- the sender pid
+/// of the very Reply frame the mark reads, when
+/// that frame's arena is this call's target. That
+/// thread stands in the target arena with its own
+/// synchronous call outstanding to the sender's
+/// arena, claimed by this very sender: the kernel
+/// hands the callback to it (transaction-stack
+/// targeting) and its own wait's gated read is
+/// where the unit belongs. Evaluated at the
+/// delivery seat in binder_send_txn, before the
+/// call is recorded; delivery does not move the
+/// sender's serving stack, so the answer agrees
+/// with the mark evaluation after delivery by
+/// construction. None when the mark would not
+/// fire -- the call then takes the pooled path
+/// exactly as before.
+fn reverse_call_waiter(
+    st: &BinderState,
+    sender_pid: i32,
+    target_arena: &str,
+    code: u32,
+) -> Option<i32> {
+    if code != 1 {
+        return None;
+    }
+    match reverse_call_frame(st, sender_pid) {
+        Some((p, a)) if a == target_arena => Some(p),
+        _ => None,
+    }
 }
 
 /// 0.9.153 (s10-152-verify section 5): one arena's
@@ -3868,6 +3965,13 @@ struct RevAcct {
     marked: u64,
     promoted: u64,
     claimed: u64,
+    /// 0.9.164: marked waits stamped direct_to and
+    /// claimed by the very waiter they were landed
+    /// on (the nested column; counted at the same
+    /// claim seat). marked = claimed + nested +
+    /// still-queued is the account's conservation
+    /// reading from this build on.
+    nested: u64,
 }
 
 /// 0.9.153 (s10-152-verify section 2.7): the
@@ -6663,6 +6767,10 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
     // queue.
     let waiting = binder_thread_waiting(st, pid);
     let (bytes, from_inbound) = if waiting {
+        // 0.9.164: this waiter's direct-unit
+        // release key, read ahead of the proc
+        // borrow (see direct_release_key).
+        let release = direct_release_key(st, &arena, pid);
         let Some(bp) = st.procs.get_mut(&arena) else {
             // 0.9.150 (M3): the removed registration
             // is discarded here too -- the arena is
@@ -6676,7 +6784,7 @@ fn binder_complete_decision(pid: i32, st: &mut BinderState) -> ParkedOutcome {
             );
             return ParkedOutcome::Nothing;
         };
-        let (b, suppressed) = bp.drain_gated_for(pid, park.read_size as usize);
+        let (b, suppressed) = bp.drain_gated_for_key(pid, park.read_size as usize, release);
         ds_count(
             st,
             &arena,
@@ -8636,6 +8744,14 @@ fn binder_deliver(
     // bytes must land in that thread's own queue, never in
     // the shared inbound stream.
     reply_to: Option<i32>,
+    // 0.9.164 (s10-164-desk section 3): for a
+    // BR_TRANSACTION, the stack-matched waiter this
+    // call nests on (see reverse_call_waiter), when
+    // one stands in the target arena. The unit then
+    // lands in that waiter's own queue ahead of the
+    // pooled order entirely (the direct arm below).
+    // None for replies and for every unmarked call.
+    direct_to: Option<i32>,
 ) -> Result<u32, &'static str> {
     let total = ((data.len() as u32 + 3) & !3) + ((offs.len() as u32 + 3) & !3);
     let Some(off) = st.alloc(target, total.max(8)) else {
@@ -8782,8 +8898,43 @@ fn binder_deliver(
     put_u32(&mut txn, 28, offs.len() as u32);
     put_u32(&mut txn, 32, base + off);
     put_u32(&mut txn, 36, base + off + ((data.len() as u32 + 3) & !3));
-    match (br_cmd, reply_to) {
-        (BR_REPLY, Some(pid)) => {
+    match (br_cmd, reply_to, direct_to) {
+        (BR_TRANSACTION, _, Some(w)) => {
+            // 0.9.164 (s10-164-desk section 3): the
+            // stack-matched direct arm. A marked
+            // reverse call lands in the queue of the
+            // very waiter it nests on, ahead of the
+            // pooled order entirely -- the delivery
+            // the kernel's transaction-stack targeting
+            // performs, which the pooled claim cannot
+            // reproduce (the claimer is whoever the
+            // pool surfaces, and in the wedge geometry
+            // that thread blocks on the waiter's own
+            // lock). The waiter's gated drain releases
+            // exactly this unit into its wait (see
+            // drain_gated_for_key). Ordering follows
+            // the landed arm: this transaction's
+            // reference notices stand in the inbound
+            // stream ahead of where the unit would
+            // have pooled, and the waiter must read
+            // them before the parcel, so the notices
+            // flush into its queue first. Nothing is
+            // pooled, so the spawn latch never sees
+            // this delivery.
+            if !bp.inbound.is_empty() {
+                let held = bp.flush_inbound_notices_to(w);
+                if held > 0 {
+                    ds_flush_held = held;
+                    ds_flush_site = "direct";
+                    ds_flush_reader = w;
+                }
+                bsup!("binder: flushed pending inbound ahead of nested txn to pid={w}");
+            }
+            bp.push_to(w, &br_cmd.to_le_bytes());
+            bp.push_to(w, &txn);
+            bsup!("binder: txn for {target} landed nested in waiter pid={w}'s queue (reverse direct)");
+        }
+        (BR_REPLY, Some(pid), _) => {
             // Kernel ordering: the reference notices for
             // objects carried in the request (BR_INCREFS /
             // BR_ACQUIRE) were queued when the peer received
@@ -9721,10 +9872,11 @@ fn reverse_claim_account(st: &BinderState, arena: &str) -> String {
     let z = RevAcct::default();
     let a = st.rev_acct.get(arena).unwrap_or(&z);
     format!(
-        "binder: arena {arena} reverse-claim account: marked={} promoted={} claimed={} t={}",
+        "binder: arena {arena} reverse-claim account: marked={} promoted={} claimed={} nested={} t={}",
         a.marked,
         a.promoted,
         a.claimed,
+        a.nested,
         field_t_ms()
     )
 }
@@ -9748,6 +9900,26 @@ fn park_registry_account(st: &BinderState, arena: &str, cur: usize) -> String {
 /// The M4-lite settlement line for one arena:
 /// current loopers off the proc record, the rest
 /// off the thread life ledger.
+/// 0.9.164 (s10-164-desk section 3): the gated
+/// drain's release key for one reader -- the
+/// identity of the direct-landed wait addressed
+/// to it in this arena, if one stands unclaimed.
+/// The key is the claim seat's own identity for
+/// the wait (sender, code, and the node resolved
+/// through claim_key_node), so the unit the drain
+/// releases is the unit the claim will pair,
+/// never a same-shaped stranger queued earlier.
+fn direct_release_key(
+    st: &BinderState,
+    arena: &str,
+    pid: i32,
+) -> Option<(i32, u32, u32, u32)> {
+    let q = st.waiters.get(arena)?;
+    let w = q.iter().find(|w| w.direct_to == Some(pid))?;
+    let (ptr, cookie) = claim_key_node(st, w);
+    Some((w.sender_pid, w.code, ptr, cookie))
+}
+
 fn thread_registry_account(st: &BinderState, arena: &str) -> String {
     let loopers = st.procs.get(arena).map_or(0, |bp| bp.loopers.len());
     let (seen, reg, unreg, exit_ioctl, reaped) = match st.thread_acct.get(arena) {
@@ -12866,6 +13038,7 @@ fn binder_handle_txn<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             &offs,
             &fd_fixups,
             Some(w.sender_pid),
+            None,
         );
         let delivered_off = delivered.as_ref().ok().copied();
         let delivered_ok = delivered.is_ok();
@@ -13151,10 +13324,26 @@ fn binder_send_txn(
     if !fd_fixups.is_empty() {
         fd_obj_dump("txn", pid, &owner, None, code, &tdata, &fd_fixups);
     }
+    // 0.9.164 (s10-164-desk section 3): the direct-
+    // delivery routing key, read off the sender's
+    // serving stack before this call is recorded.
+    // Delivery never moves the sender's stack, so
+    // the key agrees with the reverse-mark
+    // evaluation at the wait record below by
+    // construction (the two share one walk, see
+    // reverse_call_frame). Sync calls only: a
+    // one-way call registers no wait and nests on
+    // nothing.
+    let direct_to = if flags & TF_ONE_WAY == 0 {
+        reverse_call_waiter(st, pid, &owner, code)
+    } else {
+        None
+    };
     let delivered = binder_deliver(
         st, &owner, BR_TRANSACTION, nptr, ncookie, code, flags, pid, veuid, &tdata, &offs,
         &fd_fixups,
         None,
+        direct_to,
     );
     let delivered_off = delivered.as_ref().ok().copied();
     // 0.9.155 (s10-sigsegv-desk section 5.3 item
@@ -13245,6 +13434,7 @@ fn binder_send_txn(
             code,
             crash: crash_iface,
             reverse,
+            direct_to,
         });
         // 0.9.142 (s9-142-desk section 2.2): stamp
         // the call at the same instant its wait is
@@ -13408,10 +13598,13 @@ fn binder_write_read<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     // park arm below, exactly like an empty queue.
     let waiting = binder_thread_waiting(st, pid);
     let gated: Option<Vec<u8>> = if waiting && rs > 0 {
+        // 0.9.164: the release key, as at the
+        // parked seat (see direct_release_key).
+        let release = direct_release_key(st, &arena, pid);
         let (b, suppressed) = st
             .procs
             .get_mut(&arena)
-            .map(|bp| bp.drain_gated_for(pid, rs as usize))
+            .map(|bp| bp.drain_gated_for_key(pid, rs as usize, release))
             .unwrap_or_default();
         ds_count(
             st,
@@ -13906,18 +14099,51 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
                         // wait settles the C2 account's
                         // claimed column at this same
                         // seat (see RevAcct).
+                        // 0.9.164: a direct-stamped wait
+                        // claimed by the very waiter it
+                        // was landed on settles the
+                        // nested column instead and
+                        // prints the nested line; one
+                        // claimed by anyone else keeps
+                        // the claimed column and adds a
+                        // bypass line, since its unit
+                        // should never have left the
+                        // waiter's own queue.
                         if w.reverse {
-                            st.rev_acct
-                                .entry(arena.to_string())
-                                .or_default()
-                                .claimed += 1;
-                            bsup!(
-                                "binder: reverse-claim claimed claim_seq={} arena={arena} claimer={pid} sender={} code={} t={}",
-                                st.claim_seq,
-                                w.sender_pid,
-                                w.code,
-                                field_t_ms()
-                            );
+                            if w.direct_to == Some(pid) {
+                                st.rev_acct
+                                    .entry(arena.to_string())
+                                    .or_default()
+                                    .nested += 1;
+                                bsup!(
+                                    "binder: reverse-claim nested claim_seq={} arena={arena} claimer={pid} sender={} code={} t={}",
+                                    st.claim_seq,
+                                    w.sender_pid,
+                                    w.code,
+                                    field_t_ms()
+                                );
+                            } else {
+                                st.rev_acct
+                                    .entry(arena.to_string())
+                                    .or_default()
+                                    .claimed += 1;
+                                if let Some(intended) = w.direct_to {
+                                    bsup!(
+                                        "binder: reverse-claim direct-bypass claim_seq={} arena={arena} claimer={pid} intended={intended} sender={} code={} t={}",
+                                        st.claim_seq,
+                                        w.sender_pid,
+                                        w.code,
+                                        field_t_ms()
+                                    );
+                                }
+                                bsup!(
+                                    "binder: reverse-claim claimed claim_seq={} arena={arena} claimer={pid} sender={} code={} t={}",
+                                    st.claim_seq,
+                                    w.sender_pid,
+                                    w.code,
+                                    field_t_ms()
+                                );
+                            }
                         }
                         // 0.9.142 (s9-142-desk section
                         // 2.2): the claim backfills the
@@ -23280,6 +23506,124 @@ mod tests {
         assert_eq!(bp.queues[&pid], unit44(BR_TRANSACTION, 1));
     }
 
+    // 0.9.164 (s10-164-desk section 3): the keyed
+    // gated drain -- the direct unit's release.
+    // (Units built with the module's txn_unit:
+    // target, cookie, code, sender.)
+    #[test]
+    fn gated_drain_keyed_releases_direct_unit_ahead_of_answer() {
+        let mut bp = test_proc();
+        let pid = 4242;
+        // [direct TXN (sf 777, code 1), stranger TXN,
+        // REPLY]: the keyed unit is released in place,
+        // the stranger stays gated, the answer is
+        // reached behind both.
+        let direct = txn_unit(0xaaaa, 0xbbbb, 1, 777);
+        let stranger = txn_unit(0xaaaa, 0xbbbb, 1, 888);
+        let mut q = direct.clone();
+        q.extend_from_slice(&stranger);
+        q.extend_from_slice(&unit44(BR_REPLY, 2));
+        bp.queues.insert(pid, q);
+        let (out, suppressed) =
+            bp.drain_gated_for_key(pid, 4096, Some((777, 1, 0xaaaa, 0xbbbb)));
+        let mut want = direct.clone();
+        want.extend_from_slice(&unit44(BR_REPLY, 2));
+        assert_eq!(out, want);
+        assert_eq!(suppressed, 1);
+        assert_eq!(bp.queues[&pid], stranger);
+        // Unkeyed, the same queue gates both
+        // transactions and reaches only the answer.
+        let mut q = direct.clone();
+        q.extend_from_slice(&unit44(BR_REPLY, 2));
+        bp.queues.insert(pid, q);
+        let (out, suppressed) = bp.drain_gated_for(pid, 4096);
+        assert_eq!(out, unit44(BR_REPLY, 2));
+        assert_eq!(suppressed, 1);
+        assert_eq!(bp.queues[&pid], direct);
+    }
+
+    #[test]
+    fn gated_drain_keyed_unit_that_does_not_fit_stays() {
+        let mut bp = test_proc();
+        let pid = 4242;
+        let direct = txn_unit(0xaaaa, 0xbbbb, 1, 777);
+        let mut q = direct.clone();
+        q.extend_from_slice(&unit44(BR_REPLY, 2));
+        bp.queues.insert(pid, q.clone());
+        // One byte short of the keyed unit: it is
+        // held like any transaction, and the walk
+        // stops at the equally unfit answer -- the
+        // queue stays byte-identical.
+        let (out, suppressed) =
+            bp.drain_gated_for_key(pid, 43, Some((777, 1, 0xaaaa, 0xbbbb)));
+        assert!(out.is_empty());
+        assert_eq!(suppressed, 1);
+        assert_eq!(bp.queues[&pid], q);
+        // Room for both: keyed unit first, answer
+        // behind it, queue empty.
+        let (out, suppressed) =
+            bp.drain_gated_for_key(pid, 88, Some((777, 1, 0xaaaa, 0xbbbb)));
+        let mut want = direct.clone();
+        want.extend_from_slice(&unit44(BR_REPLY, 2));
+        assert_eq!(out, want);
+        assert_eq!(suppressed, 0);
+        assert!(bp.queues[&pid].is_empty());
+    }
+
+    #[test]
+    fn reverse_call_waiter_names_the_stack_waiter() {
+        fn wait(sender: i32, from: &str) -> ReplyWait {
+            ReplyWait {
+                sender_pid: sender,
+                sender_arena: from.to_string(),
+                cookie: 0,
+                target_handle: 1,
+                code: 5,
+                crash: false,
+                reverse: false,
+                direct_to: None,
+            }
+        }
+        fn stack(frames: Vec<ServingFrame>) -> ServingStack {
+            ServingStack {
+                arena: "sf".to_string(),
+                groups: vec![ServingGroup {
+                    fill_id: 1,
+                    frames,
+                }],
+            }
+        }
+        let mut st = BinderState::default();
+        // SF thread 900 serves SS waiter 24160's
+        // call: its code-1 callback nests on 24160.
+        st.serving.insert(
+            900,
+            stack(vec![ServingFrame::Reply(wait(24160, "ss"), 1)]),
+        );
+        assert_eq!(reverse_call_waiter(&st, 900, "ss", 1), Some(24160));
+        assert!(reverse_call_mark(&st, 900, "ss", 1));
+        // Another code or another target arena:
+        // neither reader fires.
+        assert_eq!(reverse_call_waiter(&st, 900, "ss", 2), None);
+        assert!(!reverse_call_mark(&st, 900, "ss", 2));
+        assert_eq!(reverse_call_waiter(&st, 900, "media", 1), None);
+        assert!(!reverse_call_mark(&st, 900, "media", 1));
+        // The walk reads the FIRST Reply frame only:
+        // a frame from another arena in front masks
+        // the matching one behind it, for both
+        // readers alike.
+        st.serving.insert(
+            901,
+            stack(vec![
+                ServingFrame::Reply(wait(31000, "media"), 1),
+                ServingFrame::Reply(wait(24160, "ss"), 2),
+            ]),
+        );
+        assert_eq!(reverse_call_waiter(&st, 901, "ss", 1), None);
+        assert!(!reverse_call_mark(&st, 901, "ss", 1));
+        assert_eq!(reverse_call_waiter(&st, 901, "media", 1), Some(31000));
+    }
+
     #[test]
     fn flush_moves_notices_only_and_holds_transactions() {
         let mut bp = test_proc();
@@ -23312,6 +23656,7 @@ mod tests {
                 code: 7,
                 crash: false,
                 reverse: false,
+                direct_to: None,
             }
         }
         let mut st = BinderState::default();
@@ -23773,6 +24118,7 @@ mod tests {
                 code: 5,
                 crash: false,
                 reverse: false,
+                direct_to: None,
             });
         assert!(matches!(
             ds_drain_counter(&st, 4242),
@@ -24008,6 +24354,7 @@ mod tests {
                 code: 9,
                 crash: false,
                 reverse: false,
+                direct_to: None,
             }
         }
         fn stack(frames: Vec<ServingFrame>) -> ServingStack {
