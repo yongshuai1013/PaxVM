@@ -1261,6 +1261,16 @@ struct Pending {
     /// written into the tracee's regs (at the exit stop, or at a
     /// SIGSYS rescue stop). Only meaningful when inject is Some.
     applied: bool,
+    /// 0.9.160 (s10-159-verify criterion 1): a conversion
+    /// pend whose entry-side register restore could not be
+    /// written (see the conversion branch): the pre-ride
+    /// snapshot, carried to the exit stop so its inject
+    /// application restores the whole set through
+    /// conv_final_regs instead of writing only r0. Set
+    /// only by the conversion branch, only when its
+    /// entry-side restore failed; every other pend leaves
+    /// it None and its exit application is unchanged.
+    conv_restore: Option<Regs>,
     /// Guest memory temporarily rewritten for the duration of
     /// one passed syscall (the unix-socket sockaddr path, see
     /// entry_unix_sockaddr): (address, original bytes), restored
@@ -13678,6 +13688,32 @@ fn conv_final_regs(saved: &Regs, result: i64) -> Regs {
     out
 }
 
+/// 0.9.160 (s10-159-verify criterion 1): the register
+/// set an exit stop applies for a pend's fabricated
+/// result. The plain case is the standing behaviour --
+/// the exit set as it stands, only r0 carrying the
+/// value. A conversion pend whose entry-side restore
+/// failed (conv_restore set) instead resumes from its
+/// pre-ride snapshot through the same restore point
+/// as the entry exits (conv_final_regs): the ride it
+/// never consumed left the tracee running with the
+/// ride's parameter set in its registers, and an
+/// r0-only write would hand that set back to the
+/// guest -- the 0.9.159 field's one leaked pair
+/// (ret=-13, r4=-1 / r5=0 / r7=192 through the
+/// generic exit stop). Pure, like conv_final_regs,
+/// so unit tests pin both arms.
+fn exit_result_regs(current: &Regs, conv_saved: Option<&Regs>, value: i64) -> Regs {
+    match conv_saved {
+        Some(saved) => conv_final_regs(saved, value),
+        None => {
+            let mut out = *current;
+            out.set_retval(value);
+            out
+        }
+    }
+}
+
 /// Ride an anonymous MAP_FIXED mmap over [addr,
 /// addr+len) in the stopped tracee, in the style of
 /// inject_openat: overwrite the current syscall's
@@ -18767,6 +18803,7 @@ fn tracer_loop(ctx: TracerCtx) {
                     desc: None,
                     inject: None,
                     applied: false,
+                    conv_restore: None,
                     mem_restore: None,
                     rescue_only: false,
                     peercred: None,
@@ -19310,6 +19347,30 @@ fn tracer_loop(ctx: TracerCtx) {
                                     regs = conv_final_regs(&saved, if ok { 0 } else { -13 });
                                     if set_regs(pid, &regs) {
                                         pend.applied = true;
+                                    } else {
+                                        // 0.9.160 (s10-159-verify
+                                        // criterion 1): the
+                                        // restore write landed
+                                        // nowhere -- the ride
+                                        // failed to consume its
+                                        // exit stop and left the
+                                        // tracee running with
+                                        // the ride's own register
+                                        // set (the 0.9.159
+                                        // field's leaked ret=-13
+                                        // pair). The transition
+                                        // is not consumed, so
+                                        // this pend reaches the
+                                        // generic exit stop (the
+                                        // ride's own); carry the
+                                        // snapshot there so its
+                                        // inject application
+                                        // restores the whole set
+                                        // through conv_final_regs
+                                        // instead of writing
+                                        // only r0 (see
+                                        // exit_result_regs).
+                                        pend.conv_restore = Some(saved);
                                     }
                                     if ok {
                                         sup!(
@@ -20172,7 +20233,19 @@ fn tracer_loop(ctx: TracerCtx) {
                         let mut ret = regs.retval();
                         if let Some(v) = pend.inject {
                             if !pend.rescue_only {
-                                regs.set_retval(v);
+                                // 0.9.160: a conversion
+                                // pend carrying its
+                                // pre-ride snapshot
+                                // (conv_restore) is
+                                // restored whole here;
+                                // every other pend keeps
+                                // the r0-only write (see
+                                // exit_result_regs).
+                                regs = exit_result_regs(
+                                    &regs,
+                                    pend.conv_restore.as_ref(),
+                                    v,
+                                );
                                 if set_regs(pid, &regs) {
                                     pend.applied = true;
                                 }
@@ -23961,5 +24034,59 @@ f1234000-f1235000 rw-p 00000000 00:00 0 [stack]
         assert_eq!(fin.arg(5), 0x800a9b00);
         assert_eq!(fin.sp(), saved.sp());
         assert_eq!(fin.pc(), saved.pc());
+    }
+
+    // 0.9.160: the 0.9.159 field's leaked pair (pid
+    // 31207 seq=634, ret=-13) replayed at the seat it
+    // actually leaked through: the ride never consumed
+    // its exit stop, the entry-side restore write
+    // failed on the running tracee, and the pend fell
+    // through to the generic exit stop bearing the
+    // ride's parameter set. Applying the exit result
+    // with the snapshot in hand restores the whole
+    // guest set; only r0 carries -13.
+    #[test]
+    fn exit_result_regs_conv_fallthrough_restores() {
+        let mut saved = conv_saved_regs();
+        saved.set_arg(4, 0xed124c70);
+        saved.set_arg(5, 0xb8);
+        saved.set_arg(6, 0x800a5600);
+        let entry = JitMpRegs::snap(&saved);
+        // The exit stop's registers as they stood in
+        // the field: inject_mmap's parameter set.
+        let mut ride = saved;
+        ride.set_nr(192);
+        ride.set_arg(0, 0xea864000);
+        ride.set_arg(1, 224);
+        ride.set_arg(2, 0x7);
+        ride.set_arg(3, 0x32);
+        ride.set_arg(4, (-1i32) as i64 as u64);
+        ride.set_arg(5, 0);
+        assert_eq!(
+            jitmp_chg(&entry, &JitMpRegs::snap(&ride)),
+            "r4:0xed124c70->0xffffffff,r5:0xb8->0x0,r7:0x7d->0xc0"
+        );
+        let fin = exit_result_regs(&ride, Some(&saved), -13);
+        assert_eq!(fin.retval(), -13);
+        assert_eq!(jitmp_chg(&entry, &JitMpRegs::snap(&fin)), "-");
+        assert_eq!(fin.arg(4), 0xed124c70);
+        assert_eq!(fin.arg(5), 0xb8);
+        assert_eq!(fin.arg(7), 125);
+    }
+
+    // 0.9.160: without a snapshot the exit application
+    // is the standing behaviour -- only r0 moves, the
+    // exit set otherwise stands as the kernel left it.
+    #[test]
+    fn exit_result_regs_plain_pend_only_r0() {
+        let cur = conv_saved_regs();
+        let fin = exit_result_regs(&cur, None, -13);
+        assert_eq!(fin.retval(), -13);
+        for i in 1..=15usize {
+            assert_eq!(fin.arg(i), cur.arg(i), "r{i} must not move");
+        }
+        assert_eq!(fin.sp(), cur.sp());
+        assert_eq!(fin.pc(), cur.pc());
+        assert_eq!(fin.lr(), cur.lr());
     }
 }
