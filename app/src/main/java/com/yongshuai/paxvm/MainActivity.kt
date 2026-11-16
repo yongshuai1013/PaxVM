@@ -1216,7 +1216,15 @@ class MainActivity : Activity() {
         // Virtual framebuffer backing (S6): two 480x800x32
         // pages, zeroed per session, plus the visible-page
         // note the supervisor's fb ioctl handler maintains.
-        RandomAccessFile(File(rootfs, ".fb0"), "rw").use {
+        // 0.9.170: delete first -- setLength alone does
+        // NOT zero an existing same-size file, and a
+        // previous session's last frame used to leak
+        // into this session's first presents (a stale
+        // boot wordmark once read in the pan census as
+        // if this session had painted it).
+        val fb0File = File(rootfs, ".fb0")
+        fb0File.delete()
+        RandomAccessFile(fb0File, "rw").use {
             it.setLength(480L * 800 * 4 * 2)
         }
         writeFresh(File(rootfs, ".fb-page"), "0 0")
@@ -1994,14 +2002,14 @@ class MainActivity : Activity() {
             // drew / page file wrong / reads failing).
             // First frame, stalled-frame warnings and
             // read-failure streaks are logged, throttled.
-            var lastFrameAt = System.currentTimeMillis()
+            var lastAdvanceAt = System.currentTimeMillis()
             var lastWarnAt = 0L
             var firstFrame = true
             var failStreak = 0
             appendLog("[shell] fb preview started")
             while (fbSession === rootfs) {
                 val nowTop = System.currentTimeMillis()
-                if (nowTop - lastFrameAt >= 15_000 &&
+                if (nowTop - lastAdvanceAt >= 15_000 &&
                     nowTop - lastWarnAt >= 30_000
                 ) {
                     lastWarnAt = nowTop
@@ -2012,7 +2020,7 @@ class MainActivity : Activity() {
                     }
                     appendLog(
                         "[shell] fb no new frame for " +
-                            "${(nowTop - lastFrameAt) / 1000}s: " +
+                            "${(nowTop - lastAdvanceAt) / 1000}s: " +
                             "presented seq=$shownSeq, " +
                             "page file: '$raw', " +
                             "fb0=${fbFile.length()}B",
@@ -2041,9 +2049,17 @@ class MainActivity : Activity() {
                     ) {
                         continue
                     }
+                    // 0.9.170: only a genuinely new frame
+                    // (the sequence advanced) resets the
+                    // stall watchdog. The 0.9.169 diary let
+                    // stale re-presents refresh it, so a
+                    // session that never got a frame warned
+                    // about nothing.
+                    if (seq >= 0 && seq != shownSeq) {
+                        lastAdvanceAt = now
+                    }
                     shownSeq = seq
                     shownAt = now
-                    lastFrameAt = now
                     failStreak = 0
                     if (firstFrame) {
                         firstFrame = false
