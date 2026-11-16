@@ -2669,6 +2669,26 @@ const FBIOGET_FSCREENINFO: u32 = 0x4602;
 const FBIOPAN_DISPLAY: u32 = 0x4606;
 const FBIO_WAITFORVSYNC: u32 = 0x4004_4620;
 
+/// 0.9.168: the .fb-page file's next contents for
+/// a pan to `yoff`: "<yoff> <seq>", with seq one
+/// past the value the file currently holds (0 when
+/// the file is missing, in the legacy one-field
+/// form, or garbage). The shell presents only
+/// frames whose seq it has not shown and drops a
+/// pixel copy whose seq moved mid-read, so what
+/// reaches the screen is always one complete,
+/// presented frame -- before this, the shell
+/// sampled the shared mapping on a bare timer and
+/// showed whatever half-composed state it caught.
+fn fb_page_contents(prev: &str, yoff: u32) -> String {
+    let seq = prev
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    format!("{yoff} {}", seq + 1)
+}
+
 fn fd_is_fb(pid: i32, fd: i32) -> bool {
     match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
         Ok(t) => t.to_string_lossy().contains("/.fb0"),
@@ -2728,7 +2748,14 @@ fn entry_fb_ioctl(
             } else {
                 0
             };
-            let _ = std::fs::write(format!("{rootfs}/.fb-page"), format!("{yoff}"));
+            // 0.9.168: the page file also carries
+            // the presentation sequence (see
+            // fb_page_contents): read-modify-write
+            // so the count survives whichever
+            // worker serves the pan.
+            let page_path = format!("{rootfs}/.fb-page");
+            let prev = std::fs::read_to_string(&page_path).unwrap_or_default();
+            let _ = std::fs::write(&page_path, fb_page_contents(&prev, yoff));
             skip_syscall(pid, regs, pend, 0);
             // Content fingerprint of the page about to be
             // shown: nonzero-byte counts of its first and
@@ -24851,6 +24878,19 @@ mod tests {
         oneway_only.purge_completed_oneway();
         assert_eq!(oneway_only.depth(), 0);
         assert!(oneway_only.groups.is_empty());
+    }
+
+    // 0.9.168: the framebuffer page file's
+    // presentation sequence -- legacy and garbage
+    // contents restart at 1, a counted file bumps.
+    #[test]
+    fn fb_page_contents_bumps_sequence() {
+        assert_eq!(fb_page_contents("", 0), "0 1");
+        assert_eq!(fb_page_contents("0", 800), "800 1");
+        assert_eq!(fb_page_contents("800 41", 0), "0 42");
+        assert_eq!(fb_page_contents("800 41\n", 800), "800 42");
+        assert_eq!(fb_page_contents("garbage", 5), "5 1");
+        assert_eq!(fb_page_contents("800 x", 800), "800 1");
     }
 
     // 0.9.162: the promotion walk -- unit order,

@@ -1219,7 +1219,7 @@ class MainActivity : Activity() {
         RandomAccessFile(File(rootfs, ".fb0"), "rw").use {
             it.setLength(480L * 800 * 4 * 2)
         }
-        writeFresh(File(rootfs, ".fb-page"), "0")
+        writeFresh(File(rootfs, ".fb-page"), "0 0")
         // Evidence markers in /data persist across sessions
         // by design (a re-run shows -EEXIST, which is itself
         // readable evidence) -- but the S5c scenario reuses
@@ -1949,9 +1949,11 @@ class MainActivity : Activity() {
     /** Poll the guest framebuffer file and present the
      * visible page. The guest draws into .fb0 through the
      * supervisor's shared mapping and reports pans in
-     * .fb-page; this loop (~5 fps) is the whole display
-     * path for now -- the picture above the log is the
-     * guest's own pixels, byte for byte. */
+     * .fb-page; since 0.9.168 the page file also carries
+     * a presentation sequence, and this loop presents
+     * only complete frames (see the loop body) -- the
+     * picture above the log is the guest's own pixels,
+     * byte for byte. */
     private fun startFbPreview(rootfs: File) {
         fbSession = rootfs
         runOnUiThread { fbView.visibility = android.view.View.VISIBLE }
@@ -1965,19 +1967,51 @@ class MainActivity : Activity() {
             // app's own GC during exactly the boot stretch
             // where the interface must stay responsive.
             val ints = IntArray(480 * 800)
-            // 0.9.54: the boot stretch is when the guest
-            // floods the supervisor and the interface is
-            // tightest; run the preview at 2 fps for the
-            // first 75 seconds, then the usual 5 fps.
-            val previewStart = System.currentTimeMillis()
+            // 0.9.168: present complete frames only.
+            // The supervisor bumps a sequence number in
+            // .fb-page at every pan (a completed,
+            // presented frame); this loop used to sample
+            // the shared mapping on a bare timer (0.9.54:
+            // 2 fps for the first 75 s, then 5 fps) and
+            // show whatever half-composed state it
+            // caught -- the picture changed like a
+            // lottery. Now the tiny page file is polled,
+            // pixels are copied only when the sequence
+            // moved, and a copy whose sequence moved
+            // again during the copy (the frame flipped
+            // under the read) is dropped, not shown.
+            // Content that never pans (direct draws) is
+            // still picked up by the 1 s stale fallback,
+            // and presents are paced to ~150 ms so a
+            // fast-panning boot cannot churn the UI.
+            var shownSeq = -1L
+            var shownAt = 0L
             while (fbSession === rootfs) {
                 try {
-                    val yoff =
-                        pageFile.readText().trim().toIntOrNull() ?: 0
+                    val head = parseFbPage(pageFile.readText())
+                    if (head == null) {
+                        Thread.sleep(50)
+                        continue
+                    }
+                    val (yoff, seq) = head
+                    val now = System.currentTimeMillis()
+                    val due = seq < 0 || seq != shownSeq ||
+                        now - shownAt >= 1_000
+                    if (!due || now - shownAt < 150) {
+                        Thread.sleep(50)
+                        continue
+                    }
                     RandomAccessFile(fbFile, "r").use { raf ->
                         raf.seek(yoff.toLong() * 480L * 4)
                         raf.readFully(buf)
                     }
+                    if (seq >= 0 &&
+                        parseFbPage(pageFile.readText()) != head
+                    ) {
+                        continue
+                    }
+                    shownSeq = seq
+                    shownAt = now
                     val bmp = fbBitmap ?: Bitmap.createBitmap(
                         480,
                         800,
@@ -2015,14 +2049,14 @@ class MainActivity : Activity() {
                     }
                     bmp.setPixels(ints, 0, 480, 0, 0, 480, 800)
                     runOnUiThread { fbView.setImageBitmap(bmp) }
+                } catch (_: InterruptedException) {
+                    break
                 } catch (_: Exception) {
                     // Mid-teardown or a torn read: the next
                     // iteration (or the session end) sorts it.
                 }
                 try {
-                    val bootPhase =
-                        System.currentTimeMillis() - previewStart < 75_000
-                    Thread.sleep(if (bootPhase) 500 else 200)
+                    Thread.sleep(50)
                 } catch (_: InterruptedException) {
                     break
                 }
@@ -2119,4 +2153,20 @@ class MainActivity : Activity() {
             }, 250)
         }
     }
+}
+
+/** Parse a .fb-page file body: "<yoff> <seq>". The
+ * sequence field arrived in 0.9.168; a legacy
+ * one-field body parses with seq -1 (unknown).
+ * Returns null on garbage. */
+internal fun parseFbPage(text: String): Pair<Int, Long>? {
+    val parts = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    if (parts.isEmpty()) return null
+    val yoff = parts[0].toIntOrNull() ?: return null
+    val seq = if (parts.size > 1) {
+        parts[1].toLongOrNull() ?: return null
+    } else {
+        -1L
+    }
+    return yoff to seq
 }
