@@ -5236,6 +5236,12 @@ const MSG_PUSH_SERVICER_FACE: u8 = 44;
 // ALL of that family's members on its shard (the
 // holder-candidate sweep; see Push::HolderSweep).
 const MSG_PUSH_HOLDER_SWEEP: u8 = 45;
+// 0.9.171: the coordinator's framebuffer stall
+// check (see CoordServer::fb_stall_check) broadcasts
+// this so every worker photographs ALL of its
+// tracees' faces -- the display can die with every
+// process alive and no watchdog anywhere near it.
+const MSG_PUSH_FB_STALL_FACES: u8 = 46;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
@@ -5630,6 +5636,10 @@ enum Push {
         arena: String,
         root: i32,
     },
+    /// 0.9.171: the presentation sequence in
+    /// .fb-page stalled while binder stayed busy;
+    /// photograph every tracee on this shard.
+    FbStallFaces,
 }
 
 /// The tracer's end of the coordinator channel. Every
@@ -5790,6 +5800,9 @@ impl CoordClient {
                     let arena = d.string();
                     let root = d.i32();
                     self.inbox.push_back(Push::HolderSweep { arena, root });
+                }
+                MSG_PUSH_FB_STALL_FACES => {
+                    self.inbox.push_back(Push::FbStallFaces);
                 }
                 _ => self.queue.push_back((kind, payload)),
             }
@@ -7214,6 +7227,16 @@ struct CoordServer {
     handoff_from: HashMap<i32, usize>,
     /// S10 I2: the coordinator time account.
     acct: CoordAcct,
+    /// 0.9.171: framebuffer stall photograph state
+    /// (see fb_stall_check). fb_rootfs is derived
+    /// from the first arena path seen; the rest
+    /// tracks the .fb-page presentation sequence.
+    fb_rootfs: Option<String>,
+    fb_last_seq: u64,
+    fb_last_advance: std::time::Instant,
+    fb_msgs: u64,
+    fb_msgs_at_advance: u64,
+    fb_dumped_seq: u64,
 }
 
 impl CoordServer {
@@ -7411,6 +7434,67 @@ impl CoordServer {
         for ci in 0..self.conns.len() {
             if self.conns[ci].wid.is_some() {
                 self.send_to(ci, MSG_PUSH_SERVICER_FACE, &e.0);
+            }
+        }
+    }
+
+    /// 0.9.171: framebuffer stall photograph. The
+    /// display's field death is silent -- compositor
+    /// alive, clients alive, no watchdog anywhere
+    /// near it; frames simply stop being presented
+    /// while binder traffic churns on (.169 black
+    /// field: zero frames ever; .170 field: the boot
+    /// animation's disc frozen for 100+ flips). The
+    /// .fb-page file is the one presentation clock
+    /// every process can read: when its sequence has
+    /// not advanced for 20 s while the coordinator
+    /// handled >= 50 frames in the same span (the
+    /// guest is busy, the display is not), broadcast
+    /// for a photograph of every tracee's face, once
+    /// per stalled sequence, so the sleep posture of
+    /// the clients' render threads is on record. A
+    /// healthy idle desktop fails the activity gate
+    /// and is never photographed.
+    fn fb_stall_check(&mut self) {
+        if self.fb_rootfs.is_none() {
+            if let Some(a) = self.st.thread_arena.values().next() {
+                if let Some(idx) = a.rfind("/.binder/") {
+                    self.fb_rootfs = Some(a[..idx].to_string());
+                }
+            }
+        }
+        let Some(rootfs) = self.fb_rootfs.clone() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(format!("{rootfs}/.fb-page"))
+        else {
+            return;
+        };
+        let seq = fb_page_seq(&text);
+        let now = std::time::Instant::now();
+        if seq != self.fb_last_seq {
+            self.fb_last_seq = seq;
+            self.fb_last_advance = now;
+            self.fb_msgs_at_advance = self.fb_msgs;
+            return;
+        }
+        if seq == 0 || self.fb_dumped_seq == seq {
+            return;
+        }
+        if now.duration_since(self.fb_last_advance).as_secs() < 20 {
+            return;
+        }
+        let frames_since = self.fb_msgs - self.fb_msgs_at_advance;
+        if frames_since < 50 {
+            return;
+        }
+        self.fb_dumped_seq = seq;
+        bsup!(
+            "fb-stall: seq={seq} unadvanced for >=20s with binder active (frames_since={frames_since}); photographing all faces"
+        );
+        for ci in 0..self.conns.len() {
+            if self.conns[ci].wid.is_some() {
+                self.send_to(ci, MSG_PUSH_FB_STALL_FACES, &[]);
             }
         }
     }
@@ -8378,6 +8462,12 @@ fn coordinator_main(sock_path: &str) -> ! {
         w0: None,
         handoff_from: HashMap::new(),
         acct: CoordAcct::default(),
+        fb_rootfs: None,
+        fb_last_seq: 0,
+        fb_last_advance: std::time::Instant::now(),
+        fb_msgs: 0,
+        fb_msgs_at_advance: 0,
+        fb_dumped_seq: 0,
     };
     loop {
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(srv.conns.len() + 1);
@@ -8397,7 +8487,10 @@ fn coordinator_main(sock_path: &str) -> ! {
                 });
             }
         }
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+        // 0.9.171: bounded wait so the fb stall
+        // check below runs on a clock even when the
+        // guest goes quiet on the sockets.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 2000) };
         if n > 0 {
             if pfds[0].revents & libc::POLLIN != 0 {
                 if let Ok((s, _)) = listener.accept() {
@@ -8449,9 +8542,11 @@ fn coordinator_main(sock_path: &str) -> ! {
                     let h0 = std::time::Instant::now();
                     srv.handle(ci, k, &p);
                     srv.acct.add(k, queue_wait, h0.elapsed());
+                    srv.fb_msgs += 1;
                 }
             }
         }
+        srv.fb_stall_check();
     }
 }
 
@@ -18284,6 +18379,26 @@ fn next_stop(
                     members.sort_unstable();
                     for m in members {
                         print_family_face(&arena, m, procs, "wedge-holder-face");
+                    }
+                }
+                Push::FbStallFaces => {
+                    // 0.9.171: the display stalled with
+                    // every process alive; photograph
+                    // EVERY tracee on this shard -- the
+                    // render thread whose sleep posture
+                    // is the evidence could belong to
+                    // any family (compositor, boot
+                    // animation, a window client).
+                    let mut members: Vec<i32> =
+                        procs.keys().copied().collect();
+                    members.sort_unstable();
+                    for m in members {
+                        print_family_face(
+                            "fb-stall",
+                            m,
+                            procs,
+                            "fb-stall-face",
+                        );
                     }
                 }
             }
