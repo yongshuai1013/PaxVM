@@ -3442,6 +3442,33 @@ impl ServingStack {
     fn depth(&self) -> usize {
         self.groups.iter().map(|g| g.frames.len()).sum()
     }
+
+    /// 0.9.167 (s10-sf-futex-desk section 8): drop
+    /// every Other frame, and any group the drop
+    /// empties. Called when a thread's new fill
+    /// opens a new group: the thread read again, so
+    /// it is back in its loop (or in the nested read
+    /// of a wait it serves), and every one-way
+    /// transaction of an older fill is finished
+    /// work -- in the kernel it leaves the thread's
+    /// transaction stack when its handler returns,
+    /// necessarily before the thread's next read.
+    /// Until now Other frames were consumed only by
+    /// a later BC_REPLY walking past them, so a
+    /// thread serving one-way floods (SF's pool)
+    /// piled them without bound -- depth 4221 in
+    /// the 0.9.166 field -- and the depth the dumps
+    /// print stopped meaning anything. Reply frames
+    /// are never dropped here: a claimed two-way
+    /// serve stays open until its BC_REPLY pops it,
+    /// nested reads included.
+    fn purge_completed_oneway(&mut self) {
+        for g in self.groups.iter_mut() {
+            g.frames
+                .retain(|fr| matches!(fr, ServingFrame::Reply(..)));
+        }
+        self.groups.retain(|g| !g.frames.is_empty());
+    }
 }
 
 /// One large transaction parcel kept in an arena's
@@ -3851,6 +3878,20 @@ fn reverse_call_frame(st: &BinderState, sender_pid: i32) -> Option<(i32, String)
     let group = stack.groups.last()?;
     group.frames.iter().find_map(|f| match f {
         ServingFrame::Reply(w, _) => Some((w.sender_pid, w.sender_arena.clone())),
+        ServingFrame::Other => None,
+    })
+}
+
+/// 0.9.167: a thread's serving context as the
+/// holder-stack line prints it -- the (sender,
+/// code) of the first Reply frame of the newest
+/// group, the same walk reverse_call_frame rules
+/// by, with the frame's code carried along.
+fn serving_context(st: &BinderState, pid: i32) -> Option<(i32, u32)> {
+    let stack = st.serving.get(&pid)?;
+    let group = stack.groups.last()?;
+    group.frames.iter().find_map(|f| match f {
+        ServingFrame::Reply(w, _) => Some((w.sender_pid, w.code)),
         ServingFrame::Other => None,
     })
 }
@@ -5153,6 +5194,12 @@ const MSG_PUSH_DUMP_STACKS: u8 = 43;
 // broadcasts the servicer pids so the worker owning
 // each prints its tracer-side face line.
 const MSG_PUSH_SERVICER_FACE: u8 = 44;
+// 0.9.167 (s10-sf-futex-desk section 8): after a
+// B/B2 wedge verdict, broadcast the servicer
+// family's root pid so every worker photographs
+// ALL of that family's members on its shard (the
+// holder-candidate sweep; see Push::HolderSweep).
+const MSG_PUSH_HOLDER_SWEEP: u8 = 45;
 const MSG_RESP_VCRED: u8 = 108;
 const MSG_RESP_IGNITION_DUMP: u8 = 109;
 const MSG_RESP_WEDGE_CHAIN: u8 = 110;
@@ -5534,6 +5581,19 @@ enum Push {
         arena: String,
         pids: Vec<i32>,
     },
+    /// 0.9.167 (s10-sf-futex-desk section 8):
+    /// broadcast after a B/B2 wedge verdict; every
+    /// worker prints a holder-face line for each of
+    /// its own procs whose family root is `root`
+    /// (the servicer process's leader). The face and
+    /// roster pushes only ever covered the shards
+    /// that owned a named thread, and the 0.9.166
+    /// field's lock holder sat in a non-futex
+    /// posture no print reached.
+    HolderSweep {
+        arena: String,
+        root: i32,
+    },
 }
 
 /// The tracer's end of the coordinator channel. Every
@@ -5688,6 +5748,12 @@ impl CoordClient {
                         pids.push(d.i32());
                     }
                     self.inbox.push_back(Push::ServicerFace { arena, pids });
+                }
+                MSG_PUSH_HOLDER_SWEEP => {
+                    let mut d = Dec::new(&payload);
+                    let arena = d.string();
+                    let root = d.i32();
+                    self.inbox.push_back(Push::HolderSweep { arena, root });
                 }
                 _ => self.queue.push_back((kind, payload)),
             }
@@ -7313,6 +7379,22 @@ impl CoordServer {
         }
     }
 
+    /// 0.9.167 (s10-sf-futex-desk section 8): the
+    /// holder sweep rides the same broadcast as the
+    /// servicer faces; `arena` is the wedged arena
+    /// the dump was taken for (the face lines'
+    /// label), `root` the servicer family's leader.
+    fn push_holder_sweep(&mut self, arena: &str, root: i32) {
+        let mut e = Enc::new();
+        e.string(arena);
+        e.i32(root);
+        for ci in 0..self.conns.len() {
+            if self.conns[ci].wid.is_some() {
+                self.send_to(ci, MSG_PUSH_HOLDER_SWEEP, &e.0);
+            }
+        }
+    }
+
     /// A connection died: drop its routes (its
     /// tracees are being EXITKILLed with it). W0's
     /// death ends the run: exit, and every worker
@@ -7643,7 +7725,7 @@ impl CoordServer {
                 // settle in the same captured reply,
                 // behind the chain dump's lines.
                 self.settle_perf_accounts();
-                let (holder, servicers, surf_ev) = holder;
+                let (holder, servicers, surf_ev, sweep) = holder;
                 // 0.9.153: file the snapshot's surface
                 // evidence under the wedged arena's
                 // name; its crash-leg settlement
@@ -7713,6 +7795,42 @@ impl CoordServer {
                         .cloned()
                         .unwrap_or_default();
                     self.push_servicer_face(&ss_arena, &servicers);
+                }
+                // 0.9.167 (s10-sf-futex-desk section
+                // 8): the holder sweep. The
+                // coordinator prints the serving-stack
+                // half for the servicer arena's
+                // threads (depth is honest since the
+                // one-way purge), then broadcasts so
+                // every worker prints the tracer-face
+                // half for the whole family.
+                if let Some((svc_arena, root)) = sweep {
+                    let ss_arena = self
+                        .st
+                        .thread_arena
+                        .get(&leader)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut tids: Vec<i32> = self
+                        .st
+                        .serving
+                        .iter()
+                        .filter(|(_, s)| s.arena == svc_arena && s.depth() > 0)
+                        .map(|(p, _)| *p)
+                        .collect();
+                    tids.sort_unstable();
+                    for pid in tids {
+                        let depth = self.st.serving[&pid].depth();
+                        let ctx = match serving_context(&self.st, pid) {
+                            Some((sender, code)) => format!("{sender}/{code}"),
+                            None => "-".to_string(),
+                        };
+                        bsup!(
+                            "binder: wedge-holder-stack arena={ss_arena} servicer_arena={svc_arena} pid={pid} depth={depth} ctx={ctx} t={}",
+                            field_t_ms()
+                        );
+                    }
+                    self.push_holder_sweep(&ss_arena, root);
                 }
             }
             MSG_REQ_FATAL_DUMP => {
@@ -11193,7 +11311,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
     leader: i32,
     solo: i32,
     rd: &mut R,
-) -> (i32, Vec<(String, i32)>, Option<SurfEv>) {
+) -> (i32, Vec<(String, i32)>, Option<SurfEv>, Option<(String, i32)>) {
     let Some(arena) = st.thread_arena.get(&leader).cloned() else {
         bsup!(
             "binder: wedge-chain leader={leader} arena=- (leader holds no binder arena)"
@@ -11201,7 +11319,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         bsup!(
             "binder: wedge-verdict arena=- class=unknown holder=- basis=none (provisional)"
         );
-        return (0, Vec::new(), None);
+        return (0, Vec::new(), None, None);
     };
     // (a) Serving stacks of this arena: every frame
     // the arena's threads are serving, in stack
@@ -11847,6 +11965,30 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
         },
         field_t_ms()
     );
+    // 0.9.167 (s10-sf-futex-desk section 8): a
+    // B/B2 verdict means a system_server thread is
+    // frozen on a servicer wait and the servicer's
+    // own stuck holder is the open question, so the
+    // snapshot also asks for a holder sweep of the
+    // servicer family: (servicer arena, its leader
+    // pid). The leader is the arena path's suffix
+    // by construction (the arena file is named for
+    // the pid that opened it). The handler prints
+    // the serving-stack half and broadcasts the
+    // tracer-face half.
+    let sweep = if class == "B" || class == "B2" {
+        out_waits
+            .iter()
+            .find(|w| w.0 == holder)
+            .and_then(|w| {
+                w.1.rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .map(|root| (w.1.clone(), root))
+            })
+    } else {
+        None
+    };
     // 0.9.146 (s9-146-desk section 5): the
     // reply-complete ledger also settles here, at
     // snapshot time, for every live arena -- same
@@ -11979,7 +12121,7 @@ fn binder_wedge_chain<R: FnMut(i32, u64, usize) -> Option<Vec<u8>>>(
             code: top.code,
         })
     };
-    (holder, all_servicers, surf_ev)
+    (holder, all_servicers, surf_ev, sweep)
 }
 
 /// Cap on the write-overlap audit table (0.9.132):
@@ -14211,6 +14353,12 @@ fn binder_claim_fills(st: &mut BinderState, arena: &str, pid: i32, bytes: &[u8])
             // the fill's first frame; later frames of
             // the same fill (same fid on top) append.
             if stack.groups.last().map_or(true, |g| g.fill_id != fid) {
+                // 0.9.167: a new fill opens a new
+                // group; the one-way frames of older
+                // fills are finished work by the time
+                // the thread reads again (see
+                // ServingStack::purge_completed_oneway).
+                stack.purge_completed_oneway();
                 stack.groups.push(ServingGroup {
                     fill_id: fid,
                     frames: Vec::new(),
@@ -18081,6 +18229,27 @@ fn next_stop(
                         }
                     }
                 }
+                Push::HolderSweep { arena, root } => {
+                    // 0.9.167 (s10-sf-futex-desk
+                    // section 8): the coordinator's
+                    // B/B2 verdict named this servicer
+                    // family's root; photograph EVERY
+                    // member on this shard, named by
+                    // nobody -- the holder of the
+                    // servicer's stuck lock is a
+                    // family member in a non-futex
+                    // posture, and the roster only
+                    // ever covered one shard.
+                    let mut members: Vec<i32> = procs
+                        .keys()
+                        .copied()
+                        .filter(|p| proc_root_of(procs, *p) == root)
+                        .collect();
+                    members.sort_unstable();
+                    for m in members {
+                        print_family_face(&arena, m, procs, "wedge-holder-face");
+                    }
+                }
             }
         }
         if acted {
@@ -18311,7 +18480,23 @@ fn proc_root_of(procs: &HashMap<i32, ProcState>, mut p: i32) -> i32 {
 /// in field time -- the 0.9.165 field photographed
 /// its suspect in a futex wait but not the address
 /// it waited on, one field short of a verdict.
+/// 0.9.167: the same line, under the tag
+/// wedge-holder-face, is what the holder sweep
+/// prints -- for EVERY member of the servicer
+/// family, on EVERY worker (the roster only ever
+/// covered the shard that received a face push,
+/// and only the members the coordinator had not
+/// named).
 fn print_servicer_roster(arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
+    print_family_face(arena, x, procs, "wedge-servicer-roster");
+}
+
+fn print_family_face(
+    arena: &str,
+    x: i32,
+    procs: &HashMap<i32, ProcState>,
+    tag: &str,
+) {
     let Some(proc) = procs.get(&x) else {
         return;
     };
@@ -18380,7 +18565,7 @@ fn print_servicer_roster(arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
     };
     let age = emit_seq_now().saturating_sub(proc.last_stop_seq);
     sup!(
-        "binder: wedge-servicer-roster arena={arena} pid={x} leader={root} last_syscall={last_syscall} state={state} futex_uaddr={futex_uaddr} futex_grp={futex_grp} last_op={last_op} last_stop_age={age} last_stop_t={} t={}",
+        "binder: {tag} arena={arena} pid={x} leader={root} last_syscall={last_syscall} state={state} futex_uaddr={futex_uaddr} futex_grp={futex_grp} last_op={last_op} last_stop_age={age} last_stop_t={} t={}",
         proc.last_stop_t,
         field_t_ms()
     );
@@ -24594,6 +24779,78 @@ mod tests {
         st.serving.insert(504, deep);
         assert!(!reverse_call_mark(&st, 504, "ss", 1));
         assert!(reverse_call_mark(&st, 504, "app", 1));
+    }
+
+    // 0.9.167: the one-way purge at a new fill --
+    // Reply frames of older fills survive in order
+    // (a claimed two-way serve is open until its
+    // BC_REPLY), Other frames and the groups they
+    // empty are gone, and an all-one-way stack
+    // empties completely.
+    #[test]
+    fn purge_completed_oneway_keeps_only_open_replies() {
+        fn rwait(sender: i32, from: &str) -> ReplyWait {
+            ReplyWait {
+                sender_pid: sender,
+                sender_arena: from.to_string(),
+                cookie: 0,
+                target_handle: 1,
+                code: 9,
+                crash: false,
+                reverse: false,
+                direct_to: None,
+            }
+        }
+        let mut stack = ServingStack {
+            arena: "sf".to_string(),
+            groups: vec![
+                ServingGroup {
+                    fill_id: 1,
+                    frames: vec![
+                        ServingFrame::Other,
+                        ServingFrame::Reply(rwait(601, "ss"), 1),
+                        ServingFrame::Other,
+                    ],
+                },
+                ServingGroup {
+                    fill_id: 2,
+                    frames: vec![ServingFrame::Other, ServingFrame::Other],
+                },
+                ServingGroup {
+                    fill_id: 3,
+                    frames: vec![ServingFrame::Reply(rwait(602, "app"), 2)],
+                },
+            ],
+        };
+        stack.purge_completed_oneway();
+        assert_eq!(stack.depth(), 2);
+        assert_eq!(stack.groups.len(), 2);
+        assert_eq!(stack.groups[0].fill_id, 1);
+        assert_eq!(stack.groups[1].fill_id, 3);
+        match &stack.groups[0].frames[0] {
+            ServingFrame::Reply(w, seq) => {
+                assert_eq!(w.sender_pid, 601);
+                assert_eq!(*seq, 1);
+            }
+            ServingFrame::Other => panic!("group 1 frame must be the reply"),
+        }
+        match &stack.groups[1].frames[0] {
+            ServingFrame::Reply(w, seq) => {
+                assert_eq!(w.sender_pid, 602);
+                assert_eq!(*seq, 2);
+            }
+            ServingFrame::Other => panic!("group 3 frame must be the reply"),
+        }
+        let mut oneway_only = ServingStack {
+            arena: "sf".to_string(),
+            groups: vec![ServingGroup {
+                fill_id: 7,
+                frames: vec![ServingFrame::Other, ServingFrame::Other],
+            }],
+        };
+        oneway_only.purge_completed_oneway();
+        assert_eq!(oneway_only.depth(), 0);
+        assert!(oneway_only.groups.is_empty());
     }
 
     // 0.9.162: the promotion walk -- unit order,

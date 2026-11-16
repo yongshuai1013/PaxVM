@@ -122,3 +122,82 @@ ret=0、真喚醒）。roster 拍全 SF 家族 5 名：13183／13184 開場探
   「主線程本地作用域自持」一形，以主線程的 serving 深度與
   last_stop_t 對讀判。
 - 凍結不復發 → 儀器未受測、不下結論（同 §5 原例）。
+
+## 7. 客體面案頭（2026-11-16）：31100 身份定讞、.166 指認撤回
+
+源碼基底：aosp-mirror platform_frameworks_base／platform_bionic
+android-2.3.7_r1 原文（SurfaceFlinger.cpp/.h、MessageQueue.cpp、
+DisplayHardwareBase.cpp、ISurfaceComposer.h、bionic pthread.h）。
+
+**31100 ＝ SurfaceFlinger 主迴圈線程（定讞）**：onFirstRef 以
+run() 啟動 SF 的 Thread，其 readyToRun() 在該線程上建
+DisplayHardware → DisplayHardwareBase，後者依序建 DisplayEventThread
+與 ConsoleManagerThread——兩者的 clone 父皆為該主迴圈線程，與場上
+家譜（31100 → {31101, 31102}）逐字吻合。31101 是 DisplayEventThread：
+readyToRun 的 access 探測順序（/sys/power/wait_for_fb_sleep →
+/sys/android_power/…）與場上日誌逐行相同、ENOENT 即 NO_INIT 退出；
+31102 是 ConsoleManagerThread（構造在父線程上下文開 /dev/tty0 失敗、
+consoleFd<0、readyToRun 直接 NO_INIT、本體零日誌退出）。
+
+**雙字身份**：SurfaceFlinger.h 成員序——mEventQueue（MessageQueue）
+→ mStateLock → mCurrentState／mDrawingState（兩個大型 State）→
+mTransactionCV。mTransactionCV 與 mStateLock 相隔兩個 State 物件、
+不可能落在 20 位元組內；20 位元組雙字只能是「mEventQueue 尾部
+（其 mCondition 的 futex 字）＋mStateLock」。故 …850＝MessageQueue
+條件字、**…864＝SurfaceFlinger::mStateLock**（行為面亦合：排隊者
+是服侍 binder 的主線程與池線程、皆 mStateLock 的常客）。
+
+**31100 的等待是健康閒置**：threadLoop → waitForEvent →
+MessageQueue::waitMessage，全程不取 mStateLock；其 …850 停留是
+條件等待（Condition::wait 期間釋放佇列自身的 mLock）。結構上它
+不可能持著 mStateLock 睡在 …850 上。
+
+**§6 指認撤回**：.166 首場「31100＝持鎖者」是排除法誤判——排除
+法預設持鎖者必在某個 futex 上等待；源碼證明 SF 內所有持
+mStateLock 又等待的路徑（mTransactionCV 的 wait／waitRelative）
+在等待期間都釋放 mStateLock，**不存在「持 mStateLock 停在 futex
+上」的姿勢**。真正的持鎖者姿勢必為非 futex 型：服侍中向外同步
+binder 等回覆、阻塞型非 futex syscall（gralloc／驅動路徑）、或
+使用者空間自旋——皆在現行印面（roster 只覆蓋推送 worker 的分片、
+face 的 parked-binder 分不出池閒置與向外阻塞）之外。
+
+凍結力學不變：最後放鎖 31088@t=18795（主線程以池身分服侍完一
+單），其後無人放鎖、waits 累積至 41、SF 不死使凍結跨 SS 任存續。
+
+**.167 儀器提案（待拍板）**：B2 判讀觸發時加一輪「持鎖候選掃描」
+——對 servicer 家族根，向全 worker 廣播專用 push，各 worker 印
+本分片內該家族全員的姿勢＋服侍棧**頂框**（非深度）＋last_stop_t，
+補上 roster 的分片覆蓋缺口與 parked-binder 的分辨力。純儀器。
+另記：serving 深度帳 oneway 框只進不出（膨脹至 4221）是模型帳
+毛病、與本掃描的頂框印法相衝突，修頂框前須先修退框或改印真棧。
+
+## 8. .167 規格與預註冊判準（2026-11-16）
+
+兩件，一真修一儀器：
+
+**(a) oneway 退框（模型帳真修）**：ServingFrame::Other 此前只被後來的
+BC_REPLY 順路吃掉，服侍 oneway 洪流的線程（SF 池）無界累積（.166 場
+深度 4221）、深度印面失真。新填料開新組時先 purge_completed_oneway：
+舊組的 Other 全清、Reply 全留（已認領的雙向服侍開著直到其 BC_REPLY
+收）。內核語義：線程再次讀取＝已回迴圈（或在所服侍等待的嵌套讀中），
+舊 oneway 在其 handler 返回時即離開交易棧、必然早於下一次讀。配對
+不受影響（Reply 框不動、.130 續答紀律不變）。
+
+**(b) 持鎖候選掃描（純儀器）**：B／B2 判讀成立時，binder_wedge_chain
+回傳 sweep＝(servicer arena、其 leader pid)；協調器先印
+wedge-holder-stack（該 arena 深度>0 的線程：深度＋serving_context
+＝最新組第一個 Reply 框的 sender/code），再以 MSG_PUSH_HOLDER_SWEEP
+（45）廣播；每個 worker 對其分片內 root 相符的**全部**成員印
+wedge-holder-face（與 roster 同欄位：last_syscall／state／futex 三欄
+／last_stop_age／last_stop_t）。
+
+**預註冊場判**：
+- 退框面：SF 線程的 serving 深度回到個位／低雙位（對照 4221）；
+  RevAcct 續全平、.164 直送不退化（marked＝nested、池認領 0）。
+- 掃描面：每張 B2 快照的 holder-face 覆蓋 SF 全家族（含池後生線程，
+  不只入鏡四名）；決定性讀法——某成員 posture 非 futex 排隊
+  （parked-binder 且 holder-stack 有 ctx、或 parked-other、或
+  no-pending）且不是 31100 本人＝持鎖候選首次具名。
+- 退出條款：掃描開火而仍無候選分離（全員非在 …864 排隊、即 31100
+  閒置、即無 ctx 的池閒置讀）→ 持鎖者不是活著的 SF 線程姿勢，
+  下一步回案頭想剩餘形狀（如自旋偵測），不再加儀器。
