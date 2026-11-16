@@ -18491,6 +18491,23 @@ fn adopt_tracee(
     let mut status: i32 = 0;
     let r = unsafe { libc::waitpid(pid, &mut status, WALL) };
     if r != pid || !libc::WIFSTOPPED(status) {
+        // 0.9.172: if this waitpid reaped an exit,
+        // the tracee died in the detach gap; print
+        // the same record a traced death gets, or
+        // the pid vanishes from every log while its
+        // real parent restarts it (the 0.9.171
+        // field's first SurfaceFlinger).
+        if r == pid && libc::WIFEXITED(status) {
+            sup!(
+                "PROC_EXITED pid={pid} code={} (handoff-gap)",
+                libc::WEXITSTATUS(status)
+            );
+        } else if r == pid && libc::WIFSIGNALED(status) {
+            sup!(
+                "PROC_SIGNALED pid={pid} sig={} (handoff-gap)",
+                libc::WTERMSIG(status)
+            );
+        }
         sup!("adopt: pid={pid} vanished at its attach stop (r={r} status={status:#x})");
         coord.adopt_ack(pid, false);
         coord.unregister_pid(pid);
@@ -18577,6 +18594,7 @@ fn do_handoff(
     }
     sup!("handoff: pid={pid} not adopted (ack={acked:?}); W{from} takes it back");
     coord.unregister_pid(pid);
+    let mut gap_status: Option<i32> = None;
     if ptrace4(PTRACE_ATTACH, pid, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
         let mut status: i32 = 0;
         let r = unsafe { libc::waitpid(pid, &mut status, WALL) };
@@ -18590,6 +18608,29 @@ fn do_handoff(
             cont_syscall(pid, 0);
             return;
         }
+        if r == pid {
+            gap_status = Some(status);
+        }
+    }
+    // 0.9.172: a take-back whose waitpid reaped an
+    // exit means the tracee died in the detach gap;
+    // record the death before dropping the state,
+    // or the pid leaves no trace in any log (the
+    // 0.9.171 field's first SurfaceFlinger).
+    match gap_status {
+        Some(status) if libc::WIFEXITED(status) => {
+            sup!(
+                "PROC_EXITED pid={pid} code={} (handoff-gap)",
+                libc::WEXITSTATUS(status)
+            );
+        }
+        Some(status) if libc::WIFSIGNALED(status) => {
+            sup!(
+                "PROC_SIGNALED pid={pid} sig={} (handoff-gap)",
+                libc::WTERMSIG(status)
+            );
+        }
+        _ => {}
     }
     sup!(
         "handoff: pid={pid} take-back FAILED errno={}; tracee left stopped",
