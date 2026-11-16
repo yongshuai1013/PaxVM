@@ -1693,6 +1693,14 @@ struct ProcState {
     /// sequence at the last stop processed for this
     /// tracee; the servicer-face age field reads it.
     last_stop_seq: u64,
+    /// 0.9.166: the same last-stop mark in field
+    /// time (ms), stamped beside last_stop_seq at
+    /// both stop seats. The roster line prints it
+    /// so a family member's silence is readable in
+    /// field time, not only in worker emit lines
+    /// (pass-through stops emit nothing, so the
+    /// emit-line age alone cannot date a silence).
+    last_stop_t: u64,
     /// 0.9.142 (s9-142-desk section 3): this thread
     /// belongs to the system_server candidate's
     /// family. Set at birth: the candidate itself
@@ -2140,6 +2148,7 @@ impl ProcState {
             sigsys_preentry: 0,
             win: WinProfile::default(),
             last_stop_seq: 0,
+            last_stop_t: 0,
             ss_family: false,
             fill_release: None,
             proc_leader: 0,
@@ -18296,12 +18305,18 @@ fn proc_root_of(procs: &HashMap<i32, ProcState>, mut p: i32) -> i32 {
 /// print_servicer_face's, minus the futex group
 /// scan. Coverage is this worker's own shard,
 /// the same limit the faces have.
+/// 0.9.166: the roster line now carries the full
+/// futex face (uaddr / group / op, same derivation
+/// as the face line) and the member's last stop
+/// in field time -- the 0.9.165 field photographed
+/// its suspect in a futex wait but not the address
+/// it waited on, one field short of a verdict.
 fn print_servicer_roster(arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
     let Some(proc) = procs.get(&x) else {
         return;
     };
     let root = proc_root_of(procs, x);
-    let (last_syscall, state) = match &proc.pending {
+    let (last_syscall, state, futex_uaddr, futex_grp, last_op) = match &proc.pending {
         Some(pd) => {
             let ls = format!("{}({})", nr_name(proc.compat, pd.nr), pd.nr);
             let state = if pd.binder_parked {
@@ -18311,13 +18326,62 @@ fn print_servicer_roster(arena: &str, x: i32, procs: &HashMap<i32, ProcState>) {
             } else {
                 "parked-other"
             };
-            (ls, state)
+            // 0.9.166: the futex face of the pending
+            // call, formatted exactly as the
+            // servicer-face line formats it, so a
+            // roster line and a face line stay
+            // comparable. The .165 field's suspect
+            // (SF's composition thread) sat in a
+            // futex wait whose address the roster
+            // line did not print -- the one field
+            // that separates "holds word A, waits on
+            // word B" from "queues on word A with
+            // everyone else". The group count scans
+            // this worker's family (same root) for
+            // the same uaddr, self included.
+            let (ua, grp, op) = match pd.last_futex {
+                Some((u, o, _)) => {
+                    let n = procs
+                        .iter()
+                        .filter(|(p, pr)| {
+                            **p != x
+                                && proc_root_of(procs, **p) == root
+                                && pr.pending.as_ref().is_some_and(|q| {
+                                    q.last_futex.is_some_and(|(u2, _, _)| u2 == u)
+                                })
+                        })
+                        .count()
+                        + 1;
+                    (
+                        format!("0x{u:x}"),
+                        if n == 1 {
+                            "solo".to_string()
+                        } else {
+                            n.to_string()
+                        },
+                        if o == 9 { "WAIT_BITSET" } else { "WAIT" },
+                    )
+                }
+                None => (
+                    "-".to_string(),
+                    "-".to_string(),
+                    if pd.last_wake.is_some() { "WAKE" } else { "-" },
+                ),
+            };
+            (ls, state, ua, grp, op)
         }
-        None => ("-".to_string(), "no-pending"),
+        None => (
+            "-".to_string(),
+            "no-pending",
+            "-".to_string(),
+            "-".to_string(),
+            "-",
+        ),
     };
     let age = emit_seq_now().saturating_sub(proc.last_stop_seq);
     sup!(
-        "binder: wedge-servicer-roster arena={arena} pid={x} leader={root} last_syscall={last_syscall} state={state} last_stop_age={age} t={}",
+        "binder: wedge-servicer-roster arena={arena} pid={x} leader={root} last_syscall={last_syscall} state={state} futex_uaddr={futex_uaddr} futex_grp={futex_grp} last_op={last_op} last_stop_age={age} last_stop_t={} t={}",
+        proc.last_stop_t,
         field_t_ms()
     );
 }
@@ -20194,6 +20258,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 // already in hand.
                 proc.win.stops += 1;
                 proc.last_stop_seq = emit_seq_now();
+                proc.last_stop_t = field_t_ms();
                 if pend.last_futex.is_some() {
                     proc.win.futex += 1;
                 }
@@ -21372,6 +21437,7 @@ fn tracer_loop(ctx: TracerCtx) {
                 // last-activity mark for the face age.
                 proc.win.stops += 1;
                 proc.last_stop_seq = emit_seq_now();
+                proc.last_stop_t = field_t_ms();
                 if let Some(mut pend) = proc.pending.take() {
                     // 0.9.152 (M-c): a completing futex
                     // WAIT closes the thread's wait-book
