@@ -1897,6 +1897,11 @@ class MainActivity : Activity() {
             return
         }
         supervisor = proc
+        // 0.9.174: hold foreground priority for the
+        // whole session so the host does not reap the
+        // shell (and with it the supervisor) when the
+        // app leaves the foreground.
+        SupervisorService.start(this)
         fieldStartNanos = System.nanoTime()
         sessionRan = true
         diagnostics?.record("supervisor process 已啟動。")
@@ -1941,6 +1946,7 @@ class MainActivity : Activity() {
             startupDiagnostics?.finish("supervisor exited with code $code")
             runOnUiThread {
                 supervisor = null
+                SupervisorService.stop(this@MainActivity)
                 startupDiagnostics = null
                 fbSession = null
                 startButton.isEnabled = true

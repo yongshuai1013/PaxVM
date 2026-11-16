@@ -12,6 +12,11 @@
     <!-- Only needed on Android 13+ (runtime permission) for the
          pairing notification; harmless on older versions. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Foreground keep-alive for a running supervisor
+         session (SupervisorService, 0.9.174). The
+         SPECIAL_USE pair is required at targetSdk 34. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:label="PaxVM"
@@ -43,6 +48,14 @@
         <service
             android:name=".PairingService"
             android:exported="false" />
+        <service
+            android:name=".SupervisorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the PaxVM ptrace supervisor process alive while a guest VM session is running" />
+        </service>
     </application>
 
 </manifest>
