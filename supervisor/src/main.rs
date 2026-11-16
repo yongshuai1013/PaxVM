@@ -1323,6 +1323,14 @@ struct Pending {
     /// (WAKE / WAKE_BITSET): (uaddr, nr_wake). See
     /// last_futex.
     last_wake: Option<(u32, u32)>,
+    /// 0.9.173: an mmap/munmap in flight: (addr arg,
+    /// len, backing label decided at the entry stop).
+    /// The exit stop files the completed call into
+    /// the worker's mapping-history ledger (see
+    /// MapHistEnt), which the FATAL object dump
+    /// consults when a crashed address sits in no
+    /// live mapping.
+    map_args: Option<(u64, u64, String)>,
 }
 
 /// 0.9.155 (s10-sigsegv-desk section 5.3 item 3):
@@ -19427,6 +19435,65 @@ fn fatal_mapline(pid: i32, addr: u64) -> String {
     "none".to_string()
 }
 
+/// 0.9.173: one completed guest mmap/munmap in a
+/// worker's mapping-history ledger. The FATAL
+/// object dump reads the live maps of a corpse;
+/// when the crashed address sits in no live
+/// mapping, this ledger is the only record of
+/// what used to live there and who removed it.
+/// Keyed by thread-group leader (the address
+/// space's identity); supervisor-injected
+/// mappings (arena bases) never pass a guest
+/// syscall and are not recorded here.
+struct MapHistEnt {
+    leader: i32,
+    actor: i32,
+    lo: u64,
+    hi: u64,
+    unmap: bool,
+    backing: String,
+    t: u64,
+}
+
+/// The biography of `addr` in one address space's
+/// ledger, newest first: the latest covering
+/// event decides. An unmap is paired with the
+/// map it removed when the ledger still holds it.
+fn map_hist_lookup(
+    hist: &std::collections::VecDeque<MapHistEnt>,
+    leader: i32,
+    addr: u64,
+) -> String {
+    let mut unmap: Option<&MapHistEnt> = None;
+    for e in hist.iter().rev() {
+        if e.leader != leader || addr < e.lo || addr >= e.hi {
+            continue;
+        }
+        if e.unmap {
+            if unmap.is_none() {
+                unmap = Some(e);
+            }
+        } else if let Some(u) = unmap {
+            return format!(
+                "mapped by pid={} t={} backing={}; unmapped by pid={} t={}",
+                e.actor, e.t, e.backing, u.actor, u.t
+            );
+        } else {
+            return format!(
+                "mapped by pid={} t={} backing={}; no unmap on this worker",
+                e.actor, e.t, e.backing
+            );
+        }
+    }
+    match unmap {
+        Some(u) => format!(
+            "unmapped by pid={} t={}; its map is not on this worker",
+            u.actor, u.t
+        ),
+        None => "never mapped on this worker".to_string(),
+    }
+}
+
 /// One FATAL memory window as the u32 words the
 /// verdict tree reads (an object's vtable word,
 /// its counter words), in the minbuf print's
@@ -20217,6 +20284,10 @@ fn tracer_loop(ctx: TracerCtx) {
     let mut ss_apk_count: u32 = 0;
     let mut ss_apk_last: String = String::new();
     let mut ss_alloc: HashMap<i32, VecDeque<(u32, bool)>> = HashMap::new();
+    // 0.9.173: this worker's mapping-history ledger
+    // (see MapHistEnt); the FATAL object dump reads
+    // it when a crashed address has no live mapping.
+    let mut map_hist: VecDeque<MapHistEnt> = VecDeque::new();
     // 0.9.146 (s9-146-desk section 4.1): the futex
     // settlement accounts of every arena this
     // worker traces, keyed by (process leader,
@@ -20465,7 +20536,42 @@ fn tracer_loop(ctx: TracerCtx) {
                     jitmp: None,
                     last_futex: None,
                     last_wake: None,
+                    map_args: None,
                 };
+                // 0.9.173: snapshot mmap/munmap arguments
+                // for the mapping-history ledger; the
+                // exit stop files the outcome. The
+                // backing label names an arena / ashmem
+                // region when the fd is one of ours,
+                // else the bare fd, else "anon".
+                if (proc.compat && matches!(nr, 91 | 192))
+                    || (!proc.compat && matches!(nr, 215 | 222))
+                {
+                    let backing = if (proc.compat && nr == 192)
+                        || (!proc.compat && nr == 222)
+                    {
+                        let fd = regs.arg(4) as i32;
+                        if fd < 0 {
+                            "anon".to_string()
+                        } else if let Some(a) = fd_arena(pid, fd) {
+                            format!(
+                                "arena {}",
+                                a.rsplit('/').next().unwrap_or("")
+                            )
+                        } else if let Some(k) = fd_ashmem(pid, fd) {
+                            format!(
+                                "ashmem {}",
+                                k.rsplit('/').next().unwrap_or("")
+                            )
+                        } else {
+                            format!("fd {fd}")
+                        }
+                    } else {
+                        "-".to_string()
+                    };
+                    pend.map_args =
+                        Some((regs.arg(0), regs.arg(1), backing));
+                }
                 // 0.9.144 (s9-144-desk section 2.1
                 // item 2): an inline fill produced by
                 // this entry stop's WRITE_READ branch
@@ -21978,6 +22084,43 @@ fn tracer_loop(ctx: TracerCtx) {
                             }
                             q.push_back((pend.nr as u32, ret >= 0));
                         }
+                        // 0.9.173: file the completed
+                        // mmap / munmap into the
+                        // mapping-history ledger (see
+                        // MapHistEnt). Success is the
+                        // guest-visible outcome: an
+                        // mmap that did not return an
+                        // errno range, a munmap that
+                        // returned 0. Telemetry only;
+                        // the call itself is untouched.
+                        if let Some((a0, mlen, backing)) = &pend.map_args {
+                            let is_mmap = (proc.compat && pend.nr == 192)
+                                || (!proc.compat && pend.nr == 222);
+                            let ok = if is_mmap {
+                                !(-4095..=-1).contains(&ret)
+                            } else {
+                                ret == 0
+                            };
+                            if ok && *mlen > 0 {
+                                let (lo, hi) = if is_mmap {
+                                    (ret as u64, ret as u64 + *mlen)
+                                } else {
+                                    (*a0, *a0 + *mlen)
+                                };
+                                if map_hist.len() >= 2048 {
+                                    map_hist.pop_front();
+                                }
+                                map_hist.push_back(MapHistEnt {
+                                    leader: proc.proc_leader,
+                                    actor: pid,
+                                    lo,
+                                    hi,
+                                    unmap: !is_mmap,
+                                    backing: backing.clone(),
+                                    t: field_t_ms(),
+                                });
+                            }
+                        }
                         // 0.9.155 (s10-sigsegv-desk
                         // section 5.3 item 3): per-thread
                         // last-mprotect memo, and the
@@ -22664,10 +22807,23 @@ fn tracer_loop(ctx: TracerCtx) {
                                     );
                                     mrefs = ws.get(1).map(|w| *w as u64);
                                 }
-                                None => sup!(
-                                    "FATAL obj pid={pid} at=0x{ck:x} unreadable map=[{}]",
-                                    fatal_mapline(pid, ck)
-                                ),
+                                None => {
+                                    sup!(
+                                        "FATAL obj pid={pid} at=0x{ck:x} unreadable map=[{}]",
+                                        fatal_mapline(pid, ck)
+                                    );
+                                    sup!(
+                                        "FATAL hist pid={pid} at=0x{ck:x} [{}]",
+                                        map_hist_lookup(
+                                            &map_hist,
+                                            procs.get(&pid).map_or(
+                                                0,
+                                                |p| p.proc_leader
+                                            ),
+                                            ck
+                                        )
+                                    );
+                                }
                             }
                         }
                     }
@@ -22692,10 +22848,21 @@ fn tracer_loop(ctx: TracerCtx) {
                                     mrefs = ws.get(1).map(|w| *w as u64);
                                 }
                             }
-                            None => sup!(
-                                "FATAL obj pid={pid} at=0x{this_hint:x} (this) unreadable map=[{}]",
-                                fatal_mapline(pid, this_hint)
-                            ),
+                            None => {
+                                sup!(
+                                    "FATAL obj pid={pid} at=0x{this_hint:x} (this) unreadable map=[{}]",
+                                    fatal_mapline(pid, this_hint)
+                                );
+                                sup!(
+                                    "FATAL hist pid={pid} at=0x{this_hint:x} [{}]",
+                                    map_hist_lookup(
+                                        &map_hist,
+                                        procs.get(&pid)
+                                            .map_or(0, |p| p.proc_leader),
+                                        this_hint
+                                    )
+                                );
+                            }
                         }
                     }
                     if mrefs.is_none() && seat == "atomic" {
@@ -22722,10 +22889,23 @@ fn tracer_loop(ctx: TracerCtx) {
                                         fatal_words_str(&ws)
                                     );
                                 }
-                                None => sup!(
-                                    "FATAL impl pid={pid} at=0x{mr:x} unreadable map=[{}]",
-                                    fatal_mapline(pid, mr)
-                                ),
+                                None => {
+                                    sup!(
+                                        "FATAL impl pid={pid} at=0x{mr:x} unreadable map=[{}]",
+                                        fatal_mapline(pid, mr)
+                                    );
+                                    sup!(
+                                        "FATAL hist pid={pid} at=0x{mr:x} [{}]",
+                                        map_hist_lookup(
+                                            &map_hist,
+                                            procs.get(&pid).map_or(
+                                                0,
+                                                |p| p.proc_leader
+                                            ),
+                                            mr
+                                        )
+                                    );
+                                }
                             }
                         } else {
                             // 0.9.157: an mRefs value
@@ -26348,5 +26528,58 @@ f1234000-f1235000 rw-p 00000000 00:00 0 [stack]
         assert_eq!(fin.sp(), cur.sp());
         assert_eq!(fin.pc(), cur.pc());
         assert_eq!(fin.lr(), cur.lr());
+    }
+
+    // 0.9.173: the mapping-history lookup pairs an
+    // unmap with the map it removed, reports a map
+    // that was never unmapped as such, and ignores
+    // other address spaces entirely.
+    fn hist_ent(
+        leader: i32,
+        actor: i32,
+        lo: u64,
+        hi: u64,
+        unmap: bool,
+        t: u64,
+    ) -> MapHistEnt {
+        MapHistEnt {
+            leader,
+            actor,
+            lo,
+            hi,
+            unmap,
+            backing: "ashmem x".to_string(),
+            t,
+        }
+    }
+
+    #[test]
+    fn map_hist_pairs_unmap_with_its_map() {
+        let mut h = std::collections::VecDeque::new();
+        h.push_back(hist_ent(10, 10, 0x8000, 0x9000, false, 100));
+        h.push_back(hist_ent(10, 11, 0x8000, 0x9000, true, 250));
+        let s = map_hist_lookup(&h, 10, 0x8ad4);
+        assert!(s.contains("mapped by pid=10 t=100"), "{s}");
+        assert!(s.contains("unmapped by pid=11 t=250"), "{s}");
+    }
+
+    #[test]
+    fn map_hist_map_without_unmap() {
+        let mut h = std::collections::VecDeque::new();
+        h.push_back(hist_ent(10, 10, 0x8000, 0x9000, false, 100));
+        let s = map_hist_lookup(&h, 10, 0x8000);
+        assert!(s.contains("no unmap on this worker"), "{s}");
+    }
+
+    #[test]
+    fn map_hist_never_and_other_leader() {
+        let mut h = std::collections::VecDeque::new();
+        h.push_back(hist_ent(10, 10, 0x8000, 0x9000, true, 100));
+        let s = map_hist_lookup(&h, 10, 0x8000);
+        assert!(s.contains("its map is not on this worker"), "{s}");
+        let s2 = map_hist_lookup(&h, 99, 0x8000);
+        assert!(s2.contains("never mapped"), "{s2}");
+        let s3 = map_hist_lookup(&h, 10, 0x7000);
+        assert!(s3.contains("never mapped"), "{s3}");
     }
 }
