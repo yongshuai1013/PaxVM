@@ -395,6 +395,15 @@ fn set_direct_log_dir(rootfs: &str, rotate: bool) {
                 let _ = std::fs::rename(&cur, &prev);
             }
         }
+        // 0.9.175: the fd ledger rotates with the
+        // mirrors, so a field's export never mixes two
+        // runs' boot windows.
+        let cur = format!("{dir}/fd-ledger.log");
+        let prev = format!("{dir}/fd-ledger-prev.log");
+        if std::path::Path::new(&cur).exists() {
+            let _ = std::fs::remove_file(&prev);
+            let _ = std::fs::rename(&cur, &prev);
+        }
     }
     let _ = DIRECT_DIR.set(dir);
 }
@@ -484,6 +493,120 @@ fn field_t_ms() -> u64 {
         .get()
         .map(|t| t.elapsed().as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 0.9.175 (mode4-desk section 4): the boot-window fd
+/// ledger. Mode 4's two surviving branches -- parcel
+/// fd translation losing a GraphicBuffer handle, or
+/// SF-side gralloc never allocating -- cannot be told
+/// apart from the direct logs: they are tail buffers
+/// that roll the boot window away, and allocation is
+/// guest-internal. For the first FD_LEDGER_WINDOW_MS
+/// of a field, every fd-fixup resolution pass and
+/// every guest ashmem open / SET_SIZE is appended to
+/// fd-ledger.log in the direct-log directory (rotated
+/// to fd-ledger-prev.log at startup, like the
+/// mirrors), one self-contained line per event, so
+/// the boot window survives to the export however
+/// the run ends. Telemetry only: nothing in the
+/// ledger feeds a decision.
+const FD_LEDGER_WINDOW_MS: u64 = 60_000;
+
+fn fd_ledger_line(line: &str) {
+    if field_t_ms() >= FD_LEDGER_WINDOW_MS {
+        return;
+    }
+    let Some(dir) = DIRECT_DIR.get() else { return };
+    let path = format!("{dir}/fd-ledger.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
+/// The fd-fixup half of the ledger, as a pure
+/// formatter (the window gate and the file write
+/// live in fd_ledger_fixups, so this is host
+/// testable): one line per resolution pass that
+/// carried at least one fixup. pairs names each
+/// surviving fixup's sender fd and the receiver-side
+/// fd it resolved to, read back from the pass's own
+/// cache; fails names each failed fixup with its
+/// recorded why (whitespace and separators folded
+/// to '_' so the line stays one line, one record).
+fn fd_ledger_format_fixups(
+    t: u64,
+    wid: u32,
+    recv_pid: i32,
+    arena: &str,
+    fixups: &[FdFixup],
+    cache: &HashMap<CacheKey, i32>,
+    res: &FdResolution,
+) -> String {
+    let arena_short = arena.rsplit('/').next().unwrap_or(arena);
+    let mut pairs: Vec<String> = Vec::new();
+    let mut fails: Vec<String> = Vec::new();
+    for f in &res.failed {
+        let why = f.why.replace(
+            |c: char| c.is_whitespace() || c == '"' || c == ';' || c == ',',
+            "_",
+        );
+        fails.push(format!("{}:{}:{}", f.sender_pid, f.sender_fd, why));
+    }
+    for fx in fixups {
+        let is_failed = res.failed.iter().any(|f| {
+            f.sender_pid == fx.sender_pid
+                && f.sender_fd == fx.sender_fd
+                && f.data_va == fx.data_va
+        });
+        if is_failed {
+            continue;
+        }
+        match cache.get(&(arena.to_string(), fx.sender_pid, fx.sender_fd)) {
+            Some(rfd) => {
+                pairs.push(format!("{}:{}->{}", fx.sender_pid, fx.sender_fd, rfd))
+            }
+            None => pairs.push(format!("{}:{}->?", fx.sender_pid, fx.sender_fd)),
+        }
+    }
+    format!(
+        "fdledger t={t} w={wid} recv={recv_pid} arena={arena_short} nfx={} rides={} dupped={} verified={} retried={} retry_saved={} ride_failed={} pairs=[{}] fails=[{}]",
+        fixups.len(),
+        res.rides,
+        res.dupped,
+        res.verified,
+        res.retried,
+        res.retry_saved,
+        res.ride_failed,
+        pairs.join(","),
+        fails.join(";"),
+    )
+}
+
+fn fd_ledger_fixups(
+    recv_pid: i32,
+    arena: &str,
+    fixups: &[FdFixup],
+    cache: &HashMap<CacheKey, i32>,
+    res: &FdResolution,
+) {
+    if fixups.is_empty() || field_t_ms() >= FD_LEDGER_WINDOW_MS {
+        return;
+    }
+    let line = fd_ledger_format_fixups(
+        field_t_ms(),
+        WID.load(Ordering::Relaxed),
+        recv_pid,
+        arena,
+        fixups,
+        cache,
+        res,
+    );
+    fd_ledger_line(&line);
 }
 
 /// Freeze forensics (0.9.81): leave W0's pid where
@@ -8721,6 +8844,7 @@ fn exec_binder_actions(
                 if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
                     coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
                 }
+                fd_ledger_fixups(pid, &arena, &fixups, &cmap, &res);
                 if !res.failed.is_empty() {
                     // 0.9.134 (fix (a)): convert the
                     // failed deliveries inside the batch
@@ -16168,6 +16292,7 @@ fn resolve_fd_fixups(
     if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
         coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
     }
+    fd_ledger_fixups(pid, arena, fixups, &cache, &res);
     if res.rides == 0 {
         return res;
     }
@@ -16960,6 +17085,14 @@ fn entry_open_ashmem(
     // body verbatim); this side only rewrites the
     // guest's path argument, to the raw path as before.
     let raw = coord.open_ashmem(pid, rootfs);
+    // 0.9.175: the ashmem half of the fd ledger --
+    // a region birth, with the guest pid that asked.
+    fd_ledger_line(&format!(
+        "fdledger-ash t={} w={} pid={pid} op=OPEN region={}",
+        field_t_ms(),
+        WID.load(Ordering::Relaxed),
+        raw.rsplit('/').next().unwrap_or(&raw),
+    ));
     let mut cursor = regs.sp().saturating_sub(256);
     match scratch_write(pid, &mut cursor, &raw) {
         Some(addr) => {
@@ -17047,9 +17180,20 @@ fn entry_ashmem_ioctl(
             // coordinator's record follows on the
             // one-way and its duplicate set_len is
             // idempotent.
+            let mut applied = 0;
             if let Ok(f) = std::fs::OpenOptions::new().write(true).open(key) {
-                let _ = f.set_len(size);
+                applied = if f.set_len(size).is_ok() { 1 } else { 0 };
             }
+            // 0.9.175: the sizing act itself, with
+            // whether the synchronous length apply
+            // above landed (its result was previously
+            // discarded unrecorded).
+            fd_ledger_line(&format!(
+                "fdledger-ash t={} w={} pid={pid} op=SET_SIZE key={} size={size} applied={applied}",
+                field_t_ms(),
+                WID.load(Ordering::Relaxed),
+                key.rsplit('/').next().unwrap_or(key),
+            ));
             coord.oneway_ashmem_set_size(key, size);
             skip_syscall(pid, regs, pend, 0);
             format!("ashmem SET_SIZE -> {size}")
@@ -26076,6 +26220,53 @@ mod tests {
     // RWX -> RX narrowings over the process's
     // virtual-ashmem region VMA (media's cache
     // at 0xe5371000, len 1048576, prot 0x5).
+    #[test]
+    fn fd_ledger_format_pairs_a_resolved_fixup() {
+        let fixups = vec![FdFixup {
+            file_off: 0,
+            sender_pid: 100,
+            sender_fd: 7,
+            data_va: 0x1000,
+        }];
+        let mut cache: HashMap<CacheKey, i32> = HashMap::new();
+        cache.insert(("/vm/.binder/200".to_string(), 100, 7), 42);
+        let res = FdResolution {
+            rides: 1,
+            dupped: 1,
+            ..Default::default()
+        };
+        let line = fd_ledger_format_fixups(1234, 2, 200, "/vm/.binder/200", &fixups, &cache, &res);
+        assert!(line.contains("fdledger t=1234 w=2 recv=200 arena=200"), "{line}");
+        assert!(line.contains("pairs=[100:7->42]"), "{line}");
+        assert!(line.contains("fails=[]"), "{line}");
+    }
+
+    #[test]
+    fn fd_ledger_format_names_a_failed_fixup() {
+        let fixups = vec![FdFixup {
+            file_off: 0,
+            sender_pid: 100,
+            sender_fd: 7,
+            data_va: 0x1000,
+        }];
+        let cache: HashMap<CacheKey, i32> = HashMap::new();
+        let res = FdResolution {
+            rides: 1,
+            failed: vec![FdFail {
+                sender_pid: 100,
+                sender_fd: 7,
+                data_va: 0x1000,
+                file_off: 0,
+                why: "open ret -2".to_string(),
+            }],
+            ..Default::default()
+        };
+        let line = fd_ledger_format_fixups(99, 0, 200, "arena", &fixups, &cache, &res);
+        assert!(line.contains("pairs=[]"), "{line}");
+        assert!(line.contains("fails=[100:7:open_ret_-2]"), "{line}");
+    }
+
+    #[test]
     #[test]
     fn ashmem_rx_narrow_hits_setup_code_cache_shape() {
         let path = "/data/data/com.yongshuai.paxvm/files/vm0/rootfsGB/.ashmem/a19281-3";

@@ -295,13 +295,12 @@ internal object StartupDiagnostics {
 
         private fun copySupervisorMirrorsLocked() {
             val dirs = listOfNotNull(mirrorDir, rootfs.parentFile).distinctBy { it.absolutePath }
-            for (worker in 0..6) {
-                val name = "supervisor-direct-w$worker.log"
-                val source = dirs.asSequence().map { File(it, name) }.firstOrNull { it.isFile } ?: continue
+            fun copyTail(name: String, capBytes: Long) {
+                val source = dirs.asSequence().map { File(it, name) }.firstOrNull { it.isFile } ?: return
                 val target = File(runDir, name)
                 try {
                     RandomAccessFile(source, "r").use { raf ->
-                        val size = minOf(raf.length(), 1024L * 1024).toInt()
+                        val size = minOf(raf.length(), capBytes).toInt()
                         raf.seek((raf.length() - size).coerceAtLeast(0))
                         val bytes = ByteArray(size)
                         raf.readFully(bytes)
@@ -310,6 +309,15 @@ internal object StartupDiagnostics {
                 } catch (_: Exception) {
                 }
             }
+            for (worker in 0..6) {
+                copyTail("supervisor-direct-w$worker.log", 1024L * 1024)
+            }
+            // 0.9.175: the supervisor's boot-window fd
+            // ledger (mode4-desk section 4) rides the
+            // same export; it is windowed to the first
+            // 60 s of a run, so a 4 MB tail is generous.
+            copyTail("fd-ledger.log", 4L * 1024 * 1024)
+            copyTail("fd-ledger-prev.log", 4L * 1024 * 1024)
         }
 
         private fun appendBounded(file: File, bytes: ByteArray, maxBytes: Long) {
