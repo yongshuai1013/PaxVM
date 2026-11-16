@@ -1986,7 +1986,38 @@ class MainActivity : Activity() {
             // fast-panning boot cannot churn the UI.
             var shownSeq = -1L
             var shownAt = 0L
+            // 0.9.169: the preview keeps a small diary
+            // in the session log. Until now every
+            // failure in here was swallowed silently,
+            // so a session that showed nothing left no
+            // evidence of which link broke (guest never
+            // drew / page file wrong / reads failing).
+            // First frame, stalled-frame warnings and
+            // read-failure streaks are logged, throttled.
+            var lastFrameAt = System.currentTimeMillis()
+            var lastWarnAt = 0L
+            var firstFrame = true
+            var failStreak = 0
+            appendLog("[shell] fb preview started")
             while (fbSession === rootfs) {
+                val nowTop = System.currentTimeMillis()
+                if (nowTop - lastFrameAt >= 15_000 &&
+                    nowTop - lastWarnAt >= 30_000
+                ) {
+                    lastWarnAt = nowTop
+                    val raw = try {
+                        pageFile.readText().trim()
+                    } catch (e: Exception) {
+                        "<unreadable ${e.javaClass.simpleName}>"
+                    }
+                    appendLog(
+                        "[shell] fb no new frame for " +
+                            "${(nowTop - lastFrameAt) / 1000}s: " +
+                            "presented seq=$shownSeq, " +
+                            "page file: '$raw', " +
+                            "fb0=${fbFile.length()}B",
+                    )
+                }
                 try {
                     val head = parseFbPage(pageFile.readText())
                     if (head == null) {
@@ -2012,6 +2043,15 @@ class MainActivity : Activity() {
                     }
                     shownSeq = seq
                     shownAt = now
+                    lastFrameAt = now
+                    failStreak = 0
+                    if (firstFrame) {
+                        firstFrame = false
+                        appendLog(
+                            "[shell] fb first frame: " +
+                                "seq=$seq yoff=$yoff",
+                        )
+                    }
                     val bmp = fbBitmap ?: Bitmap.createBitmap(
                         480,
                         800,
@@ -2051,9 +2091,21 @@ class MainActivity : Activity() {
                     runOnUiThread { fbView.setImageBitmap(bmp) }
                 } catch (_: InterruptedException) {
                     break
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                     // Mid-teardown or a torn read: the next
-                    // iteration (or the session end) sorts it.
+                    // iteration (or the session end) sorts
+                    // it -- but a streak is evidence, so
+                    // the first and every 100th failure
+                    // leave a line (0.9.169).
+                    failStreak++
+                    if (failStreak == 1 || failStreak % 100 == 0) {
+                        appendLog(
+                            "[shell] fb preview read failing " +
+                                "(x$failStreak): " +
+                                "${e.javaClass.simpleName}: " +
+                                "${e.message}",
+                        )
+                    }
                 }
                 try {
                     Thread.sleep(50)

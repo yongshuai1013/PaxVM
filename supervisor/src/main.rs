@@ -2680,13 +2680,15 @@ const FBIO_WAITFORVSYNC: u32 = 0x4004_4620;
 /// presented frame -- before this, the shell
 /// sampled the shared mapping on a bare timer and
 /// showed whatever half-composed state it caught.
-fn fb_page_contents(prev: &str, yoff: u32) -> String {
-    let seq = prev
-        .split_whitespace()
+fn fb_page_seq(prev: &str) -> u64 {
+    prev.split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    format!("{yoff} {}", seq + 1)
+        .unwrap_or(0)
+}
+
+fn fb_page_contents(prev: &str, yoff: u32) -> String {
+    format!("{yoff} {}", fb_page_seq(prev) + 1)
 }
 
 fn fd_is_fb(pid: i32, fd: i32) -> bool {
@@ -2756,6 +2758,13 @@ fn entry_fb_ioctl(
             let page_path = format!("{rootfs}/.fb-page");
             let prev = std::fs::read_to_string(&page_path).unwrap_or_default();
             let _ = std::fs::write(&page_path, fb_page_contents(&prev, yoff));
+            // 0.9.169: the pan line below carries the
+            // sequence too, so a session's log shows
+            // the presentation timeline directly (a
+            // black-from-boot session reads as GET
+            // lines with zero PAN lines, or pans that
+            // stop at a visible seq).
+            let pan_seq = fb_page_seq(&prev) + 1;
             skip_syscall(pid, regs, pend, 0);
             // Content fingerprint of the page about to be
             // shown: nonzero-byte counts of its first and
@@ -3026,7 +3035,7 @@ fn entry_fb_ioctl(
                 }
             })();
             format!(
-                "fb PAN yoffset={yoff} (page {}) by pid={pid} {fp}{shape}{ash}",
+                "fb PAN yoffset={yoff} (page {}) seq={pan_seq} by pid={pid} {fp}{shape}{ash}",
                 yoff / FB_H
             )
         }
