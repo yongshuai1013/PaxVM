@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -574,7 +575,7 @@ fn fd_ledger_format_fixups(
         }
     }
     format!(
-        "fdledger t={t} w={wid} recv={recv_pid} arena={arena_short} nfx={} rides={} dupped={} verified={} retried={} retry_saved={} ride_failed={} pairs=[{}] fails=[{}]",
+        "fdledger t={t} w={wid} recv={recv_pid} arena={arena_short} nfx={} rides={} dupped={} verified={} retried={} retry_saved={} ride_failed={} pins={} pairs=[{}] fails=[{}]",
         fixups.len(),
         res.rides,
         res.dupped,
@@ -582,6 +583,7 @@ fn fd_ledger_format_fixups(
         res.retried,
         res.retry_saved,
         res.ride_failed,
+        fixups.iter().filter(|f| f.pin.is_some()).count(),
         pairs.join(","),
         fails.join(";"),
     )
@@ -4645,6 +4647,13 @@ struct BinderState {
     /// with the receiver-side number.
     fd_pending: HashMap<String, Vec<FdFixup>>,
     fd_cache: HashMap<(String, i32, i32), i32>,
+    /// 0.9.176: the coordinator's held pin Files,
+    /// keyed by their own fd number (see FdPin).
+    /// Opened by binder_deliver at queue time;
+    /// closed on MSG_ONEWAY_FD_PIN_RELEASE once the
+    /// owning fixup has settled, or when the arena
+    /// teardown drops the pending fixup.
+    fd_pins: HashMap<i32, std::fs::File>,
     /// Transactions addressed to handle 0 before any
     /// context manager registered (0.9.24). On real
     /// hardware this cannot happen -- servicemanager is
@@ -4850,6 +4859,38 @@ struct AshmemRec {
     prot: u64,
 }
 
+/// 0.9.176: a delivery-time pin of one sender fd.
+/// The real binder driver installs a parcel's fds
+/// into the receiver at delivery time, while the
+/// sender's fd provably names the file. The virtual
+/// binder defers installation to the receiver's
+/// pickup (resolve_fd_fixups_core rides an open of
+/// /proc/<sender>/fd/<n> in the receiver), and the
+/// .175 field showed the gap is fatal for graphic
+/// buffers: SF's buffer fds were alive at every
+/// delivery-time dump (32 of 32 host=ok) yet the
+/// slots stood empty at pickup (open_ret=-2 at all
+/// three attempts, supervisor-side read_link err2
+/// too) -- the sender churns its low slots faster
+/// than a sibling worker's receiver picks the
+/// parcel up. A pin closes the gap: at queue time
+/// (binder_deliver) the coordinator opens the
+/// sender fd's target itself and holds the File;
+/// the fixup carries the holder's pid and fd
+/// number, and the pickup-time ride opens
+/// /proc/<holder>/fd/<pin> -- a table the
+/// coordinator controls and only releases once the
+/// fixup has settled (MSG_ONEWAY_FD_PIN_RELEASE,
+/// or the arena teardown that drops the pending
+/// fixup). The recorded target is what fd_verify
+/// holds the receiver's candidate against.
+#[derive(Clone)]
+struct FdPin {
+    holder_pid: i32,
+    fd: i32,
+    target: String,
+}
+
 struct FdFixup {
     file_off: u64,
     sender_pid: i32,
@@ -4867,6 +4908,13 @@ struct FdFixup {
     /// fd_convert_in_stream); never consulted on the
     /// success path.
     data_va: u32,
+    /// 0.9.176: the delivery-time pin of the sender
+    /// fd (see FdPin), taken by binder_deliver when
+    /// it queues this fixup. None when the sender fd
+    /// did not name a pinnable file at queue time;
+    /// the pickup then rides the sender's own /proc
+    /// path exactly as before.
+    pin: Option<FdPin>,
 }
 
 impl BinderState {
@@ -5352,6 +5400,11 @@ const MSG_ONEWAY_ISSUANCE_STATS: u8 = 36;
 /// coordinator's spawn-looper gate can cap pool
 /// growth at the process's own declared limit.
 const MSG_ONEWAY_SET_MAX_THREADS: u8 = 37;
+/// 0.9.176: a worker settled a batch of fd fixups;
+/// the coordinator closes the delivery-time pins
+/// they carried (see FdPin). Payload: u32 count,
+/// then that many coordinator fd numbers.
+const MSG_ONEWAY_FD_PIN_RELEASE: u8 = 38;
 const MSG_PUSH_WAKE: u8 = 40;
 const MSG_PUSH_ADOPT: u8 = 41;
 const MSG_PUSH_ADOPT_ACK: u8 = 42;
@@ -5486,6 +5539,15 @@ impl Enc {
         self.i32(f.sender_pid);
         self.i32(f.sender_fd);
         self.u32(f.data_va);
+        // 0.9.176: the delivery-time pin rides along
+        // (holder pid + the coordinator's fd number +
+        // the target recorded at queue time).
+        self.bool(f.pin.is_some());
+        if let Some(p) = &f.pin {
+            self.i32(p.holder_pid);
+            self.i32(p.fd);
+            self.string(&p.target);
+        }
     }
     fn fixups(&mut self, fs: &[FdFixup]) {
         self.u32(fs.len() as u32);
@@ -5614,11 +5676,26 @@ impl<'a> Dec<'a> {
         }
     }
     fn fixup(&mut self) -> FdFixup {
+        let file_off = self.u64();
+        let sender_pid = self.i32();
+        let sender_fd = self.i32();
+        let data_va = self.u32();
+        // 0.9.176: mirror of Enc::fixup's pin tail.
+        let pin = if self.bool() {
+            Some(FdPin {
+                holder_pid: self.i32(),
+                fd: self.i32(),
+                target: self.string(),
+            })
+        } else {
+            None
+        };
         FdFixup {
-            file_off: self.u64(),
-            sender_pid: self.i32(),
-            sender_fd: self.i32(),
-            data_va: self.u32(),
+            file_off,
+            sender_pid,
+            sender_fd,
+            data_va,
+            pin,
         }
     }
     fn fixups(&mut self) -> Vec<FdFixup> {
@@ -6415,6 +6492,25 @@ impl CoordClient {
         e.u32(retry_saved);
         e.u32(ride_failed);
         self.send(MSG_ONEWAY_FD_STATS, &e.0);
+    }
+
+    /// 0.9.176: the fixups this worker just settled
+    /// carried these delivery-time pins; the
+    /// coordinator closes the held Files (see
+    /// FdPin). Sent unconditionally after every
+    /// resolution pass that took fixups, success
+    /// and failure alike -- a converted delivery's
+    /// pin is spent too.
+    fn oneway_fd_pin_release(&mut self, pin_fds: &[i32]) {
+        if pin_fds.is_empty() {
+            return;
+        }
+        let mut e = Enc::new();
+        e.u32(pin_fds.len() as u32);
+        for fd in pin_fds {
+            e.i32(*fd);
+        }
+        self.send(MSG_ONEWAY_FD_PIN_RELEASE, &e.0);
     }
 
     /// 0.9.141 (s9-141-desk P1): issuance double-read
@@ -7276,7 +7372,8 @@ fn coord_class(kind: u8) -> usize {
         | MSG_ONEWAY_ASHMEM_SET_SIZE
         | MSG_ONEWAY_ASHMEM_SET_PROT => 0,
         MSG_REQ_VCRED | MSG_ONEWAY_VCRED_PUBLISH => 1,
-        MSG_ONEWAY_FD_CACHE_PUT | MSG_ONEWAY_FD_FAIL | MSG_ONEWAY_FD_STATS => 2,
+        MSG_ONEWAY_FD_CACHE_PUT | MSG_ONEWAY_FD_FAIL | MSG_ONEWAY_FD_STATS
+        | MSG_ONEWAY_FD_PIN_RELEASE => 2,
         _ => 3,
     }
 }
@@ -8231,6 +8328,17 @@ impl CoordServer {
                 self.st.fd_fixup_retry_saved += retry_saved as u64;
                 self.st.fd_fixup_ride_failed += ride_failed as u64;
             }
+            MSG_ONEWAY_FD_PIN_RELEASE => {
+                // 0.9.176: the settling worker is
+                // done with these delivery-time
+                // pins; closing the held File is
+                // the whole release (see FdPin).
+                let n = d.u32();
+                for _ in 0..n {
+                    let fd = d.i32();
+                    self.st.fd_pins.remove(&fd);
+                }
+            }
             MSG_ONEWAY_ISSUANCE_STATS => {
                 let reads = d.u32();
                 let differs = d.u32();
@@ -8844,6 +8952,13 @@ fn exec_binder_actions(
                 if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
                     coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
                 }
+                // 0.9.176: release the pins these
+                // fixups carried (see FdPin).
+                let pin_fds: Vec<i32> = fixups
+                    .iter()
+                    .filter_map(|f| f.pin.as_ref().map(|p| p.fd))
+                    .collect();
+                coord.oneway_fd_pin_release(&pin_fds);
                 fd_ledger_fixups(pid, &arena, &fixups, &cmap, &res);
                 if !res.failed.is_empty() {
                     // 0.9.134 (fix (a)): convert the
@@ -9119,6 +9234,42 @@ fn fd_obj_dump(
     }
 }
 
+/// 0.9.176: what a /proc fd link target must look
+/// like for a delivery-time pin to be possible: an
+/// absolute path to a file that still has its name.
+/// Magic-link targets (socket:[...], pipe:[...],
+/// anon_inode:[...]) name no openable path, and a
+/// " (deleted)" suffix means the name is already
+/// gone; both fall back to the pre-.176 sender-path
+/// ride, no worse than today.
+fn pinnable_target(link: &str) -> Option<&str> {
+    if link.starts_with('/') && !link.ends_with(" (deleted)") {
+        Some(link)
+    } else {
+        None
+    }
+}
+
+/// 0.9.176: take a delivery-time pin of one sender
+/// fd (see FdPin): read what the fd names right
+/// now -- the same read fd_obj_dump prints as
+/// host=ok -- and hold the file open in the
+/// coordinator. None when the fd names nothing
+/// pinnable or the open fails; the fixup then
+/// resolves exactly as it did before .176.
+fn pin_sender_fd(st: &mut BinderState, sender_pid: i32, sender_fd: i32) -> Option<FdPin> {
+    let link = std::fs::read_link(format!("/proc/{sender_pid}/fd/{sender_fd}")).ok()?;
+    let target = pinnable_target(&link.to_string_lossy())?.to_string();
+    let f = std::fs::File::open(&target).ok()?;
+    let fd = f.as_raw_fd();
+    st.fd_pins.insert(fd, f);
+    Some(FdPin {
+        holder_pid: std::process::id() as i32,
+        fd,
+        target,
+    })
+}
+
 /// Copy a translated parcel into the target arena and queue
 /// the BR_TRANSACTION / BR_REPLY carrying it. On failure the
 /// Err names the exact stage, so a dead delivery explains
@@ -9177,6 +9328,11 @@ fn binder_deliver(
         base
     };
     for (rel, sfd) in fd_fixups {
+        // 0.9.176: pin the sender fd at queue time,
+        // while it provably names its file (see
+        // FdPin); the pickup-time ride opens the
+        // pin, not the sender's churned slot.
+        let pin = pin_sender_fd(st, sender_pid, *sfd);
         st.fd_pending
             .entry(target.to_string())
             .or_default()
@@ -9185,6 +9341,7 @@ fn binder_deliver(
                 sender_pid,
                 sender_fd: *sfd,
                 data_va: base + off,
+                pin,
             });
     }
     // 0.9.147 (s9-147-desk section 2 R4): parked
@@ -15624,9 +15781,31 @@ fn inject_close(
 /// on its own, so the un-comparable case is the cache
 /// hit, whose fd was opened legitimately while the
 /// sender lived).
-fn fd_verify(recv_pid: i32, sender_pid: i32, sender_fd: i32, fd: i32) -> Result<(), &'static str> {
+fn fd_verify(
+    recv_pid: i32,
+    sender_pid: i32,
+    sender_fd: i32,
+    fd: i32,
+    pin: Option<&FdPin>,
+) -> Result<(), &'static str> {
     let rt = std::fs::read_link(format!("/proc/{recv_pid}/fd/{fd}"))
         .map_err(|_| "verify-recv-missing")?;
+    // 0.9.176: with a pin, the candidate is held
+    // against the pin's file -- what the sender's
+    // fd named at delivery time -- read live off
+    // the holder, so a post-pin unlink renders the
+    // same " (deleted)" suffix on both sides. If
+    // the holder's slot is somehow unreadable, the
+    // recorded target stands in. Unpinned fixups
+    // keep the pre-.176 sender-side comparison.
+    if let Some(p) = pin {
+        let expected = std::fs::read_link(format!("/proc/{}/fd/{}", p.holder_pid, p.fd))
+            .unwrap_or_else(|_| p.target.clone().into());
+        if expected != rt {
+            return Err("verify-target-mismatch");
+        }
+        return Ok(());
+    }
     if let Ok(st) = std::fs::read_link(format!("/proc/{sender_pid}/fd/{sender_fd}")) {
         if st != rt {
             return Err("verify-target-mismatch");
@@ -16005,7 +16184,17 @@ fn resolve_fd_fixups_core(
         if let Some(fd) = cache.get(&cache_key) {
             candidate = Some(*fd);
         } else {
-            let path = format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd);
+            // 0.9.176: ride the open against the
+            // delivery-time pin when this fixup
+            // carries one -- the coordinator's held
+            // File cannot churn the way the sender's
+            // own slot does (see FdPin). Unpinned
+            // fixups ride the sender's path exactly
+            // as before.
+            let path = match &fx.pin {
+                Some(p) => format!("/proc/{}/fd/{}", p.holder_pid, p.fd),
+                None => format!("/proc/{}/fd/{}", fx.sender_pid, fx.sender_fd),
+            };
             // 0.9.137: retry the injected open in place,
             // up to three attempts in total (see the
             // header comment). Only this step retries:
@@ -16113,7 +16302,7 @@ fn resolve_fd_fixups_core(
             }
         }
         if let Some(fd0) = candidate {
-            match fd_verify(pid, fx.sender_pid, fx.sender_fd, fd0) {
+            match fd_verify(pid, fx.sender_pid, fx.sender_fd, fd0, fx.pin.as_ref()) {
                 Ok(()) => {
                     res.verified += 1;
                     let mut fd = fd0;
@@ -16292,6 +16481,14 @@ fn resolve_fd_fixups(
     if res.dupped > 0 || res.verified > 0 || res.retried > 0 || res.retry_saved > 0 || res.ride_failed > 0 {
         coord.oneway_fd_stats(res.dupped, res.verified, res.retried, res.retry_saved, res.ride_failed);
     }
+    // 0.9.176: release the pins these fixups
+    // carried; the resolution above was their
+    // last use (see FdPin).
+    let pin_fds: Vec<i32> = fixups
+        .iter()
+        .filter_map(|f| f.pin.as_ref().map(|p| p.fd))
+        .collect();
+    coord.oneway_fd_pin_release(&pin_fds);
     fd_ledger_fixups(pid, arena, fixups, &cache, &res);
     if res.rides == 0 {
         return res;
@@ -16484,7 +16681,16 @@ fn binder_on_proc_exit(arena: &str, st: &mut BinderState, wakes: &mut Vec<i32>) 
     // consumed, and it must not survive into a later
     // tenure of the same arena path (its data_va could
     // coincide with a fresh parcel's).
-    st.fd_pending.remove(arena);
+    // 0.9.176: the dropped fixups' delivery-time
+    // pins die with them -- no settle will ever
+    // release them now (see FdPin).
+    if let Some(pending) = st.fd_pending.remove(arena) {
+        for f in &pending {
+            if let Some(p) = &f.pin {
+                st.fd_pins.remove(&p.fd);
+            }
+        }
+    }
     if let Some(bp) = st.procs.get(arena) {
         bsup!(
             "binder: arena {arena} free counters: hit={} nobase={} stale={} parcels_left={} notify_queued={} shield_drops={} free_hit={} free_miss={} free_rescued={} shield_cookie_suspects={} reply_unmatched={} shield4_drops={} shield4_buckets: cookie={} libc={} stack={} other={} second_reads={} second_read_differs={} fd_fixup_failed={} fd_fixup_dupped={} fd_fixup_verified={} fd_fixup_retried={} fd_fixup_retry_saved={} reply_collide_checks={} reply_collide_hits={}",
@@ -26227,6 +26433,7 @@ mod tests {
             sender_pid: 100,
             sender_fd: 7,
             data_va: 0x1000,
+            pin: None,
         }];
         let mut cache: HashMap<CacheKey, i32> = HashMap::new();
         cache.insert(("/vm/.binder/200".to_string(), 100, 7), 42);
@@ -26248,6 +26455,7 @@ mod tests {
             sender_pid: 100,
             sender_fd: 7,
             data_va: 0x1000,
+            pin: None,
         }];
         let cache: HashMap<CacheKey, i32> = HashMap::new();
         let res = FdResolution {
@@ -26264,6 +26472,99 @@ mod tests {
         let line = fd_ledger_format_fixups(99, 0, 200, "arena", &fixups, &cache, &res);
         assert!(line.contains("pairs=[]"), "{line}");
         assert!(line.contains("fails=[100:7:open_ret_-2]"), "{line}");
+    }
+
+    // 0.9.176: the ledger counts the fixups that
+    // carried a delivery-time pin, so a field run
+    // can prove the pins were actually taken.
+    #[test]
+    fn fd_ledger_format_counts_pins() {
+        let fixups = vec![
+            FdFixup {
+                file_off: 0,
+                sender_pid: 100,
+                sender_fd: 7,
+                data_va: 0x1000,
+                pin: Some(FdPin {
+                    holder_pid: 999,
+                    fd: 55,
+                    target: "/vm/.ashmem/a100-7".to_string(),
+                }),
+            },
+            FdFixup {
+                file_off: 4,
+                sender_pid: 100,
+                sender_fd: 8,
+                data_va: 0x1000,
+                pin: None,
+            },
+        ];
+        let cache: HashMap<CacheKey, i32> = HashMap::new();
+        let res = FdResolution::default();
+        let line = fd_ledger_format_fixups(7, 1, 200, "arena", &fixups, &cache, &res);
+        assert!(line.contains("nfx=2"), "{line}");
+        assert!(line.contains("pins=1"), "{line}");
+    }
+
+    // 0.9.176: only a named, still-named file can
+    // be pinned; magic links and deleted names
+    // fall back to the sender-path ride.
+    #[test]
+    fn pinnable_target_shapes() {
+        assert_eq!(
+            pinnable_target("/data/vm/.ashmem/a23551-34"),
+            Some("/data/vm/.ashmem/a23551-34")
+        );
+        assert_eq!(pinnable_target("socket:[12345]"), None);
+        assert_eq!(pinnable_target("pipe:[12345]"), None);
+        assert_eq!(pinnable_target("anon_inode:[ashmem]"), None);
+        assert_eq!(pinnable_target("/data/vm/file (deleted)"), None);
+        assert_eq!(pinnable_target("relative/path"), None);
+    }
+
+    // 0.9.176: the pin survives the coordinator
+    // wire format intact.
+    #[test]
+    fn fixup_codec_roundtrips_a_pin() {
+        let fx = FdFixup {
+            file_off: 0x1234,
+            sender_pid: 23551,
+            sender_fd: 17,
+            data_va: 0xdead,
+            pin: Some(FdPin {
+                holder_pid: 23457,
+                fd: 61,
+                target: "/data/vm/.ashmem/a23551-34".to_string(),
+            }),
+        };
+        let mut e = Enc::new();
+        e.fixups(std::slice::from_ref(&fx));
+        let mut d = Dec::new(&e.0);
+        let back = d.fixups();
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+        assert_eq!(b.file_off, 0x1234);
+        assert_eq!(b.sender_pid, 23551);
+        assert_eq!(b.sender_fd, 17);
+        assert_eq!(b.data_va, 0xdead);
+        let p = b.pin.as_ref().expect("pin survives the wire");
+        assert_eq!(p.holder_pid, 23457);
+        assert_eq!(p.fd, 61);
+        assert_eq!(p.target, "/data/vm/.ashmem/a23551-34");
+        // The unpinned shape stays pinless.
+        let fx2 = FdFixup {
+            file_off: 0,
+            sender_pid: 1,
+            sender_fd: 2,
+            data_va: 3,
+            pin: None,
+        };
+        let mut e2 = Enc::new();
+        e2.fixups(std::slice::from_ref(&fx2));
+        let mut d2 = Dec::new(&e2.0);
+        let back2 = d2.fixups();
+        assert_eq!(back2.len(), 1);
+        assert!(back2[0].pin.is_none());
     }
 
     #[test]
